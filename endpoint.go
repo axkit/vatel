@@ -433,23 +433,24 @@ func (e *Endpoint) writeResponse(ctx Context, lo LogOption, res interface{}, zc 
 
 	ctx.SetContentType(e.responseContentType)
 
+	fmt.Println("lo:", lo, LogRespBody, lo&LogRespBody)
 	if lo&LogRespBody != LogRespBody {
 		_, err = ctx.BodyWriter().Write(buf)
 		return err
 	}
 
-	if e.jm == nil || len(e.resultFields) == 0 {
+	if e.jm != nil && len(e.resultFields) > 0 {
+		maskedBuf, err := e.jm.Mask(buf, e.resultFields)
+		if err != nil {
+			maskedBuf = []byte(`{"maskingError": "` + err.Error() + `"}`)
+		}
+
+		*zc = zc.RawJSON("maskedRespBody", maskedBuf)
+	} else {
 		*zc = zc.RawJSON("respBody", buf)
-		return nil
 	}
 
-	maskedBuf, err := e.jm.Mask(buf, e.resultFields)
-	if err != nil {
-		maskedBuf = []byte(`{"maskingError": "` + err.Error() + `"}`)
-	}
-
-	*zc = zc.RawJSON("maskedRespBody", maskedBuf)
-
+	//fmt.Println("buf:", string(buf))
 	_, err = ctx.BodyWriter().Write(buf)
 	return err
 }
