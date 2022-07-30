@@ -10,17 +10,17 @@ import (
 
 type Context interface {
 	BodyWriter() io.Writer
-	SetContentType([]byte) *VatelContext
-	SetStatusCode(code int) *VatelContext
+	SetContentType([]byte) Context
+	SetStatusCode(code int) Context
 	FormFile(key string) (*multipart.FileHeader, error)
 	FormValue(key string) []byte
 	SaveMultipartFile(fh *multipart.FileHeader, path string) error
 	Header(name string) []byte
 	TokenPayload() TokenPayloader
 	SetTokenPayload(tp TokenPayloader)
-	SetHeader(name, val []byte) *VatelContext
+	SetHeader(name, val []byte) Context
 	RequestCtx() *fasthttp.RequestCtx
-	Set(key string, val interface{}) *VatelContext
+	Set(key string, val interface{}) Context
 	Get(key string) interface{}
 	VisitUserValues(func(key []byte, val interface{}))
 }
@@ -62,17 +62,17 @@ func (ctx *VatelContext) SaveMultipartFile(fh *multipart.FileHeader, path string
 	return fasthttp.SaveMultipartFile(fh, path)
 }
 
-func (ctx *VatelContext) SetContentType(contentType []byte) *VatelContext {
+func (ctx *VatelContext) SetContentType(contentType []byte) Context {
 	ctx.fh.Response.Header.SetContentTypeBytes(contentType)
 	return ctx
 }
 
-func (ctx *VatelContext) SetHeader(name, val []byte) *VatelContext {
+func (ctx *VatelContext) SetHeader(name, val []byte) Context {
 	ctx.fh.Response.Header.SetBytesKV(name, val)
 	return ctx
 }
 
-func (ctx *VatelContext) Log(key string, val interface{}) *VatelContext {
+func (ctx *VatelContext) Log(key string, val interface{}) Context {
 	if ctx.kv == nil {
 		ctx.kv = make(map[string]interface{}, 1)
 	}
@@ -90,7 +90,7 @@ func (ctx *VatelContext) BodyWriter() io.Writer {
 }
 
 // SetStatusCode sets HTTP status code.
-func (ctx *VatelContext) SetStatusCode(code int) *VatelContext {
+func (ctx *VatelContext) SetStatusCode(code int) Context {
 	ctx.fh.SetStatusCode(code)
 	return ctx
 }
@@ -104,7 +104,7 @@ func (ctx *VatelContext) Get(key string) interface{} {
 	return ctx.fh.UserValue(key)
 }
 
-func (ctx *VatelContext) Set(key string, val interface{}) *VatelContext {
+func (ctx *VatelContext) Set(key string, val interface{}) Context {
 	ctx.fh.SetUserValue(key, val)
 	return ctx
 }

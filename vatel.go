@@ -90,6 +90,7 @@ type Vatel struct {
 
 	authDisabled bool
 	cfg          Option
+	ws           *WebsocketGateway
 }
 
 // NewVatel returns new instance of Vatel.
@@ -104,6 +105,9 @@ func NewVatel(optFunc ...func(*Option)) *Vatel {
 	v.ep = []Endpoint{{Method: "GET", Path: "/", Controller: func() Handler { return &tocController{s: &v} }}}
 	return &v
 }
+func (va *Vatel) AddWebsocketSupport(dws *WebsocketGateway) {
+	va.ws = dws
+}
 
 type Option struct {
 	urlPrefix          string
@@ -114,6 +118,9 @@ type Option struct {
 	jm                 JsonMasker
 	ala                Alarmer
 	mr                 MetricReporter
+	// websocketUpgradePath string
+	// ws                   *websocket.Server
+	// wsStore              WebSocketStorer
 }
 
 func WithMetricReporter(mr MetricReporter) func(*Option) {
@@ -139,6 +146,13 @@ func WithStaticLoggingLevel() func(*Option) {
 		o.staticLoggingLevel = true
 	}
 }
+
+// func WithWebsocket(upgradePath string, wss WebSocketStorer) func(*Option) {
+// 	return func(o *Option) {
+// 		o.websocketUpgradePath = upgradePath
+// 		o.wsStore = wss
+// 	}
+// }
 
 // WithVerboseError sets verbose mode for error response to the client.
 func WithVerboseError(b bool) func(*Option) {
@@ -230,6 +244,10 @@ func (v *Vatel) BuildHandlers(mux *router.Router, l *zerolog.Logger) error {
 
 func (v *Vatel) buildHandlers(mux *router.Router, l *zerolog.Logger) error {
 
+	if v.ws != nil {
+		v.ep = append(v.ep, v.ws.Endpoints()...)
+	}
+
 	for i := range v.ep {
 		v.ep[i].Method = strings.ToUpper(v.ep[i].Method)
 	}
@@ -241,18 +259,73 @@ func (v *Vatel) buildHandlers(mux *router.Router, l *zerolog.Logger) error {
 		return v.ep[i].Path < v.ep[j].Path
 	})
 
+	// if v.cfg.websocketUpgradePath != "" {
+	// 	// v.ws.OnMessage =
+	// 	if v.cfg.wsStore != nil {
+	// 		v.ws.HandleOpen(v.cfg.wsStore.OnOpen)
+	// 		v.ws.HandleClose(v.cfg.wsStore.OnClose)
+	// 		v.ep = append(v.ep, Endpoint{
+	// 			LogOptions: LogExit,
+	// 			Method:     "WS",
+	// 			Path:       "auth",
+	// 			Controller: func() Handler { return &AuthConnectionHandler{v: v} },
+	// 		})
+	// 	}
+	// 	v.wsPath = make(map[string]*Endpoint)
+	// 	for i := range v.ep {
+	// 		e := &v.ep[i]
+	// 		if e.Method != "WS" { // Regular HTTP handlers processed above.
+	// 			continue
+	// 		}
+	// 		if _, ok := v.wsPath[e.Path]; ok {
+	// 			panic(e.Path + " is already registered")
+	// 		}
+	// 		logger := l.With().Str("method", e.Method).Str("path", e.Path).Logger()
+	// 		if err := e.wsCompile(v, &logger); err != nil {
+	// 			return err
+	// 		}
+	// 		v.wsPath[e.Path] = e
+
+	// 		// if e.Compress {
+	// 		// 	mux.Handle(e.Method, e.Path, fasthttp.CompressHandler(e.handler(&logger)))
+	// 		// } else {
+	// 		// 	mux.Handle(e.Method, e.Path, e.handler(&logger))
+	// 		// }
+	// 		logger.Info().Msg("ws handler registered")
+	// 	}
+	// 	v.ep = append(v.ep, Endpoint{
+	// 		LogOptions: LogExit,
+	// 		Method:     "GET",
+	// 		Path:       v.cfg.websocketUpgradePath,
+	// 		Controller: func() Handler { return &UpgradeConnectionHandler{v: v} },
+	// 	})
+
+	// 	v.ws.HandleData(v.wsMessageHandler)
+	// }
+
 	for i := range v.ep {
 		e := &v.ep[i]
-		if err := e.compile(v); err != nil {
-			return err
+		logger := l.With().Str("method", e.Method).Str("path", e.Path).Logger()
+
+		if e.Method == "WS" { // websocket processed externally.
+			if v.ws == nil {
+				panic("websocket server was not assigned")
+			}
+			if err := v.ws.RegisterEndpoint(v, e, &logger); err != nil {
+				panic(err)
+			}
+			continue
+		} else {
+			if err := e.compile(v); err != nil {
+				return err
+			}
+			if e.Compress {
+				mux.Handle(e.Method, e.Path, fasthttp.CompressHandler(e.handler(&logger)))
+			} else {
+				mux.Handle(e.Method, e.Path, e.handler(&logger))
+			}
 		}
 
-		logger := l.With().Str("method", e.Method).Str("path", e.Path).Logger()
-		if e.Compress {
-			mux.Handle(e.Method, e.Path, fasthttp.CompressHandler(e.handler(&logger)))
-		} else {
-			mux.Handle(e.Method, e.Path, e.handler(&logger))
-		}
 		logger.Info().Msg("handler registered")
 	}
 

@@ -14,6 +14,7 @@ import (
 	"github.com/axkit/date"
 	"github.com/axkit/errors"
 	"github.com/axkit/vatel/jsonmask"
+	"github.com/dgrr/websocket"
 	"github.com/rs/zerolog"
 
 	//	goon "github.com/shurcooL/go-goon"
@@ -59,7 +60,7 @@ type Endpoint struct {
 	logRequestID       bool
 	LogOptions         LogOption
 
-	// Method holds HTTP method name (e.g GET, POST, PUT, DELETE).
+	// Method holds HTTP method name (e.g GET, POST, PUT, DELETE, WS).
 	Method string
 
 	// Wraps response by gzip compression function.
@@ -73,6 +74,8 @@ type Endpoint struct {
 
 	// Controller holds reference to the object implementing interface Handler.
 	Controller func() Handler
+
+	WebsocketController func() WebsocketHandler
 
 	// ResponseContentType by default has "application/json; charset: utf-8;"
 	ResponseContentType string
@@ -110,8 +113,9 @@ type Endpoint struct {
 	inputFields  jsonmask.Fields
 	resultFields jsonmask.Fields
 
-	ala Alarmer
-	mr  MetricReporter
+	ala      Alarmer
+	mr       MetricReporter
+	wsLogger *zerolog.Logger
 }
 
 // NewEndpoint builds Endpoint.
@@ -133,6 +137,13 @@ type Handler interface {
 	Handle(Context) error
 }
 
+// WebsocketHandler is the interface what wraps Handle method.
+//
+// Handle invocates by websocket message processing func.
+type WebsocketHandler interface {
+	Handle(WebsocketContext) error
+}
+
 // Inputer is the interface what wraps Input method.
 //
 // Input returns reference to the object what will be promoted
@@ -150,7 +161,7 @@ type Inputer interface {
 // Resulter is the interface what wraps a single Result method.
 //
 // Result returns reference to the object what will be
-// send to the client when endpoint handler completes succesfully.
+// send to the client when endpoint handler completes successfully.
 //
 // If endpoint's controller have outgoing data, Result method should be implemented.
 type Resulter interface {
@@ -174,58 +185,6 @@ type Resulter interface {
 type Paramer interface {
 	Param() interface{}
 }
-
-// func writeErrorResponse(ctx Context, verbose bool, zc *zerolog.Context, err error) {
-// 	if err == nil {
-// 		return
-// 	}
-
-// 	statusCode := 500
-// 	ce, ok := err.(*errors.CatchedError)
-// 	if ok {
-// 		statusCode = ce.Last().StatusCode
-// 		if statusCode == 429 {
-// 			// in case of too many requests, look if error has attribute Retry-After
-// 			var hv []byte
-// 			if ra, ok := ce.Get("Retry-After"); ok {
-// 				switch ra.(type) {
-// 				case int, int64, int32, int16, int8, uint, uint64, uint32, uint16, uint8:
-// 					hv = []byte(fmt.Sprintf("%d", ra))
-// 				case string:
-// 					hv = []byte(ra.(string))
-// 				case []byte:
-// 					hv = ra.([]byte)
-// 				}
-// 				ctx.SetHeader([]byte("Retry-After"), hv)
-// 			}
-// 		}
-// 	}
-
-// 	z := *zc
-// 	ctx.VisitUserValues(func(key []byte, v interface{}) {
-// 		z = z.Interface(string(key), v)
-// 	})
-
-// 	jsonErr := errors.ToServerJSON(err)
-// 	zl := z.RawJSON("err", jsonErr).Logger()
-// 	zl.Error().Msg("request failed")
-
-// 	ctx.SetContentType([]byte("application/json; charset=utf-8"))
-// 	ctx.SetStatusCode(statusCode)
-
-// 	var ff errors.FormattingFlag
-// 	if verbose {
-// 		ff = errors.AddStack | errors.AddFields | errors.AddWrappedErrors
-// 	}
-
-// 	_, xerr := ctx.BodyWriter().Write(errors.ToJSON(err, ff))
-
-// 	if xerr != nil {
-// 		//zl.With().Error().RawJSON("err", errors.ToServerJSON(xerr)).Msg("writing http response failed")
-// 	}
-
-// 	return
-// }
 
 func (e *Endpoint) writeErrorResponse(ctx Context, verbose bool, zc *zerolog.Context, err error) {
 	if err == nil {
@@ -322,7 +281,10 @@ func (e *Endpoint) handler(l *zerolog.Logger) func(*fasthttp.RequestCtx) {
 		// inDebug := e.LogOptions&ConfidentialInput != ConfidentialInput
 		// outDebug := e.LogOptions&ConfidentialOutput != ConfidentialOutput
 
-		if len(e.Perms) > 0 && e.auth != nil {
+		at := fctx.Request.Header.Peek("Authorization") // access token
+
+		if e.auth != nil {
+
 			switch len(e.Perms) {
 			case 0:
 				break
@@ -332,19 +294,57 @@ func (e *Endpoint) handler(l *zerolog.Logger) func(*fasthttp.RequestCtx) {
 				zc = zc.Strs("perms", e.Perms)
 			}
 
-			token, err := e.authorize(fctx)
-			if err != nil {
-				e.writeErrorResponse(ctx, verbose, &zc, err)
+			if len(at) == 0 && len(e.Perms) > 0 {
+				e.writeErrorResponse(ctx, verbose, &zc, ErrAuthorizationHeaderMissed.Capture())
 				return
 			}
 
-			if e.rd != nil {
-				//	inDebug, outDebug = e.rd.IsDebugRequired(token.ApplicationPayload())
+			if len(at) > 0 {
+				token, err := e.authorize(at)
+				if err != nil {
+					e.writeErrorResponse(ctx, verbose, &zc, err)
+					return
+				}
+
+				if e.rd != nil {
+					//	inDebug, outDebug = e.rd.IsDebugRequired(token.ApplicationPayload())
+				}
+				t := token.ApplicationPayload()
+				ctx.SetTokenPayload(t)
+				verbose = verbose || t.Debug()
 			}
-			t := token.ApplicationPayload()
-			ctx.SetTokenPayload(t)
-			verbose = verbose || t.Debug()
+
 		}
+		// if e.auth != nil {
+		// 	if len(e.Perms) > 0 {
+		// 		switch len(e.Perms) {
+		// 		case 0:
+		// 			break
+		// 		case 1:
+		// 			zc = zc.Str("perm", e.Perms[0])
+		// 		default:
+		// 			zc = zc.Strs("perms", e.Perms)
+		// 		}
+
+		// 		if len(at) == 0 {
+		// 			e.writeErrorResponse(ctx, verbose, &zc, ErrAuthorizationHeaderMissed.Capture())
+		// 			return
+		// 		}
+
+		// 		token, err := e.authorize(at)
+		// 		if err != nil {
+		// 			e.writeErrorResponse(ctx, verbose, &zc, err)
+		// 			return
+		// 		}
+
+		// 		if e.rd != nil {
+		// 			//	inDebug, outDebug = e.rd.IsDebugRequired(token.ApplicationPayload())
+		// 		}
+		// 		t := token.ApplicationPayload()
+		// 		ctx.SetTokenPayload(t)
+		// 		verbose = verbose || t.Debug()
+		// 	}
+		// }
 
 		if fctx.QueryArgs().GetBool("description") {
 			if err := e.handleDescription(ctx); err != nil {
@@ -433,7 +433,7 @@ func (e *Endpoint) writeResponse(ctx Context, lo LogOption, res interface{}, zc 
 
 	ctx.SetContentType(e.responseContentType)
 
-	fmt.Println("lo:", lo, LogRespBody, lo&LogRespBody)
+	//fmt.Println("lo:", lo, LogRespBody, lo&LogRespBody)
 	if lo&LogRespBody != LogRespBody {
 		_, err = ctx.BodyWriter().Write(buf)
 		return err
@@ -455,17 +455,44 @@ func (e *Endpoint) writeResponse(ctx Context, lo LogOption, res interface{}, zc 
 	return err
 }
 
+func (e *Endpoint) wsWriteResponse(c *websocket.Conn, lo LogOption, res interface{}, zc *zerolog.Context) error {
+
+	buf, err := json.Marshal(res)
+	if err != nil {
+		*zc = zc.Interface("result", res)
+		return err
+	}
+
+	if lo&LogRespOutput == LogRespOutput {
+		*zc = zc.Interface("result", res)
+	}
+
+	if lo&LogRespBody != LogRespBody {
+		_, err = c.Write(buf)
+		return err
+	}
+
+	if e.jm != nil && len(e.resultFields) > 0 {
+		maskedBuf, err := e.jm.Mask(buf, e.resultFields)
+		if err != nil {
+			maskedBuf = []byte(`{"maskingError": "` + err.Error() + `"}`)
+		}
+
+		*zc = zc.RawJSON("maskedRespBody", maskedBuf)
+	} else {
+		*zc = zc.RawJSON("respBody", buf)
+	}
+
+	_, err = c.Write(buf)
+	return err
+}
+
 var (
 	ErrAuthorizationHeaderMissed = errors.New("header Authorization missed").Code("VTL-0001").StatusCode(401).Critical()
 	ErrAccessTokenRevoked        = errors.New("access token revoked").Code("VTL-0002").StatusCode(401).Critical()
 )
 
-func (e *Endpoint) authorize(ctx *fasthttp.RequestCtx) (Tokener, error) {
-
-	at := ctx.Request.Header.Peek("Authorization")
-	if len(at) == 0 {
-		return nil, ErrAuthorizationHeaderMissed.Capture()
-	}
+func (e *Endpoint) authorize(at []byte) (Tokener, error) {
 
 	if e.rtc != nil {
 		isRevoked, err := e.rtc.IsTokenRevoked(string(at))
@@ -481,6 +508,10 @@ func (e *Endpoint) authorize(ctx *fasthttp.RequestCtx) (Tokener, error) {
 	token, err := e.td.Decode(at)
 	if err != nil {
 		return nil, errors.Catch(err).SetStrs("perms", e.Perms...).Msg("unauthorized")
+	}
+
+	if len(e.Perms) == 0 {
+		return token, nil
 	}
 
 	isAllowed, err := e.auth.IsAllowed(token.ApplicationPayload().Perms(), e.perms...)
