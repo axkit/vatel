@@ -433,7 +433,6 @@ func (e *Endpoint) writeResponse(ctx Context, lo LogOption, res interface{}, zc 
 
 	ctx.SetContentType(e.responseContentType)
 
-	fmt.Println("lo:", lo, LogRespBody, lo&LogRespBody)
 	if lo&LogRespBody != LogRespBody {
 		_, err = ctx.BodyWriter().Write(buf)
 		return err
@@ -450,7 +449,6 @@ func (e *Endpoint) writeResponse(ctx Context, lo LogOption, res interface{}, zc 
 		*zc = zc.RawJSON("respBody", buf)
 	}
 
-	//fmt.Println("buf:", string(buf))
 	_, err = ctx.BodyWriter().Write(buf)
 	return err
 }
