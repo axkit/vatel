@@ -529,18 +529,23 @@ func (e *Endpoint) initController(ctx *fasthttp.RequestCtx, lo LogOption, zc zer
 			)
 
 			cJSON = bytes.NewBuffer(nil)
-			buf = cJSON.Bytes()
 			key := "requestBody"
 			err := json.Compact(cJSON, ctx.Request.Body())
-			if err == nil && e.jm != nil && len(e.inputFields) > 0 {
-				if buf, err = e.jm.Mask(cJSON.Bytes(), e.inputFields); err == nil {
-					key = "maskedRequestBody"
+			if err != nil {
+				zc = zc.Str("requestBodyLoggingFailed", err.Error())
+			} else {
+				buf = cJSON.Bytes()
+				if e.jm != nil && len(e.inputFields) > 0 {
+					if buf, err = e.jm.Mask(cJSON.Bytes(), e.inputFields); err == nil {
+						key = "maskedRequestBody"
+					} else {
+						zc = zc.Str("maskingRequestAttrsFailed", err.Error())
+					}
+				}
+				if err == nil {
+					zc = zc.RawJSON(key, buf)
 				}
 			}
-			if err != nil {
-				zc = zc.Str("maskingFailedMessage", err.Error())
-			}
-			zc = zc.RawJSON(key, buf)
 		}
 
 		in := h.(Inputer).Input()
