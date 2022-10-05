@@ -18,7 +18,7 @@ import (
 
 	//	goon "github.com/shurcooL/go-goon"
 	//	"github.com/hexops/valast"
-	realip "github.com/Ferluci/fast-realip"
+	realip "github.com/ferluci/fast-realip"
 	"github.com/valyala/fasthttp"
 )
 
@@ -102,6 +102,7 @@ type Endpoint struct {
 	pm            PermissionManager
 	rd            RequestDebugger
 	rtc           RevokeTokenChecker
+	ad            AuthDisabler
 	perms         []uint
 
 	middlewares middlewareSet
@@ -322,28 +323,40 @@ func (e *Endpoint) handler(l *zerolog.Logger) func(*fasthttp.RequestCtx) {
 		// inDebug := e.LogOptions&ConfidentialInput != ConfidentialInput
 		// outDebug := e.LogOptions&ConfidentialOutput != ConfidentialOutput
 
-		if len(e.Perms) > 0 && e.auth != nil {
-			switch len(e.Perms) {
-			case 0:
-				break
-			case 1:
-				zc = zc.Str("perm", e.Perms[0])
-			default:
-				zc = zc.Strs("perms", e.Perms)
-			}
-
-			token, err := e.authorize(fctx)
+		var authDisable bool = false
+		if e.ad != nil {
+			ad, err := e.ad.IsAuthDisable(fctx)
 			if err != nil {
 				e.writeErrorResponse(ctx, verbose, &zc, err)
 				return
 			}
+			authDisable = ad
+		}
 
-			if e.rd != nil {
-				//	inDebug, outDebug = e.rd.IsDebugRequired(token.ApplicationPayload())
+		if !authDisable {
+			if len(e.Perms) > 0 && e.auth != nil {
+				switch len(e.Perms) {
+				case 0:
+					break
+				case 1:
+					zc = zc.Str("perm", e.Perms[0])
+				default:
+					zc = zc.Strs("perms", e.Perms)
+				}
+
+				token, err := e.authorize(fctx)
+				if err != nil {
+					e.writeErrorResponse(ctx, verbose, &zc, err)
+					return
+				}
+
+				if e.rd != nil {
+					//	inDebug, outDebug = e.rd.IsDebugRequired(token.ApplicationPayload())
+				}
+				t := token.ApplicationPayload()
+				ctx.SetTokenPayload(t)
+				verbose = verbose || t.Debug()
 			}
-			t := token.ApplicationPayload()
-			ctx.SetTokenPayload(t)
-			verbose = verbose || t.Debug()
 		}
 
 		if fctx.QueryArgs().GetBool("description") {
@@ -771,6 +784,9 @@ func (e *Endpoint) compile(v *Vatel) error {
 	e.pm = v.pm
 	e.rd = v.rd
 	e.rtc = v.rtc
+
+	e.ad = v.ad
+
 	e.middlewares = v.mdw
 	e.staticLoggingLevel = v.cfg.staticLoggingLevel
 	e.verboseError = v.cfg.verboseError

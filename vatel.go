@@ -77,6 +77,11 @@ type Logger interface {
 	Log()
 }
 
+// блокирование проверки токена и прав на выполение запроса
+type AuthDisabler interface {
+	IsAuthDisable(ctx *fasthttp.RequestCtx) (bool, error)
+}
+
 // Vatel holds
 type Vatel struct {
 	ep   []Endpoint
@@ -85,6 +90,7 @@ type Vatel struct {
 	pm   PermissionManager
 	rd   RequestDebugger
 	rtc  RevokeTokenChecker
+	ad   AuthDisabler
 
 	mdw middlewareSet
 
@@ -195,6 +201,10 @@ func (v *Vatel) SetRequestDebugger(rd RequestDebugger) {
 // SetTokenDecoder assigns session token decoder.
 func (v *Vatel) SetTokenDecoder(tp TokenDecoder) {
 	v.td = tp
+}
+
+func (v *Vatel) SetAuthDisabler(ad AuthDisabler) {
+	v.ad = ad
 }
 
 // Add add endpoints to the list.
