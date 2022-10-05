@@ -18,7 +18,7 @@ import (
 
 	//	goon "github.com/shurcooL/go-goon"
 	//	"github.com/hexops/valast"
-	realip "github.com/Ferluci/fast-realip"
+	realip "github.com/ferluci/fast-realip"
 	"github.com/valyala/fasthttp"
 )
 
