@@ -1,4 +1,4 @@
-module github.com/axkit/vatel
+module github.com/xshura1/vatel
 
 go 1.13
 
@@ -6,11 +6,10 @@ go 1.13
 
 require (
 	github.com/Ferluci/fast-realip v1.0.0
-	github.com/andybalholm/brotli v1.0.4 // indirect
 	github.com/axkit/date v0.0.1
 	github.com/axkit/errors v0.2.2
+	github.com/axkit/vatel v0.12.3
 	github.com/fasthttp/router v1.4.4
-	github.com/klauspost/compress v1.13.6 // indirect
 	github.com/rs/zerolog v1.26.0
 	github.com/tidwall/gjson v1.12.1
 	github.com/tidwall/sjson v1.2.4
