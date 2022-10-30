@@ -35,7 +35,7 @@ func (c *WsCon) RawWC() *websocket.Conn {
 }
 
 type WebsocketGateway struct {
-	log                   *zerolog.Logger
+	log                   zerolog.Logger
 	va                    *Vatel
 	isPublicAccessAllowed bool
 	ws                    websocket.Server
@@ -93,8 +93,7 @@ func (wsg *WebsocketGateway) RegisterEndpoint(v *Vatel, e *Endpoint, l *zerolog.
 }
 
 func (wsg *WebsocketGateway) compile(v *Vatel, e *Endpoint, l *zerolog.Logger) error {
-	opath := wsg.upgradePath + "/" + e.Path
-	e.Path = e.Path
+	opath := "ws:" + e.Path
 	e.auth = v.auth
 	e.td = v.td
 	e.pm = v.pm
