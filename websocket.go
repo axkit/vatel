@@ -23,72 +23,72 @@ type WebsocketWrapper interface {
 	MustRegisterEndpoint(v *Vatel, e *Endpoint, l *zerolog.Logger) error
 }
 
-type connectionParams struct {
-	UserID int
-	RoleID int
-	m      tinymap.TinyMap
-	tp     TokenPayloader
+type WsCon struct {
+	wc             *websocket.Conn
+	tp             TokenPayloader
+	m              tinymap.TinyMap
+	tokenExpiresAt time.Time
+}
+
+func (c *WsCon) RawWC() *websocket.Conn {
+	return c.wc
 }
 
 type WebsocketGateway struct {
-	va          *Vatel
-	upgradePath string
-	ws          websocket.Server
-	wsPath      map[string]*Endpoint
+	log                   *zerolog.Logger
+	va                    *Vatel
+	isPublicAccessAllowed bool
+	ws                    websocket.Server
+	path                  map[string]*Endpoint
 
-	mux     sync.RWMutex
-	cParams []connectionParams
-	conns   []*websocket.Conn
+	mux   sync.RWMutex
+	conns []WsCon
 
 	udx     map[int][]uint64 // websocket connection ID per user
 	cdx     map[uint64]int   // websocket connection ID index to wsClients
+	loc     map[string][]int // locations: key is name, values is connection ids
 	ldx     *radix.Tree
 	deleted []int
 }
 
-func NewWebsocketGateway(upgradePath string) *WebsocketGateway {
+func NewWebsocketGateway(l *zerolog.Logger, va *Vatel, publicAccessAllowed bool) *WebsocketGateway {
 	wsg := WebsocketGateway{
-		udx:         make(map[int][]uint64),
-		cdx:         make(map[uint64]int),
-		ldx:         radix.New(),
-		wsPath:      make(map[string]*Endpoint),
-		upgradePath: upgradePath,
+		log:                   l.With().Str("layer", "vatel.wsw").Logger(),
+		va:                    va,
+		udx:                   make(map[int][]uint64),
+		cdx:                   make(map[uint64]int),
+		ldx:                   radix.New(),
+		path:                  make(map[string]*Endpoint),
+		isPublicAccessAllowed: publicAccessAllowed,
 	}
 	wsg.ws.HandleOpen(wsg.OnOpen)
 	wsg.ws.HandleClose(wsg.OnClose)
 	wsg.ws.HandleData(wsg.onMessage)
-
 	return &wsg
 }
 
 func (wsg *WebsocketGateway) Endpoints() []Endpoint {
 	return []Endpoint{
-		{
-			LogOptions: LogExit,
-			Method:     "GET",
-			Path:       wsg.upgradePath,
-			Controller: func() Handler { return &UpgradeConnectionHandler{dws: wsg} },
-		},
-		{
-			LogOptions:          LogExit,
-			Method:              "WS",
-			Path:                "auth",
-			WebsocketController: func() WebsocketHandler { return &AuthConnectionHandler{dws: wsg} },
-		},
+		// {
+		// 	LogOptions:          LogExit,
+		// 	Method:              "POST",
+		// 	Path:                "/ws/fan",
+		// 	WebsocketController: func() WebsocketHandler { return &FanHandler{dws: wsg} },
+		// },
 	}
 }
 
 // RegisterEndpoint is invocated by Vatel.MustBuildHandler() for every endpoint having method "WS".
 func (wsg *WebsocketGateway) RegisterEndpoint(v *Vatel, e *Endpoint, l *zerolog.Logger) error {
-	if _, ok := wsg.wsPath[e.Path]; ok {
-		return errors.New("endpoint is already registered")
+	if _, ok := wsg.path[e.Path]; ok {
+		return errors.New("endpoint is already registered").Set("path", e.Path)
 	}
 
 	if err := wsg.compile(v, e, l); err != nil {
 		return err
 	}
 
-	wsg.wsPath[e.Path] = e
+	wsg.path[e.Path] = e
 	return nil
 }
 
@@ -161,22 +161,24 @@ func (wsg *WebsocketGateway) compile(v *Vatel, e *Endpoint, l *zerolog.Logger) e
 // OnOpen implements interface
 func (wsg *WebsocketGateway) OnOpen(c *websocket.Conn) {
 	wsg.mux.Lock()
-	wsg.onOpen(c)
+	_ = wsg.onOpen(c)
 	wsg.mux.Unlock()
+	wsg.log.Debug().Uint64("conId", c.ID()).Str("remoteAddr", c.RemoteAddr().String()).Msg("new ws connection")
 }
 
-func (dws *WebsocketGateway) onOpen(c *websocket.Conn) {
+func (dws *WebsocketGateway) onOpen(c *websocket.Conn) int {
 
 	var idx int
 	if len(dws.deleted) > 0 {
 		idx = dws.deleted[len(dws.deleted)-1]
 		dws.deleted = dws.deleted[:len(dws.deleted)-1]
+		dws.conns[idx] = WsCon{wc: c}
 	} else {
-		dws.cParams = append(dws.cParams, connectionParams{})
-		dws.conns = append(dws.conns, c)
-		idx = len(dws.cParams) - 1
+		dws.conns = append(dws.conns, WsCon{wc: c})
+		idx = len(dws.conns) - 1
 	}
 	dws.cdx[c.ID()] = idx
+	return idx
 }
 
 func (dws *WebsocketGateway) OnClose(c *websocket.Conn, err error) {
@@ -190,9 +192,11 @@ func (dws *WebsocketGateway) OnClose(c *websocket.Conn, err error) {
 	}
 
 	dws.deleted = append(dws.deleted, idx)
-	dws.conns[idx] = nil
+	dws.conns[idx].wc = nil
+	dws.conns[idx].m.Reset()
+
 	delete(dws.cdx, c.ID())
-	cdx, ok := dws.udx[dws.cParams[idx].UserID]
+	cdx, ok := dws.udx[dws.conns[idx].tp.User()]
 	if !ok || len(cdx) == 0 {
 		return
 	}
@@ -209,56 +213,51 @@ func (dws *WebsocketGateway) OnClose(c *websocket.Conn, err error) {
 		copy(cdx[cx:], cdx[cx+1:])
 		cdx = cdx[:len(cdx)-1]
 		if len(cdx) == 0 {
-			delete(dws.udx, dws.cParams[idx].UserID)
+			delete(dws.udx, dws.conns[idx].tp.User())
 		} else {
-			dws.udx[dws.cParams[idx].UserID] = cdx
+			dws.udx[dws.conns[idx].tp.User()] = cdx
 		}
 	}
+	dws.conns[idx].tp = nil
 }
 
-// CalendarHandler implements access token validation handler.
-// Returns {"result" : "ok"} if access token valid.
-type UpgradeConnectionHandler struct {
-	dws *WebsocketGateway
+func (dws *WebsocketGateway) Upgrade(ctx Context) {
+	dws.ws.Upgrade(ctx.RequestCtx())
 }
 
-// Handle implements github.com/axkit/vatel Handler interface.
-// The handler has no logic because if access token is
-// invalid, middleware would not pass it to the handler.
-func (c *UpgradeConnectionHandler) Handle(ctx Context) error {
-	c.dws.ws.Upgrade(ctx.RequestCtx())
-	return nil
-}
+// type AuthConnectionHandler struct {
+// 	dws   *WebsocketGateway
+// 	input struct {
+// 		AccessToken string `json:"accessToken"`
+// 	}
+// 	output struct {
+// 		Result string
+// 	}
+// }
 
-type AuthConnectionHandler struct {
-	dws   *WebsocketGateway
-	input struct {
-		AccessToken string `json:"accessToken"`
-	}
-	output struct {
-		Result string
-	}
-}
+// func (c *AuthConnectionHandler) Input() interface{} {
+// 	return &c.input
+// }
 
-func (c *AuthConnectionHandler) Input() interface{} {
-	return &c.input
-}
+// func (c *AuthConnectionHandler) Result() interface{} {
+// 	return &c.output
+// }
 
-func (c *AuthConnectionHandler) Result() interface{} {
-	return &c.output
-}
-
-// Handle implements github.com/axkit/vatel Handler interface.
-// The handler has no logic because if access token is
-// invalid, middleware would not pass it to the handler.
-func (c *AuthConnectionHandler) Handle(ctx WebsocketContext) error {
-	c.output.Result = time.Now().String()
-	return c.dws.Auth([]byte(c.input.AccessToken))
-}
+// // Handle implements github.com/axkit/vatel Handler interface.
+// // The handler has no logic because if access token is
+// // invalid, middleware would not pass it to the handler.
+// func (c *AuthConnectionHandler) Handle(ctx WebsocketContext) error {
+// 	c.output.Result = time.Now().String()
+// 	return c.dws.Auth(ctx.ID(), []byte(c.input.AccessToken))
+// }
 
 type WebsocketMessage struct {
 	Path string          `json:"path"`
 	Data json.RawMessage `json:"data,omitempty"`
+}
+
+type AuthMessageData struct {
+	AccessToken string `json:"accessToken"`
 }
 
 func (dws *WebsocketGateway) onMessage(c *websocket.Conn, isBinary bool, data []byte) {
@@ -277,7 +276,21 @@ func (dws *WebsocketGateway) onMessage(c *websocket.Conn, isBinary bool, data []
 		return
 	}
 
-	e, ok := dws.wsPath[msg.Path]
+	if msg.Path == "auth" {
+		var amd AuthMessageData
+		if err := json.Unmarshal(msg.Data, &amd); err != nil {
+			c.Write(errors.ToClientJSON(err))
+			return
+		}
+		if err := dws.Auth(c, []byte(amd.AccessToken)); err != nil {
+			c.Write(errors.ToClientJSON(err))
+			return
+		}
+		c.Write([]byte(`{"result": "ok"}`))
+		return
+	}
+
+	e, ok := dws.path[msg.Path]
 	if !ok {
 		err := errors.New("unknown path").StatusCode(404)
 		c.Write(errors.ToClientJSON(err))
@@ -304,28 +317,23 @@ func (dws *WebsocketGateway) onMessage(c *websocket.Conn, isBinary bool, data []
 	}
 	zc = zco
 
-	var cParam connectionParams
 	dws.mux.RLock()
-
 	cidx, ok := dws.cdx[c.ID()]
 	if !ok {
 		dws.mux.RUnlock()
 		dws.mux.Lock()
-		dws.onOpen(c)
+		if cidx, ok = dws.cdx[c.ID()]; !ok {
+			cidx = dws.onOpen(c)
+		}
 		dws.mux.Unlock()
 		dws.mux.RLock()
-		cidx, ok = dws.cdx[c.ID()]
 	}
-	if ok {
-		cParam = dws.cParams[cidx]
-		if cParam.tp != nil {
-			ctx.SetTokenPayload(cParam.tp)
-		}
+
+	cp := &dws.conns[cidx]
+	if cp.tp != nil {
+		ctx.SetTokenPayload(cp.tp)
 	}
 	dws.mux.RUnlock()
-	if !ok {
-		return
-	}
 
 	// for i := range e.middlewares[BeforeAuthorization] {
 	// 	if err := e.middlewares[BeforeAuthorization][i](ctx); err != nil {
@@ -347,7 +355,7 @@ func (dws *WebsocketGateway) onMessage(c *websocket.Conn, isBinary bool, data []
 			zc = zc.Strs("perms", e.Perms)
 		}
 
-		if cParam.RoleID == 0 {
+		if cp.tp.Role() == 0 {
 			wsWriteErrorResponse(e, ctx, c, verbose, &zc, errors.Forbidden().Capture())
 			return
 		}
@@ -429,28 +437,41 @@ func (dws *WebsocketGateway) PingAll() {
 		dws.mux.RUnlock()
 		return
 	}
-	cs := make([]*websocket.Conn, len(dws.conns))
-	copy(cs, dws.conns)
+	cs := make([]*websocket.Conn, 0, len(dws.conns))
+	for i := range dws.conns {
+		if dws.conns[i].wc != nil {
+			cs = append(cs, dws.conns[i].wc)
+		}
+	}
 	dws.mux.RUnlock()
 	for i := range cs {
 		cs[i].Write([]byte(`{"push": "ping"}`))
 	}
 }
 
-func (dws *WebsocketGateway) Auth(token []byte) error {
+func (wg *WebsocketGateway) Auth(c *websocket.Conn, token []byte) error {
 
-	// token, err := e.authorize(at)
-	// if err != nil {
-	// 	e.writeErrorResponse(ctx, verbose, &zc, err)
-	// 	return
-	// }
+	if len(token) == 0 {
+		return nil
+	}
 
-	// if e.rd != nil {
-	// 	//	inDebug, outDebug = e.rd.IsDebugRequired(token.ApplicationPayload())
-	// }
-	// t := token.ApplicationPayload()
-	// ctx.SetTokenPayload(t)
-	// verbose = verbose || t.Debug()
+	if wg.va.td == nil {
+		return errors.Forbidden().Msg("token decoder is missed")
+	}
+
+	t, err := wg.va.td.Decode(token)
+	if err != nil {
+		return err
+	}
+
+	wg.mux.Lock()
+	defer wg.mux.Unlock()
+	idx, ok := wg.cdx[c.ID()]
+	if !ok {
+		idx = wg.onOpen(c)
+	}
+
+	wg.conns[idx].tp = t.ApplicationPayload()
 	return nil
 }
 
@@ -529,4 +550,18 @@ func (e *Endpoint) wsAuthorize(ctx WebsocketContext) error {
 		Set("role", ctx.TokenPayload().Role()).
 		SetStrs("perms", e.Perms...).
 		StatusCode(401)
+}
+
+func (wg *WebsocketGateway) Traverse(fn func(*WsCon) bool) {
+
+	wg.mux.RLock()
+	defer wg.mux.RUnlock()
+	for i := range wg.conns {
+		if wg.conns[i].wc == nil {
+			continue
+		}
+		if stop := fn(&wg.conns[i]); stop {
+			break
+		}
+	}
 }

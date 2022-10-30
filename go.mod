@@ -16,7 +16,6 @@ require (
 	github.com/dgrr/websocket v0.1.1
 	github.com/fasthttp/router v1.4.4
 	github.com/klauspost/compress v1.13.6 // indirect
-	github.com/pkg/errors v0.9.1
 	github.com/rs/zerolog v1.26.0
 	github.com/tidwall/gjson v1.12.1
 	github.com/tidwall/sjson v1.2.4

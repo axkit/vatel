@@ -17,6 +17,7 @@ type WebsocketContext interface {
 	Get(key string) interface{}
 	VisitValues(func(key []byte, val interface{}))
 	Created() time.Time
+	ID() uint64
 }
 
 type WsContext struct {
@@ -40,6 +41,10 @@ func (ctx *WsContext) SetTokenPayload(tp TokenPayloader) {
 
 func (ctx *WsContext) TokenPayload() TokenPayloader {
 	return ctx.tp
+}
+
+func (ctx *WsContext) ID() uint64 {
+	return ctx.conn.ID()
 }
 
 // func (ctx *WsContext) Log(key string, val interface{}) *WsContext {
