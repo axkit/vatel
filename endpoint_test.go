@@ -1,9 +1,11 @@
 package vatel
 
 import (
+	"io"
 	"testing"
 
 	"github.com/axkit/date"
+	"github.com/rs/zerolog"
 	"github.com/valyala/fasthttp"
 )
 
@@ -28,7 +30,9 @@ func TestDecodeURLQuery(t *testing.T) {
 	ctx.QueryArgs().Add("day", "2021-09-01")
 	ctx.QueryArgs().Add("g", "0.5")
 
-	if err := decodeURLQuery(&ctx, &a); err != nil {
+	l := zerolog.New(io.Discard)
+
+	if _, err := decodeURLQuery(&ctx, &a, l.With()); err != nil {
 		t.Error(err)
 	}
 
