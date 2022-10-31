@@ -202,7 +202,7 @@ func (*td) Decode(encodedToken []byte) (vatel.Tokener, error) {
 
 func TestWebsocketHandler(t *testing.T) {
 	logger := zerolog.New(os.Stdout)
-	ws := vatel.NewWebsocketGateway("/ws")
+	ws := vatel.NewWebsocketWrapper()
 	va.AddWebsocketSupport(ws)
 	va.SetPermissionManager(&pm{})
 	va.SetAuthorizer(&au{})

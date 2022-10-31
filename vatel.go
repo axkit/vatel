@@ -90,7 +90,7 @@ type Vatel struct {
 
 	authDisabled bool
 	cfg          Option
-	ws           *WebsocketGateway
+	ws           *WebsocketWrapper
 }
 
 // NewVatel returns new instance of Vatel.
@@ -105,7 +105,7 @@ func NewVatel(optFunc ...func(*Option)) *Vatel {
 	v.ep = []Endpoint{{Method: "GET", Path: "/", Controller: func() Handler { return &tocController{s: &v} }}}
 	return &v
 }
-func (va *Vatel) AddWebsocketSupport(dws *WebsocketGateway) {
+func (va *Vatel) AddWebsocketSupport(dws *WebsocketWrapper) {
 	va.ws = dws
 }
 

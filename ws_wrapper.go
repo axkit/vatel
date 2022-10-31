@@ -11,88 +11,93 @@ import (
 	"github.com/axkit/errors"
 	"github.com/axkit/tinymap"
 
-	"github.com/armon/go-radix"
 	"github.com/dgrr/websocket"
 	"github.com/rs/zerolog"
 )
 
-// WebsocketWrapper
-type WebsocketWrapper interface {
-	OnOpen(*websocket.Conn)
-	OnClose(*websocket.Conn, error)
-	MustRegisterEndpoint(v *Vatel, e *Endpoint, l *zerolog.Logger) error
-}
-
-type WsCon struct {
+type WebsocketConnection struct {
 	wc             *websocket.Conn
 	tp             TokenPayloader
 	m              tinymap.TinyMap
 	tokenExpiresAt time.Time
+	startedAt      time.Time
 }
 
-func (c *WsCon) RawWC() *websocket.Conn {
+func (c *WebsocketConnection) RawConnection() *websocket.Conn {
 	return c.wc
 }
 
-type WebsocketGateway struct {
-	log                   zerolog.Logger
-	va                    *Vatel
+type WebsocketWrapper struct {
 	isPublicAccessAllowed bool
 	ws                    websocket.Server
 	path                  map[string]*Endpoint
+	mux                   sync.RWMutex
+	conns                 []WebsocketConnection
+	idx                   map[uint64]int // websocket connection ID -> index to conns
+	delIndex              []int
 
-	mux   sync.RWMutex
-	conns []WsCon
+	//udx                   map[int][]int  // user ID -> index to conns
+	//loc     map[string][]int // locations: key is name, values is connection ids
+	//ldx     *radix.Tree
 
-	udx     map[int][]uint64 // websocket connection ID per user
-	cdx     map[uint64]int   // websocket connection ID index to wsClients
-	loc     map[string][]int // locations: key is name, values is connection ids
-	ldx     *radix.Tree
-	deleted []int
+	cfg             WsOption
+	callbackOnOpen  func(cid uint64)
+	callbackOnClose func(cid uint64)
 }
 
-func NewWebsocketGateway(l *zerolog.Logger, va *Vatel, publicAccessAllowed bool) *WebsocketGateway {
-	wsg := WebsocketGateway{
-		log:                   l.With().Str("layer", "vatel.wsw").Logger(),
-		va:                    va,
-		udx:                   make(map[int][]uint64),
-		cdx:                   make(map[uint64]int),
-		ldx:                   radix.New(),
-		path:                  make(map[string]*Endpoint),
-		isPublicAccessAllowed: publicAccessAllowed,
-	}
-	wsg.ws.HandleOpen(wsg.OnOpen)
-	wsg.ws.HandleClose(wsg.OnClose)
-	wsg.ws.HandleData(wsg.onMessage)
-	return &wsg
+type WsOption struct {
+	log              *zerolog.Logger
+	isAuthAccessOnly bool
 }
 
-func (wsg *WebsocketGateway) Endpoints() []Endpoint {
-	return []Endpoint{
-		// {
-		// 	LogOptions:          LogExit,
-		// 	Method:              "POST",
-		// 	Path:                "/ws/fan",
-		// 	WebsocketController: func() WebsocketHandler { return &FanHandler{dws: wsg} },
-		// },
+func WithLogger(log *zerolog.Logger) func(*WsOption) {
+	return func(o *WsOption) {
+		zl := log.With().Str("layer", "ww").Logger()
+		o.log = &zl
 	}
+}
+
+func WithAuthAccessOnly() func(*WsOption) {
+	return func(o *WsOption) {
+		o.isAuthAccessOnly = true
+	}
+}
+
+func NewWebsocketWrapper(optFunc ...func(*WsOption)) *WebsocketWrapper {
+	ww := WebsocketWrapper{
+		idx:  make(map[uint64]int),
+		path: make(map[string]*Endpoint),
+	}
+
+	for i := range optFunc {
+		optFunc[i](&ww.cfg)
+	}
+
+	ww.ws.HandleOpen(ww.OnOpen)
+	ww.ws.HandleClose(ww.OnClose)
+	ww.ws.HandleData(ww.onMessage)
+	return &ww
+}
+
+func (ww *WebsocketWrapper) Endpoints() []Endpoint {
+	return []Endpoint{}
 }
 
 // RegisterEndpoint is invocated by Vatel.MustBuildHandler() for every endpoint having method "WS".
-func (wsg *WebsocketGateway) RegisterEndpoint(v *Vatel, e *Endpoint, l *zerolog.Logger) error {
-	if _, ok := wsg.path[e.Path]; ok {
+func (ww *WebsocketWrapper) RegisterEndpoint(v *Vatel, e *Endpoint, l *zerolog.Logger) error {
+	if _, ok := ww.path[e.Path]; ok {
 		return errors.New("endpoint is already registered").Set("path", e.Path)
 	}
 
-	if err := wsg.compile(v, e, l); err != nil {
+	if err := ww.compile(v, e, l); err != nil {
 		return err
 	}
 
-	wsg.path[e.Path] = e
+	ww.path[e.Path] = e
 	return nil
 }
 
-func (wsg *WebsocketGateway) compile(v *Vatel, e *Endpoint, l *zerolog.Logger) error {
+func (ww *WebsocketWrapper) compile(v *Vatel, e *Endpoint, l *zerolog.Logger) error {
 	opath := "ws:" + e.Path
 	e.auth = v.auth
 	e.td = v.td
@@ -157,70 +162,98 @@ func (wsg *WebsocketGateway) compile(v *Vatel, e *Endpoint, l *zerolog.Logger) e
 	return nil
 }
 
-// OnOpen implements interface
-func (wsg *WebsocketGateway) OnOpen(c *websocket.Conn) {
-	wsg.mux.Lock()
-	_ = wsg.onOpen(c)
-	wsg.mux.Unlock()
-	wsg.log.Debug().Uint64("conId", c.ID()).Str("remoteAddr", c.RemoteAddr().String()).Msg("new ws connection")
+// OnOpen invocates by websocket server when new connection established.
+func (ww *WebsocketWrapper) OnOpen(c *websocket.Conn) {
+	ww.mux.Lock()
+	_ = ww.onOpen(c)
+	ww.mux.Unlock()
+	if ww.cfg.log != nil {
+		ww.cfg.log.Debug().Uint64("conId", c.ID()).Str("remoteAddr", c.RemoteAddr().String()).Msg("new ws connection")
+	}
+
 }
 
-func (dws *WebsocketGateway) onOpen(c *websocket.Conn) int {
-
+func (dws *WebsocketWrapper) onOpen(c *websocket.Conn) int {
 	var idx int
-	if len(dws.deleted) > 0 {
-		idx = dws.deleted[len(dws.deleted)-1]
-		dws.deleted = dws.deleted[:len(dws.deleted)-1]
-		dws.conns[idx] = WsCon{wc: c}
+	if len(dws.delIndex) > 0 {
+		idx = dws.delIndex[len(dws.delIndex)-1]
+		dws.delIndex = dws.delIndex[:len(dws.delIndex)-1]
+		dws.conns[idx] = WebsocketConnection{wc: c, startedAt: time.Now()}
 	} else {
-		dws.conns = append(dws.conns, WsCon{wc: c})
+		dws.conns = append(dws.conns, WebsocketConnection{wc: c, startedAt: time.Now()})
 		idx = len(dws.conns) - 1
 	}
-	dws.cdx[c.ID()] = idx
+	dws.idx[c.ID()] = idx
 	return idx
 }
 
-func (dws *WebsocketGateway) OnClose(c *websocket.Conn, err error) {
-	var idx int
-	dws.mux.Lock()
-	defer dws.mux.Unlock()
+// OnClose invocates by websocket server when connection is closed.
+func (ww *WebsocketWrapper) OnClose(c *websocket.Conn, err error) {
+	ww.mux.Lock()
+	dur := ww.onClose(c.ID())
+	ww.mux.Unlock()
 
-	idx, ok := dws.cdx[c.ID()]
-	if !ok {
+	if ww.callbackOnClose != nil {
+		ww.callbackOnClose(c.ID())
+	}
+
+	if ww.cfg.log == nil {
 		return
 	}
-
-	dws.deleted = append(dws.deleted, idx)
-	dws.conns[idx].wc = nil
-	dws.conns[idx].m.Reset()
-
-	delete(dws.cdx, c.ID())
-	cdx, ok := dws.udx[dws.conns[idx].tp.User()]
-	if !ok || len(cdx) == 0 {
-		return
+	zc := ww.cfg.log.Debug().Uint64("conId", c.ID()).Str("remoteAddr", c.RemoteAddr().String()).Str("dur", dur.String())
+	if err == nil {
+		zc.Msg("ws connection closed")
+	} else {
+		zc.Str("err", err.Error()).Msg("ws connection closed with error")
 	}
-
-	cx := -1
-
-	for i, cid := range cdx {
-		if cid == c.ID() {
-			cx = i
-			break
-		}
-	}
-	if cx != -1 {
-		copy(cdx[cx:], cdx[cx+1:])
-		cdx = cdx[:len(cdx)-1]
-		if len(cdx) == 0 {
-			delete(dws.udx, dws.conns[idx].tp.User())
-		} else {
-			dws.udx[dws.conns[idx].tp.User()] = cdx
-		}
-	}
-	dws.conns[idx].tp = nil
 }
 
-func (dws *WebsocketGateway) Upgrade(ctx Context) {
+func (ww *WebsocketWrapper) onClose(id uint64) time.Duration {
+	var idx int
+	idx, ok := ww.idx[id]
+	if !ok {
+		return 0
+	}
+	dur := time.Since(ww.conns[idx].startedAt)
+
+	ww.delIndex = append(ww.delIndex, idx)
+	ww.conns[idx].wc = nil
+	ww.conns[idx].m.Reset()
+	delete(ww.idx, id)
+
+	// if ww.conns[idx].tp == nil {
+	// 	// the user is not logged in
+	// 	return dur
+	// }
+
+	// cdx, ok := ww.udx[ww.conns[idx].tp.User()]
+	// if !ok || len(cdx) == 0 {
+	// 	return dur
+	// }
+
+	// cx := -1
+
+	// for i, cid := range cdx {
+	// 	if cid == id {
+	// 		cx = i
+	// 		break
+	// 	}
+	// }
+	// if cx != -1 {
+	// 	copy(cdx[cx:], cdx[cx+1:])
+	// 	cdx = cdx[:len(cdx)-1]
+	// 	if len(cdx) == 0 {
+	// 		delete(ww.udx, ww.conns[idx].tp.User())
+	// 	} else {
+	// 		ww.udx[ww.conns[idx].tp.User()] = cdx
+	// 	}
+	// }
+	// ww.conns[idx].tp = nil
+
+	return dur
+}
+
+func (dws *WebsocketWrapper) Upgrade(ctx Context) {
 	dws.ws.Upgrade(ctx.RequestCtx())
 }
 
@@ -259,7 +292,7 @@ type AuthMessageData struct {
 	AccessToken string `json:"accessToken"`
 }
 
-func (dws *WebsocketGateway) onMessage(c *websocket.Conn, isBinary bool, data []byte) {
+func (dws *WebsocketWrapper) onMessage(c *websocket.Conn, isBinary bool, data []byte) {
 
 	ctx := NewWsContext(c)
 
@@ -275,19 +308,19 @@ func (dws *WebsocketGateway) onMessage(c *websocket.Conn, isBinary bool, data []
 		return
 	}
 
-	if msg.Path == "auth" {
-		var amd AuthMessageData
-		if err := json.Unmarshal(msg.Data, &amd); err != nil {
-			c.Write(errors.ToClientJSON(err))
-			return
-		}
-		if err := dws.Auth(c, []byte(amd.AccessToken)); err != nil {
-			c.Write(errors.ToClientJSON(err))
-			return
-		}
-		c.Write([]byte(`{"result": "ok"}`))
-		return
-	}
+	// if msg.Path == "auth" {
+	// 	var amd AuthMessageData
+	// 	if err := json.Unmarshal(msg.Data, &amd); err != nil {
+	// 		c.Write(errors.ToClientJSON(err))
+	// 		return
+	// 	}
+	// 	if err := dws.Auth(c, []byte(amd.AccessToken)); err != nil {
+	// 		c.Write(errors.ToClientJSON(err))
+	// 		return
+	// 	}
+	// 	c.Write([]byte(`{"result": "ok"}`))
+	// 	return
+	// }
 
 	e, ok := dws.path[msg.Path]
 	if !ok {
@@ -317,11 +350,11 @@ func (dws *WebsocketGateway) onMessage(c *websocket.Conn, isBinary bool, data []
 	zc = zco
 
 	dws.mux.RLock()
-	cidx, ok := dws.cdx[c.ID()]
+	cidx, ok := dws.idx[c.ID()]
 	if !ok {
 		dws.mux.RUnlock()
 		dws.mux.Lock()
-		if cidx, ok = dws.cdx[c.ID()]; !ok {
+		if cidx, ok = dws.idx[c.ID()]; !ok {
 			cidx = dws.onOpen(c)
 		}
 		dws.mux.Unlock()
@@ -430,7 +463,7 @@ func (dws *WebsocketGateway) onMessage(c *websocket.Conn, isBinary bool, data []
 	//e.Controller().Inp
 }
 
-func (dws *WebsocketGateway) PingAll() {
+func (dws *WebsocketWrapper) PingAll() {
 	dws.mux.RLock()
 	if len(dws.conns) == 0 {
 		dws.mux.RUnlock()
@@ -448,31 +481,31 @@ func (dws *WebsocketGateway) PingAll() {
 	}
 }
 
-func (wg *WebsocketGateway) Auth(c *websocket.Conn, token []byte) error {
+// func (wg *WebsocketWrapper) Auth(c *websocket.Conn, token []byte) error {
 
-	if len(token) == 0 {
-		return nil
-	}
+// 	if len(token) == 0 {
+// 		return nil
+// 	}
 
-	if wg.va.td == nil {
-		return errors.Forbidden().Msg("token decoder is missed")
-	}
+// 	if wg.va.td == nil {
+// 		return errors.Forbidden().Msg("token decoder is missed")
+// 	}
 
-	t, err := wg.va.td.Decode(token)
-	if err != nil {
-		return err
-	}
+// 	t, err := wg.va.td.Decode(token)
+// 	if err != nil {
+// 		return err
+// 	}
 
-	wg.mux.Lock()
-	defer wg.mux.Unlock()
-	idx, ok := wg.cdx[c.ID()]
-	if !ok {
-		idx = wg.onOpen(c)
-	}
+// 	wg.mux.Lock()
+// 	defer wg.mux.Unlock()
+// 	idx, ok := wg.cdx[c.ID()]
+// 	if !ok {
+// 		idx = wg.onOpen(c)
+// 	}
 
-	wg.conns[idx].tp = t.ApplicationPayload()
-	return nil
-}
+// 	wg.conns[idx].tp = t.ApplicationPayload()
+// 	return nil
+// }
 
 func wsWriteErrorResponse(e *Endpoint, ctx WebsocketContext, c *websocket.Conn, verbose bool, zc *zerolog.Context, err error) {
 	if err == nil {
@@ -551,7 +584,7 @@ func (e *Endpoint) wsAuthorize(ctx WebsocketContext) error {
 		StatusCode(401)
 }
 
-func (wg *WebsocketGateway) Traverse(fn func(*WsCon) bool) {
+func (wg *WebsocketWrapper) TraverseAll(fn func(*WebsocketConnection) bool) {
 
 	wg.mux.RLock()
 	defer wg.mux.RUnlock()
@@ -563,4 +596,28 @@ func (wg *WebsocketGateway) Traverse(fn func(*WsCon) bool) {
 			break
 		}
 	}
+}
+
+func (ww *WebsocketWrapper) Traverse(cids []uint64, fn func(*WebsocketConnection)) {
+	ww.mux.RLock()
+	defer ww.mux.RUnlock()
+	for _, cid := range cids {
+		if idx, ok := ww.idx[cid]; ok {
+			fn(&ww.conns[idx])
+		}
+	}
+}
+
+func (ww *WebsocketWrapper) Write(cids []uint64, data []byte) {
+	ww.mux.RLock()
+	defer ww.mux.RUnlock()
+	for _, cid := range cids {
+		if idx, ok := ww.idx[cid]; ok {
+			ww.conns[idx].wc.Write(data)
+		}
+	}
+}
+
+func (ww *WebsocketWrapper) SetOnCloseCallback(fn func(cid uint64)) {
+	ww.callbackOnClose = fn
 }
