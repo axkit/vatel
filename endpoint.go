@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -34,6 +35,16 @@ const (
 	LogRespBody
 	LogRespOutput
 )
+
+var logOptionString = map[string]LogOption{
+	"silent":    LogSilent,
+	"enter":     LogEnter,
+	"exit":      LogExit,
+	"req-body":  LogReqBody,
+	"req-input": LogReqInput,
+	"resp-body": LogRespBody,
+	"resp-out":  LogRespOutput,
+}
 
 const (
 	LogUnknown      LogOption = 0
@@ -258,7 +269,21 @@ func (e *Endpoint) handler(l *zerolog.Logger) func(*fasthttp.RequestCtx) {
 
 		var lo LogOption
 		if !e.staticLoggingLevel {
-			lo = LogOption(atomic.LoadUint32((*uint32)(&e.LogOptions)))
+			logLevels := fctx.Request.Header.Peek("X-Set-Log-Level")
+			if len(logLevels) > 0 {
+				lvls := strings.Split(string(logLevels), ",")
+				var n uint32 = 0
+				for _, lvl := range lvls {
+					if v, ok := logOptionString[strings.TrimSpace(lvl)]; ok {
+						n |= uint32(v)
+					}
+				}
+				atomic.StoreUint32((*uint32)(&e.LogOptions), n)
+				fctx.Write([]byte(fmt.Sprintf("new logging rules are accepted: %b", n)))
+				return
+			} else {
+				lo = LogOption(atomic.LoadUint32((*uint32)(&e.LogOptions)))
+			}
 		} else {
 			lo = e.LogOptions
 		}
@@ -650,7 +675,12 @@ func decodeParams(ctx *fasthttp.RequestCtx, param interface{}, zcin zerolog.Cont
 			continue
 		}
 
-		val, ok := ctx.UserValue(tag).(string)
+		uv := ctx.UserValue(tag)
+		if uv == nil {
+			return zc, errors.InternalError().Set("name", tag).Msg("path param not found")
+		}
+
+		val, ok := uv.(string)
 		if !ok {
 			panic("non string param")
 		}
@@ -687,7 +717,7 @@ func decodeParams(ctx *fasthttp.RequestCtx, param interface{}, zcin zerolog.Cont
 		case []string:
 			break
 		default:
-			return zc, errors.ValidationFailed("unsuppoted go type").Set("tag", tag)
+			return zc, errors.ValidationFailed("unsupported go type").Set("tag", tag)
 		}
 	}
 	return zc, nil
