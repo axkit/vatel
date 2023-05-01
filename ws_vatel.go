@@ -4,50 +4,29 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/axkit/errors"
-	"github.com/axkit/tinymap"
+	"github.com/valyala/fasthttp"
 
-	"github.com/dgrr/websocket"
+	"github.com/regorov/websocket"
 	"github.com/rs/zerolog"
 )
 
-type WebsocketConnection struct {
-	wc             *websocket.Conn
-	tp             TokenPayloader
-	m              tinymap.TinyMap
-	tokenExpiresAt time.Time
-	startedAt      time.Time
-}
-
-func (c *WebsocketConnection) RawConnection() *websocket.Conn {
-	return c.wc
-}
-
-type WebsocketWrapper struct {
+type WebsocketVatel struct {
 	isPublicAccessAllowed bool
 	ws                    websocket.Server
 	path                  map[string]*Endpoint
-	mux                   sync.RWMutex
-	conns                 []WebsocketConnection
-	idx                   map[uint64]int // websocket connection ID -> index to conns
-	delIndex              []int
-
-	//udx                   map[int][]int  // user ID -> index to conns
-	//loc     map[string][]int // locations: key is name, values is connection ids
-	//ldx     *radix.Tree
-
-	cfg             WsOption
-	callbackOnOpen  func(cid uint64)
-	callbackOnClose func(cid uint64)
+	cfg                   WsOption
+	callbackOnOpen        func(*websocket.Conn)
+	callbackOnClose       func(*websocket.Conn, error)
+	callbackOnTokenUpdate func(cid uint64, tp TokenPayloader) error
 }
 
 type WsOption struct {
-	log              *zerolog.Logger
-	isAuthAccessOnly bool
+	log *zerolog.Logger
+	td  TokenDecoder
 }
 
 func WithLogger(log *zerolog.Logger) func(*WsOption) {
@@ -57,15 +36,14 @@ func WithLogger(log *zerolog.Logger) func(*WsOption) {
 	}
 }
 
-func WithAuthAccessOnly() func(*WsOption) {
+func WithTokenDecoder(td TokenDecoder) func(*WsOption) {
 	return func(o *WsOption) {
-		o.isAuthAccessOnly = true
+		o.td = td
 	}
 }
 
-func NewWebsocketWrapper(optFunc ...func(*WsOption)) *WebsocketWrapper {
-	ww := WebsocketWrapper{
-		idx:  make(map[uint64]int),
+func NewWebsocketVatel(optFunc ...func(*WsOption)) *WebsocketVatel {
+	ww := WebsocketVatel{
 		path: make(map[string]*Endpoint),
 	}
 
@@ -73,18 +51,23 @@ func NewWebsocketWrapper(optFunc ...func(*WsOption)) *WebsocketWrapper {
 		optFunc[i](&ww.cfg)
 	}
 
-	ww.ws.HandleOpen(ww.OnOpen)
-	ww.ws.HandleClose(ww.OnClose)
 	ww.ws.HandleData(ww.onMessage)
 	return &ww
 }
 
-func (ww *WebsocketWrapper) Endpoints() []Endpoint {
-	return []Endpoint{}
+func (wv *WebsocketVatel) Endpoints() []Endpoint {
+	return []Endpoint{
+		{
+			Path:                "updateAccessToken",
+			Method:              "WS",
+			LogOptions:          LogConfidential,
+			WebsocketController: func() WebsocketHandler { return &AccessTokenUpdateHandler{wv: wv} },
+		},
+	}
 }
 
 // RegisterEndpoint is invocated by Vatel.MustBuildHandler() for every endpoint having method "WS".
-func (ww *WebsocketWrapper) RegisterEndpoint(v *Vatel, e *Endpoint, l *zerolog.Logger) error {
+func (ww *WebsocketVatel) RegisterEndpoint(v *Vatel, e *Endpoint, l *zerolog.Logger) error {
 	if _, ok := ww.path[e.Path]; ok {
 		return errors.New("endpoint is already registered").Set("path", e.Path)
 	}
@@ -97,7 +80,7 @@ func (ww *WebsocketWrapper) RegisterEndpoint(v *Vatel, e *Endpoint, l *zerolog.L
 	return nil
 }
 
-func (ww *WebsocketWrapper) compile(v *Vatel, e *Endpoint, l *zerolog.Logger) error {
+func (ww *WebsocketVatel) compile(v *Vatel, e *Endpoint, l *zerolog.Logger) error {
 	opath := "ws:" + e.Path
 	e.auth = v.auth
 	e.td = v.td
@@ -163,127 +146,38 @@ func (ww *WebsocketWrapper) compile(v *Vatel, e *Endpoint, l *zerolog.Logger) er
 }
 
 // OnOpen invocates by websocket server when new connection established.
-func (ww *WebsocketWrapper) OnOpen(c *websocket.Conn) {
-	ww.mux.Lock()
-	_ = ww.onOpen(c)
-	ww.mux.Unlock()
-	if ww.cfg.log != nil {
-		ww.cfg.log.Debug().Uint64("conId", c.ID()).Str("remoteAddr", c.RemoteAddr().String()).Msg("new ws connection")
-	}
-
+func (ww *WebsocketVatel) OnOpen(f func(*websocket.Conn)) {
+	ww.callbackOnOpen = f
+	ww.ws.HandleOpen(ww.onOpen)
 }
 
-func (dws *WebsocketWrapper) onOpen(c *websocket.Conn) int {
-	var idx int
-	if len(dws.delIndex) > 0 {
-		idx = dws.delIndex[len(dws.delIndex)-1]
-		dws.delIndex = dws.delIndex[:len(dws.delIndex)-1]
-		dws.conns[idx] = WebsocketConnection{wc: c, startedAt: time.Now()}
-	} else {
-		dws.conns = append(dws.conns, WebsocketConnection{wc: c, startedAt: time.Now()})
-		idx = len(dws.conns) - 1
+func (ww *WebsocketVatel) OnClose(f func(*websocket.Conn, error)) {
+	ww.callbackOnClose = f
+	ww.ws.HandleClose(ww.onClose)
+}
+
+func (dws *WebsocketVatel) onOpen(c *websocket.Conn) {
+	if dws.callbackOnOpen != nil {
+		dws.callbackOnOpen(c)
 	}
-	dws.idx[c.ID()] = idx
-	return idx
 }
 
 // OnClose invocates by websocket server when connection is closed.
-func (ww *WebsocketWrapper) OnClose(c *websocket.Conn, err error) {
-	ww.mux.Lock()
-	dur := ww.onClose(c.ID())
-	ww.mux.Unlock()
-
+func (ww *WebsocketVatel) onClose(c *websocket.Conn, err error) {
 	if ww.callbackOnClose != nil {
-		ww.callbackOnClose(c.ID())
-	}
-
-	if ww.cfg.log == nil {
-		return
-	}
-	zc := ww.cfg.log.Debug().Uint64("conId", c.ID()).Str("remoteAddr", c.RemoteAddr().String()).Str("dur", dur.String())
-	if err == nil {
-		zc.Msg("ws connection closed")
-	} else {
-		zc.Str("err", err.Error()).Msg("ws connection closed with error")
+		ww.callbackOnClose(c, err)
 	}
 }
 
-func (ww *WebsocketWrapper) onClose(id uint64) time.Duration {
-	var idx int
-	idx, ok := ww.idx[id]
-	if !ok {
-		return 0
-	}
-	dur := time.Since(ww.conns[idx].startedAt)
-
-	ww.delIndex = append(ww.delIndex, idx)
-	ww.conns[idx].wc = nil
-	ww.conns[idx].m.Reset()
-	delete(ww.idx, id)
-
-	// if ww.conns[idx].tp == nil {
-	// 	// the user is not logged in
-	// 	return dur
-	// }
-
-	// cdx, ok := ww.udx[ww.conns[idx].tp.User()]
-	// if !ok || len(cdx) == 0 {
-	// 	return dur
-	// }
-
-	// cx := -1
-
-	// for i, cid := range cdx {
-	// 	if cid == id {
-	// 		cx = i
-	// 		break
-	// 	}
-	// }
-	// if cx != -1 {
-	// 	copy(cdx[cx:], cdx[cx+1:])
-	// 	cdx = cdx[:len(cdx)-1]
-	// 	if len(cdx) == 0 {
-	// 		delete(ww.udx, ww.conns[idx].tp.User())
-	// 	} else {
-	// 		ww.udx[ww.conns[idx].tp.User()] = cdx
-	// 	}
-	// }
-	// ww.conns[idx].tp = nil
-
-	return dur
+func (ww *WebsocketVatel) Upgrade(ctx *fasthttp.RequestCtx) {
+	ww.ws.Upgrade(ctx)
 }
 
-func (dws *WebsocketWrapper) Upgrade(ctx Context) {
-	dws.ws.Upgrade(ctx.RequestCtx())
+func (ww *WebsocketVatel) UpgradeWithID(ctx *fasthttp.RequestCtx, id uint64) {
+	ww.ws.UpgradeWithID(ctx, id)
 }
 
-// type AuthConnectionHandler struct {
-// 	dws   *WebsocketGateway
-// 	input struct {
-// 		AccessToken string `json:"accessToken"`
-// 	}
-// 	output struct {
-// 		Result string
-// 	}
-// }
-
-// func (c *AuthConnectionHandler) Input() interface{} {
-// 	return &c.input
-// }
-
-// func (c *AuthConnectionHandler) Result() interface{} {
-// 	return &c.output
-// }
-
-// // Handle implements github.com/axkit/vatel Handler interface.
-// // The handler has no logic because if access token is
-// // invalid, middleware would not pass it to the handler.
-// func (c *AuthConnectionHandler) Handle(ctx WebsocketContext) error {
-// 	c.output.Result = time.Now().String()
-// 	return c.dws.Auth(ctx.ID(), []byte(c.input.AccessToken))
-// }
-
-type WebsocketMessage struct {
+type WebsocketRequest struct {
 	Path string          `json:"path"`
 	Data json.RawMessage `json:"data,omitempty"`
 }
@@ -292,11 +186,11 @@ type AuthMessageData struct {
 	AccessToken string `json:"accessToken"`
 }
 
-func (dws *WebsocketWrapper) onMessage(c *websocket.Conn, isBinary bool, data []byte) {
+func (dws *WebsocketVatel) onMessage(c *websocket.Conn, isBinary bool, data []byte) {
 
 	ctx := NewWsContext(c)
 
-	var msg WebsocketMessage
+	var msg WebsocketRequest
 	if err := json.Unmarshal(data, &msg); err != nil {
 		ex := errors.Catch(err).Set("reason", "invalid json").StatusCode(400).Msg("bad request")
 		c.Write(errors.ToClientJSON(ex))
@@ -307,20 +201,6 @@ func (dws *WebsocketWrapper) onMessage(c *websocket.Conn, isBinary bool, data []
 		c.Write(errors.ToClientJSON(errors.New("bad request").Set("reason", "empty path").StatusCode(400)))
 		return
 	}
-
-	// if msg.Path == "auth" {
-	// 	var amd AuthMessageData
-	// 	if err := json.Unmarshal(msg.Data, &amd); err != nil {
-	// 		c.Write(errors.ToClientJSON(err))
-	// 		return
-	// 	}
-	// 	if err := dws.Auth(c, []byte(amd.AccessToken)); err != nil {
-	// 		c.Write(errors.ToClientJSON(err))
-	// 		return
-	// 	}
-	// 	c.Write([]byte(`{"result": "ok"}`))
-	// 	return
-	// }
 
 	e, ok := dws.path[msg.Path]
 	if !ok {
@@ -349,23 +229,24 @@ func (dws *WebsocketWrapper) onMessage(c *websocket.Conn, isBinary bool, data []
 	}
 	zc = zco
 
-	dws.mux.RLock()
-	cidx, ok := dws.idx[c.ID()]
-	if !ok {
-		dws.mux.RUnlock()
-		dws.mux.Lock()
-		if cidx, ok = dws.idx[c.ID()]; !ok {
-			cidx = dws.onOpen(c)
-		}
-		dws.mux.Unlock()
-		dws.mux.RLock()
-	}
+	// AUTH PART !!!
+	// dws.mux.RLock()
+	// cidx, ok := dws.idx[c.ID()]
+	// if !ok {
+	// 	dws.mux.RUnlock()
+	// 	dws.mux.Lock()
+	// 	if cidx, ok = dws.idx[c.ID()]; !ok {
+	// 		cidx = dws.onOpen(c)
+	// 	}
+	// 	dws.mux.Unlock()
+	// 	dws.mux.RLock()
+	// }
 
-	cp := &dws.conns[cidx]
-	if cp.tp != nil {
-		ctx.SetTokenPayload(cp.tp)
-	}
-	dws.mux.RUnlock()
+	// cp := &dws.conns[cidx]
+	// if cp.tp != nil {
+	// 	ctx.SetTokenPayload(cp.tp)
+	// }
+	// dws.mux.RUnlock()
 
 	// for i := range e.middlewares[BeforeAuthorization] {
 	// 	if err := e.middlewares[BeforeAuthorization][i](ctx); err != nil {
@@ -387,10 +268,11 @@ func (dws *WebsocketWrapper) onMessage(c *websocket.Conn, isBinary bool, data []
 			zc = zc.Strs("perms", e.Perms)
 		}
 
-		if cp.tp.Role() == 0 {
-			wsWriteErrorResponse(e, ctx, c, verbose, &zc, errors.Forbidden().Capture())
-			return
-		}
+		// AUTH PART !!!
+		// if cp.tp.Role() == 0 {
+		// 	wsWriteErrorResponse(e, ctx, c, verbose, &zc, errors.Forbidden().Capture())
+		// 	return
+		// }
 
 		if err := e.wsAuthorize(ctx); err != nil {
 			wsWriteErrorResponse(e, ctx, c, verbose, &zc, err)
@@ -463,23 +345,23 @@ func (dws *WebsocketWrapper) onMessage(c *websocket.Conn, isBinary bool, data []
 	//e.Controller().Inp
 }
 
-func (dws *WebsocketWrapper) PingAll() {
-	dws.mux.RLock()
-	if len(dws.conns) == 0 {
-		dws.mux.RUnlock()
-		return
-	}
-	cs := make([]*websocket.Conn, 0, len(dws.conns))
-	for i := range dws.conns {
-		if dws.conns[i].wc != nil {
-			cs = append(cs, dws.conns[i].wc)
-		}
-	}
-	dws.mux.RUnlock()
-	for i := range cs {
-		cs[i].Write([]byte(`{"push": "ping"}`))
-	}
-}
+// func (dws *WebsocketWrapper) PingAll() {
+// 	dws.mux.RLock()
+// 	if len(dws.conns) == 0 {
+// 		dws.mux.RUnlock()
+// 		return
+// 	}
+// 	cs := make([]*websocket.Conn, 0, len(dws.conns))
+// 	for i := range dws.conns {
+// 		if dws.conns[i].wc != nil {
+// 			cs = append(cs, dws.conns[i].wc)
+// 		}
+// 	}
+// 	dws.mux.RUnlock()
+// 	for i := range cs {
+// 		cs[i].Write([]byte(`{"push": "ping"}`))
+// 	}
+// }
 
 // func (wg *WebsocketWrapper) Auth(c *websocket.Conn, token []byte) error {
 
@@ -584,40 +466,53 @@ func (e *Endpoint) wsAuthorize(ctx WebsocketContext) error {
 		StatusCode(401)
 }
 
-func (wg *WebsocketWrapper) TraverseAll(fn func(*WebsocketConnection) bool) {
+// func (wg *WebsocketWrapper) TraverseAll(fn func(*WebsocketConnection) bool) {
 
-	wg.mux.RLock()
-	defer wg.mux.RUnlock()
-	for i := range wg.conns {
-		if wg.conns[i].wc == nil {
-			continue
+// 	wg.mux.RLock()
+// 	defer wg.mux.RUnlock()
+// 	for i := range wg.conns {
+// 		if wg.conns[i].wc == nil {
+// 			continue
+// 		}
+// 		if stop := fn(&wg.conns[i]); stop {
+// 			break
+// 		}
+// 	}
+// }
+
+// func (ww *WebsocketWrapper) Traverse(cids []uint64, fn func(*WebsocketConnection)) {
+// 	ww.mux.RLock()
+// 	defer ww.mux.RUnlock()
+// 	for _, cid := range cids {
+// 		if idx, ok := ww.idx[cid]; ok {
+// 			fn(&ww.conns[idx])
+// 		}
+// 	}
+// }
+
+// func (ww *WebsocketWrapper) Write(cids []uint64, data []byte) {
+// 	ww.mux.RLock()
+// 	defer ww.mux.RUnlock()
+// 	for _, cid := range cids {
+// 		if idx, ok := ww.idx[cid]; ok {
+// 			ww.conns[idx].wc.Write(data)
+// 		}
+// 	}
+// }
+
+// func (ww *WebsocketWrapper) SetOnCloseCallback(fn func(cid uint64)) {
+// 	ww.callbackOnClose = fn
+// }
+
+func (wv *WebsocketVatel) UpdateAccessToken(cid uint64, token string) error {
+	if wv.cfg.td != nil {
+		at, err := wv.cfg.td.Decode([]byte(token))
+		if err != nil {
+			return err
 		}
-		if stop := fn(&wg.conns[i]); stop {
-			break
+		if wv.callbackOnTokenUpdate != nil {
+			wv.callbackOnTokenUpdate(cid, at.ApplicationPayload())
 		}
 	}
-}
-
-func (ww *WebsocketWrapper) Traverse(cids []uint64, fn func(*WebsocketConnection)) {
-	ww.mux.RLock()
-	defer ww.mux.RUnlock()
-	for _, cid := range cids {
-		if idx, ok := ww.idx[cid]; ok {
-			fn(&ww.conns[idx])
-		}
-	}
-}
-
-func (ww *WebsocketWrapper) Write(cids []uint64, data []byte) {
-	ww.mux.RLock()
-	defer ww.mux.RUnlock()
-	for _, cid := range cids {
-		if idx, ok := ww.idx[cid]; ok {
-			ww.conns[idx].wc.Write(data)
-		}
-	}
-}
-
-func (ww *WebsocketWrapper) SetOnCloseCallback(fn func(cid uint64)) {
-	ww.callbackOnClose = fn
+	return nil
 }

@@ -15,7 +15,7 @@ import (
 	"github.com/axkit/date"
 	"github.com/axkit/errors"
 	"github.com/axkit/vatel/jsonmask"
-	"github.com/dgrr/websocket"
+	"github.com/regorov/websocket"
 	"github.com/rs/zerolog"
 
 	//	goon "github.com/shurcooL/go-goon"

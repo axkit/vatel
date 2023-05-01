@@ -6,7 +6,7 @@ import (
 	"time"
 
 	"github.com/axkit/tinymap"
-	"github.com/dgrr/websocket"
+	"github.com/regorov/websocket"
 )
 
 type WebsocketContext interface {

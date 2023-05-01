@@ -90,7 +90,6 @@ type Vatel struct {
 
 	authDisabled bool
 	cfg          Option
-	ws           *WebsocketWrapper
 }
 
 // NewVatel returns new instance of Vatel.
@@ -105,9 +104,6 @@ func NewVatel(optFunc ...func(*Option)) *Vatel {
 	v.ep = []Endpoint{{Method: "GET", Path: "/", Controller: func() Handler { return &tocController{s: &v} }}}
 	return &v
 }
-func (va *Vatel) AddWebsocketSupport(dws *WebsocketWrapper) {
-	va.ws = dws
-}
 
 type Option struct {
 	urlPrefix          string
@@ -118,14 +114,18 @@ type Option struct {
 	jm                 JsonMasker
 	ala                Alarmer
 	mr                 MetricReporter
-	// websocketUpgradePath string
-	// ws                   *websocket.Server
-	// wsStore              WebSocketStorer
+	wv                 *WebsocketVatel
 }
 
 func WithMetricReporter(mr MetricReporter) func(*Option) {
 	return func(o *Option) {
 		o.mr = mr
+	}
+}
+
+func WithWebsocketSupport(wv *WebsocketVatel) func(*Option) {
+	return func(o *Option) {
+		o.wv = wv
 	}
 }
 
@@ -146,13 +146,6 @@ func WithStaticLoggingLevel() func(*Option) {
 		o.staticLoggingLevel = true
 	}
 }
-
-// func WithWebsocket(upgradePath string, wss WebSocketStorer) func(*Option) {
-// 	return func(o *Option) {
-// 		o.websocketUpgradePath = upgradePath
-// 		o.wsStore = wss
-// 	}
-// }
 
 // WithVerboseError sets verbose mode for error response to the client.
 func WithVerboseError(b bool) func(*Option) {
@@ -213,7 +206,7 @@ func (v *Vatel) SetTokenDecoder(tp TokenDecoder) {
 
 // Add add endpoints to the list.
 //
-// The method does not check Endpoint for corectness and uqiqueness here.
+// The method does not check Endpoint for correctness and uniqueness here.
 // Paths validation implemented by method BuildHandlers.
 func (v *Vatel) Add(e ...Endpointer) {
 	for i := range e {
@@ -221,7 +214,8 @@ func (v *Vatel) Add(e ...Endpointer) {
 	}
 }
 
-// Endpoints returns all registered endpoints.
+// Endpoints returns all registered endpoints. Vatel itself has only one endpoint GET /,
+// which returns the list of all registered endpoints.
 func (v *Vatel) Endpoints() []Endpoint {
 	return v.ep
 }
@@ -244,8 +238,8 @@ func (v *Vatel) BuildHandlers(mux *router.Router, l *zerolog.Logger) error {
 
 func (v *Vatel) buildHandlers(mux *router.Router, l *zerolog.Logger) error {
 
-	if v.ws != nil {
-		v.ep = append(v.ep, v.ws.Endpoints()...)
+	if v.cfg.wv != nil {
+		v.ep = append(v.ep, v.cfg.wv.Endpoints()...)
 	}
 
 	for i := range v.ep {
@@ -259,59 +253,16 @@ func (v *Vatel) buildHandlers(mux *router.Router, l *zerolog.Logger) error {
 		return v.ep[i].Path < v.ep[j].Path
 	})
 
-	// if v.cfg.websocketUpgradePath != "" {
-	// 	// v.ws.OnMessage =
-	// 	if v.cfg.wsStore != nil {
-	// 		v.ws.HandleOpen(v.cfg.wsStore.OnOpen)
-	// 		v.ws.HandleClose(v.cfg.wsStore.OnClose)
-	// 		v.ep = append(v.ep, Endpoint{
-	// 			LogOptions: LogExit,
-	// 			Method:     "WS",
-	// 			Path:       "auth",
-	// 			Controller: func() Handler { return &AuthConnectionHandler{v: v} },
-	// 		})
-	// 	}
-	// 	v.wsPath = make(map[string]*Endpoint)
-	// 	for i := range v.ep {
-	// 		e := &v.ep[i]
-	// 		if e.Method != "WS" { // Regular HTTP handlers processed above.
-	// 			continue
-	// 		}
-	// 		if _, ok := v.wsPath[e.Path]; ok {
-	// 			panic(e.Path + " is already registered")
-	// 		}
-	// 		logger := l.With().Str("method", e.Method).Str("path", e.Path).Logger()
-	// 		if err := e.wsCompile(v, &logger); err != nil {
-	// 			return err
-	// 		}
-	// 		v.wsPath[e.Path] = e
-
-	// 		// if e.Compress {
-	// 		// 	mux.Handle(e.Method, e.Path, fasthttp.CompressHandler(e.handler(&logger)))
-	// 		// } else {
-	// 		// 	mux.Handle(e.Method, e.Path, e.handler(&logger))
-	// 		// }
-	// 		logger.Info().Msg("ws handler registered")
-	// 	}
-	// 	v.ep = append(v.ep, Endpoint{
-	// 		LogOptions: LogExit,
-	// 		Method:     "GET",
-	// 		Path:       v.cfg.websocketUpgradePath,
-	// 		Controller: func() Handler { return &UpgradeConnectionHandler{v: v} },
-	// 	})
-
-	// 	v.ws.HandleData(v.wsMessageHandler)
-	// }
-
 	for i := range v.ep {
 		e := &v.ep[i]
 		logger := l.With().Str("method", e.Method).Str("path", e.Path).Logger()
 
-		if e.Method == "WS" { // websocket processed externally.
-			if v.ws == nil {
+		// websocket processes externally.
+		if e.Method == "WS" {
+			if v.cfg.wv == nil {
 				panic("websocket server was not assigned")
 			}
-			if err := v.ws.RegisterEndpoint(v, e, &logger); err != nil {
+			if err := v.cfg.wv.RegisterEndpoint(v, e, &logger); err != nil {
 				panic(err)
 			}
 			continue
@@ -337,8 +288,7 @@ type Dater interface {
 	Set(interface{})
 }
 
-// AddMiddleware adds middlewares to be called for every requests in
-// the same order.
+// AddMiddleware adds middleware to be called for every requests in the order of adding.
 func (v *Vatel) AddMiddleware(pos MiddlewarePos, f ...func(Context) error) {
 	v.mdw[pos] = append(v.mdw[pos], f...)
 }
