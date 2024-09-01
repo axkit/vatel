@@ -186,10 +186,11 @@ type Resulter interface {
 //
 // Example: if we have /customer/{id}/bill/{billnum} then
 // Param() should return reference to struct
-// {
-//		CustomerID int `param:"id"
-//	 	BillNum string `param:"billnum"`
-// }
+//
+//	{
+//			CustomerID int `param:"id"
+//		 	BillNum string `param:"billnum"`
+//	}
 //
 // If there is URL params and variables like /customer/{id}?sortBy=name&balanceAbove=100
 // methods Param and Input can return reference to the same struct.
@@ -202,8 +203,11 @@ func (e *Endpoint) writeErrorResponse(ctx Context, verbose bool, zc *zerolog.Con
 		return
 	}
 
+	fmt.Printf("err: %#v\n", err)
 	statusCode := 500
 	ce, ok := err.(*errors.CatchedError)
+
+	fmt.Printf("ce: %#v\n", ce)
 	if ok {
 		statusCode = ce.Last().StatusCode
 		if statusCode == 429 {

@@ -4,6 +4,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/axkit/errors"
 	"github.com/axkit/vatel/jsonmask"
 	"github.com/fasthttp/router"
 	"github.com/rs/zerolog"
@@ -263,7 +264,7 @@ func (v *Vatel) buildHandlers(mux *router.Router, l *zerolog.Logger) error {
 				panic("websocket server was not assigned")
 			}
 			if err := v.cfg.wv.RegisterEndpoint(v, e, &logger); err != nil {
-				panic(err)
+				panic(string(errors.ToServerJSON(err)))
 			}
 			continue
 		} else {

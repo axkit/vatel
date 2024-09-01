@@ -69,7 +69,7 @@ func (wv *WebsocketVatel) Endpoints() []Endpoint {
 // RegisterEndpoint is invocated by Vatel.MustBuildHandler() for every endpoint having method "WS".
 func (ww *WebsocketVatel) RegisterEndpoint(v *Vatel, e *Endpoint, l *zerolog.Logger) error {
 	if _, ok := ww.path[e.Path]; ok {
-		return errors.New("endpoint is already registered").Set("path", e.Path)
+		return errors.New("websocket endpoint is already registered").Set("path", e.Path)
 	}
 
 	if err := ww.compile(v, e, l); err != nil {
