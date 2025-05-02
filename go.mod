@@ -6,12 +6,12 @@ go 1.13
 //replace github.com/regorov/websocket => /home/gera/go/src/github.com/regorov/websocket
 
 require (
-	github.com/Ferluci/fast-realip v1.0.0
 	github.com/andybalholm/brotli v1.0.4 // indirect
 	github.com/axkit/aaa v0.1.0
-	github.com/axkit/bitset v0.1.0
+	github.com/axkit/bitset v1.0.0
 	github.com/axkit/date v0.3.1
-	github.com/axkit/errors v0.2.2
+	github.com/axkit/errors v0.2.4
+	github.com/axkit/fasthttp-realip v1.0.1
 	github.com/axkit/tinymap v0.0.2
 	github.com/fasthttp/router v1.4.4
 	github.com/google/uuid v1.3.0

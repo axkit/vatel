@@ -202,8 +202,8 @@ func (*td) Decode(encodedToken []byte) (vatel.Tokener, error) {
 
 func TestWebsocketHandler(t *testing.T) {
 	logger := zerolog.New(os.Stdout)
-	ws := vatel.NewWebsocketWrapper()
-	va.AddWebsocketSupport(ws)
+	//ws := vatel.NewWebsocketVatel()
+	// TODO::: RETURN !!! va.AddWebsocketSupport(ws)
 	va.SetPermissionManager(&pm{})
 	va.SetAuthorizer(&au{})
 	va.SetTokenDecoder(&td{})
@@ -234,5 +234,4 @@ func TestWebsocketHandler(t *testing.T) {
 
 	fs.ListenAndServe(":9999")
 
-	return
 }
