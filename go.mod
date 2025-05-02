@@ -8,12 +8,12 @@ go 1.13
 require (
 	github.com/andybalholm/brotli v1.0.4 // indirect
 	github.com/axkit/aaa v0.1.0
-	github.com/axkit/bitset v0.1.0
+	github.com/axkit/bitset v1.0.0
 	github.com/axkit/date v0.3.1
-	github.com/axkit/errors v0.2.2
+	github.com/axkit/errors v0.2.4
+	github.com/axkit/fasthttp-realip v1.0.1
 	github.com/axkit/tinymap v0.0.2
 	github.com/fasthttp/router v1.4.4
-	github.com/ferluci/fast-realip v1.0.1
 	github.com/google/uuid v1.3.0
 	github.com/klauspost/compress v1.13.6 // indirect
 	github.com/regorov/websocket v0.1.3

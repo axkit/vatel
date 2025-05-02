@@ -20,7 +20,7 @@ import (
 
 	//	goon "github.com/shurcooL/go-goon"
 	//	"github.com/hexops/valast"
-	realip "github.com/ferluci/fast-realip"
+	realip "github.com/axkit/fasthttp-realip"
 	"github.com/valyala/fasthttp"
 )
 
@@ -292,13 +292,14 @@ func (e *Endpoint) handler(l *zerolog.Logger) func(*fasthttp.RequestCtx) {
 			lo = e.LogOptions
 		}
 
+		ctx := NewContext(fctx)
+
 		zco = l.With().Str("client", realip.FromRequest(fctx))
 		if e.logRequestID {
 			zco = zco.Uint64("reqId", fctx.ID())
+			ctx.Set("reqId", fctx.ID())
 		}
 		zc = zco
-
-		ctx := NewContext(fctx)
 
 		for i := range e.middlewares[BeforeAuthorization] {
 			if err := e.middlewares[BeforeAuthorization][i](ctx); err != nil {
@@ -839,7 +840,7 @@ func (e *Endpoint) compile(v *Vatel) error {
 	e.middlewares = v.mdw
 	e.staticLoggingLevel = v.cfg.staticLoggingLevel
 	e.verboseError = v.cfg.verboseError
-	e.logRequestID = v.cfg.logRequestID
+	e.logRequestID = true // v.cfg.logRequestID
 	e.jm = v.cfg.jm
 	e.ala = v.cfg.ala
 	e.mr = v.cfg.mr

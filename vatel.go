@@ -190,7 +190,6 @@ func (v *Vatel) DisableAuthorizer() {
 }
 
 // SetPermissionManager assigns implementation of permission manager.
-//
 func (v *Vatel) SetPermissionManager(pm PermissionManager) {
 	v.pm = pm
 }
@@ -223,8 +222,8 @@ func (v *Vatel) Endpoints() []Endpoint {
 
 // MustBuildHandlers initializes http mux with rules by converting []Endpoint
 // added before. Panics if:
-// 	- there are Perms but SetAuthorizer or SetTokenDecoder were not called.
-// 	-
+//   - there are Perms but SetAuthorizer or SetTokenDecoder were not called.
+//     -
 func (v *Vatel) MustBuildHandlers(mux *router.Router, l *zerolog.Logger) {
 	if err := v.buildHandlers(mux, l); err != nil {
 		panic(err.Error())
