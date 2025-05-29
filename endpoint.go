@@ -207,7 +207,7 @@ func (e *Endpoint) writeErrorResponse(ctx Context, verbose bool, zc *zerolog.Con
 
 	//fmt.Printf("ce: %#v\n", ce)
 	if xe, ok := err.(*errors.Error); ok {
-		ce := errors.Serialize(xe)
+		ce := errors.Serialize(xe, errors.WithAttributes(errors.ServerOutputFormat))
 		statusCode = ce.StatusCode
 		if statusCode == 429 {
 			// in case of too many requests, look if error has attribute Retry-After
