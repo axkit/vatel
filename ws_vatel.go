@@ -69,7 +69,7 @@ func (wv *WebsocketVatel) Endpoints() []Endpoint {
 // RegisterEndpoint is invocated by Vatel.MustBuildHandler() for every endpoint having method "WS".
 func (ww *WebsocketVatel) RegisterEndpoint(v *Vatel, e *Endpoint, l *zerolog.Logger) error {
 	if _, ok := ww.path[e.Path]; ok {
-		return errors.New("websocket endpoint is already registered").Set("path", e.Path)
+		return errors.Template("websocket endpoint is already registered").New().Set("path", e.Path)
 	}
 
 	if err := ww.compile(v, e, l); err != nil {
@@ -186,26 +186,33 @@ type AuthMessageData struct {
 	AccessToken string `json:"accessToken"`
 }
 
+func ToClientJSON(err error) []byte {
+	if err == nil {
+		return nil
+	}
+	return errors.ToJSON(err, errors.WithAttributes(errors.ClientOutputFormat))
+}
+
 func (dws *WebsocketVatel) onMessage(c *websocket.Conn, isBinary bool, data []byte) {
 
 	ctx := NewWsContext(c)
 
 	var msg WebsocketRequest
 	if err := json.Unmarshal(data, &msg); err != nil {
-		ex := errors.Catch(err).Set("reason", "invalid json").StatusCode(400).Msg("bad request")
-		c.Write(errors.ToClientJSON(ex))
+		ex := ErrInvalidRequestBody.Wrap(err).Set("reason", "invalid json").StatusCode(400).Msg("bad request")
+		c.Write(ToClientJSON(ex))
 		return
 	}
 
 	if msg.Path == "" {
-		c.Write(errors.ToClientJSON(errors.New("bad request").Set("reason", "empty path").StatusCode(400)))
+		c.Write(ToClientJSON(errors.Template("bad request").New().Set("reason", "empty path").StatusCode(400)))
 		return
 	}
 
 	e, ok := dws.path[msg.Path]
 	if !ok {
-		err := errors.New("unknown path").StatusCode(404)
-		c.Write(errors.ToClientJSON(err))
+		err := errors.Template("unknown path").New().StatusCode(404)
+		c.Write(ToClientJSON(err))
 		return
 	}
 
@@ -395,13 +402,14 @@ func wsWriteErrorResponse(e *Endpoint, ctx WebsocketContext, c *websocket.Conn, 
 	}
 
 	statusCode := 500
-	ce, ok := err.(*errors.CatchedError)
-	if ok {
-		statusCode = ce.Last().StatusCode
+
+	if xe, ok := err.(*errors.Error); ok {
+		ce := errors.Serialize(xe)
+		statusCode = ce.StatusCode
 		if statusCode == 429 {
 			// in case of too many requests, look if error has attribute Retry-After
 			var hv []byte
-			if ra, ok := ce.Get("Retry-After"); ok {
+			if ra, ok := ce.Fields["Retry-After"]; ok {
 				switch ra.(type) {
 				case int, int64, int32, int16, int8, uint, uint64, uint32, uint16, uint8:
 					hv = []byte(fmt.Sprintf("%d", ra))
@@ -420,15 +428,15 @@ func wsWriteErrorResponse(e *Endpoint, ctx WebsocketContext, c *websocket.Conn, 
 		z = z.Interface(string(key), v)
 	})
 
-	zl := z.RawJSON("err", errors.ToServerJSON(err)).Logger()
+	zl := z.RawJSON("err", errors.ToJSON(err, errors.WithAttributes(errors.ServerOutputFormat))).Logger()
 	zl.Error().Msg("request failed")
 
-	var ff errors.FormattingFlag
+	var ff errors.ErrorSerializationRule
 	if verbose {
 		ff = errors.AddStack | errors.AddFields | errors.AddWrappedErrors
 	}
 
-	buf := errors.ToJSON(err, ff)
+	buf := errors.ToJSON(err, errors.WithAttributes(ff))
 	_, xerr := c.Write(buf)
 
 	if xerr != nil {
@@ -453,17 +461,16 @@ func (e *Endpoint) wsAuthorize(ctx WebsocketContext) error {
 		if isAllowed {
 			return nil
 		}
-		return errors.Forbidden().
+		return ErrForbidden.New().
 			Set("user", ctx.TokenPayload().Login()).
 			Set("role", ctx.TokenPayload().Role()).
-			SetStrs("perms", e.Perms...)
+			Set("perms", e.Perms)
 	}
 
-	return errors.Catch(err).
+	return ErrUnauthorized.Wrap(err).
 		Set("user", ctx.TokenPayload().Login()).
 		Set("role", ctx.TokenPayload().Role()).
-		SetStrs("perms", e.Perms...).
-		StatusCode(401)
+		Set("perms", e.Perms)
 }
 
 // func (wg *WebsocketWrapper) TraverseAll(fn func(*WebsocketConnection) bool) {

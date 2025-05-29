@@ -2,10 +2,12 @@ package vatel_test
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
 	"testing"
 
+	//"github.com/axkit/aaa"
 	"github.com/axkit/aaa"
 	"github.com/axkit/bitset"
 	"github.com/axkit/errors"
@@ -16,9 +18,10 @@ import (
 )
 
 var (
-	va  *vatel.Vatel
-	a   *aaa.BasicAAA
-	cfg = aaa.DefaultConfig
+	va *vatel.Vatel
+	//a           *aaa.BasicAAA
+	//cfg         = aaa.DefaultConfig
+	ErrNotFound = errors.Template("not found").StatusCode(404)
 )
 
 type User struct {
@@ -39,14 +42,14 @@ func (*us) UserByCredentials(login, password string) (aaa.Userer, error) {
 	if login == "gera" {
 		return &User{id: 1, login: "gera", role: 1, isLocked: false}, nil
 	}
-	return nil, errors.NotFound("unknown user")
+	return nil, ErrNotFound.New().Set("reason", "unknown user credentials")
 }
 
 func (*us) UserByID(userID int) (aaa.Userer, error) {
 	if userID == 1 {
 		return &User{id: 1, login: "gera", role: 1, isLocked: false}, nil
 	}
-	return nil, errors.NotFound("unknown user id")
+	return nil, ErrNotFound.New().Set("reason", "unknown user id")
 }
 
 type rs struct{}
@@ -60,9 +63,11 @@ func (*rs) IsRoleExist(roleID int) bool {
 
 func (*rs) RolePermissions(roleID int) ([]string, bitset.BitSet) {
 	if roleID == 3 {
-		return []string{"Ping", "Follow"}, *bitset.New(8).Set(1, 2)
+		bs := bitset.New(8)
+		bs.Set(true, 1, 2) // Set permissions for "Ping" and "FollowCalendar"
+		return []string{"Ping", "Follow"}, &bs
 	}
-	return nil, bitset.BitSet{}
+	return nil, &bitset.ByteBitSet{}
 }
 
 var (
@@ -174,11 +179,11 @@ type au struct{}
 func (*au) IsAllowed(requestPerms []byte, endpointPerms ...uint) (bool, error) {
 
 	if n := len(requestPerms); n > 0 && n%2 != 0 {
-		return false, errors.Forbidden().Set("reason", "invalid request permission set")
+		return false, vatel.ErrForbidden.New().Set("reason", "invalid request permission set")
 	}
-	ok, err := bitset.AreSet(requestPerms, endpointPerms...)
+	ok, err := bitset.AreSet(requestPerms, bitset.Any, endpointPerms...)
 	if err != nil {
-		return false, errors.Catch(err).StatusCode(403)
+		return false, vatel.ErrForbidden.New().Set("reason", "failed to check permissions")
 	}
 	return ok, nil
 }
@@ -187,16 +192,19 @@ type td struct{}
 
 func (*td) Decode(encodedToken []byte) (vatel.Tokener, error) {
 	if bytes.Equal(encodedToken, []byte("abc")) {
-		return nil, errors.Unauthorized()
+		return nil, vatel.ErrUnauthorized.New().Set("reason", "invalid token")
 	}
+
+	bs := bitset.New(8)
+	bs.Set(true, 1, 2) // Set permissions for "Ping" and "FollowCalendar"
 	return &aaa.Token{
 		App: aaa.ApplicationPayload{
-			UserID:           1,                                        //int                    `json:"user"`
-			UserLogin:        "gera",                                   //string                 `json:"login"`
-			RoleID:           2,                                        //int                    `json:"role"`
-			PermissionBitSet: []byte(bitset.New(8).Set(1, 2).String()), //json.RawMessage        `json:"perms,omitempty"`
-			IsDebug:          true,                                     //bool                   `json:"debug,omitempty"`
-			ExtraPayload:     nil,                                      //map[string]interface{} `json:"extra,omitempty"`
+			UserID:           1,                            //int                    `json:"user"`
+			UserLogin:        "gera",                       //string                 `json:"login"`
+			RoleID:           2,                            //int                    `json:"role"`
+			PermissionBitSet: json.RawMessage(bs.String()), //json.RawMessage        `json:"perms,omitempty"`
+			IsDebug:          true,                         //bool                   `json:"debug,omitempty"`
+			ExtraPayload:     nil,                          //map[string]interface{} `json:"extra,omitempty"`
 		}}, nil
 }
 

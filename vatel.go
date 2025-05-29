@@ -263,7 +263,7 @@ func (v *Vatel) buildHandlers(mux *router.Router, l *zerolog.Logger) error {
 				panic("websocket server was not assigned")
 			}
 			if err := v.cfg.wv.RegisterEndpoint(v, e, &logger); err != nil {
-				panic(string(errors.ToServerJSON(err)))
+				panic(string(errors.ToJSON(err, errors.WithAttributes(errors.ServerDebugOutputFormat))))
 			}
 			continue
 		} else {

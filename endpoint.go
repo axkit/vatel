@@ -203,17 +203,16 @@ func (e *Endpoint) writeErrorResponse(ctx Context, verbose bool, zc *zerolog.Con
 		return
 	}
 
-	fmt.Printf("err: %#v\n", err)
 	statusCode := 500
-	ce, ok := err.(*errors.CatchedError)
 
-	fmt.Printf("ce: %#v\n", ce)
-	if ok {
-		statusCode = ce.Last().StatusCode
+	//fmt.Printf("ce: %#v\n", ce)
+	if xe, ok := err.(*errors.Error); ok {
+		ce := errors.Serialize(xe)
+		statusCode = ce.StatusCode
 		if statusCode == 429 {
 			// in case of too many requests, look if error has attribute Retry-After
 			var hv []byte
-			if ra, ok := ce.Get("Retry-After"); ok {
+			if ra, ok := ce.Fields["Retry-After"]; ok {
 				switch ra.(type) {
 				case int, int64, int32, int16, int8, uint, uint64, uint32, uint16, uint8:
 					hv = []byte(fmt.Sprintf("%d", ra))
@@ -232,18 +231,23 @@ func (e *Endpoint) writeErrorResponse(ctx Context, verbose bool, zc *zerolog.Con
 		z = z.Interface(string(key), v)
 	})
 
-	zl := z.RawJSON("err", errors.ToServerJSON(err)).Logger()
+	zl := z.RawJSON("err",
+		errors.ToJSON(err,
+			errors.WithAttributes(errors.ServerOutputFormat),
+		)).Logger()
+
 	zl.Error().Msg("request failed")
 
 	ctx.SetContentType([]byte("application/json; charset=utf-8"))
 	ctx.SetStatusCode(statusCode)
 
-	var ff errors.FormattingFlag
+	var ff errors.ErrorSerializationRule
 	if verbose {
+		//ff = errors.AddStack | errors.AddFields | errors.AddWrappedErrors
 		ff = errors.AddStack | errors.AddFields | errors.AddWrappedErrors
 	}
 
-	_, xerr := ctx.BodyWriter().Write(errors.ToJSON(err, ff))
+	_, xerr := ctx.BodyWriter().Write(errors.ToJSON(err, errors.WithAttributes(ff)))
 
 	if xerr != nil {
 		//zl.With().Error().RawJSON("err", errors.ToServerJSON(xerr)).Msg("writing http response failed")
@@ -325,7 +329,7 @@ func (e *Endpoint) handler(l *zerolog.Logger) func(*fasthttp.RequestCtx) {
 			}
 
 			if len(at) == 0 && len(e.Perms) > 0 {
-				e.writeErrorResponse(ctx, verbose, &zc, ErrAuthorizationHeaderMissed.Capture())
+				e.writeErrorResponse(ctx, verbose, &zc, ErrAuthorizationHeaderMissed.New())
 				return
 			}
 
@@ -516,8 +520,13 @@ func (e *Endpoint) wsWriteResponse(c *websocket.Conn, lo LogOption, res interfac
 }
 
 var (
-	ErrAuthorizationHeaderMissed = errors.New("header Authorization missed").Code("VTL-0001").StatusCode(401).Critical()
-	ErrAccessTokenRevoked        = errors.New("access token revoked").Code("VTL-0002").StatusCode(401).Critical()
+	ErrAuthorizationHeaderMissed = errors.Template("header Authorization missed").Code("VTL-0001").StatusCode(401).Severity(errors.Medium)
+	ErrAccessTokenRevoked        = errors.Template("access token revoked").Code("VTL-0002").StatusCode(401).Severity(errors.Medium)
+	ErrForbidden                 = errors.Template("forbidden").Code("VTL-0003").StatusCode(403).Severity(errors.Medium)
+	ErrUnauthorized              = errors.Template("unauthorized").Code("VTL-0004").StatusCode(401).Severity(errors.Medium)
+	ErrInternalError             = errors.Template("internal error").Code("VTL-0005").StatusCode(500).Severity(errors.Critical)
+	ErrValidationFailed          = errors.Template("validation failed").Code("VTL-0006").StatusCode(400).Severity(errors.Tiny)
+	ErrInvalidRequestBody        = errors.Template("invalid request body").Code("VTL-0007").StatusCode(400).Severity(errors.Tiny)
 )
 
 func (e *Endpoint) authorize(at []byte) (Tokener, error) {
@@ -529,13 +538,13 @@ func (e *Endpoint) authorize(at []byte) (Tokener, error) {
 		}
 
 		if isRevoked {
-			return nil, ErrAccessTokenRevoked.Capture()
+			return nil, ErrAccessTokenRevoked.New()
 		}
 	}
 
 	token, err := e.td.Decode(at)
 	if err != nil {
-		return nil, errors.Catch(err).SetStrs("perms", e.Perms...).Msg("unauthorized")
+		return nil, errors.Wrap(err, "unauthorized").Set("perms", e.Perms)
 	}
 
 	if len(e.Perms) == 0 {
@@ -547,17 +556,16 @@ func (e *Endpoint) authorize(at []byte) (Tokener, error) {
 		if isAllowed {
 			return token, nil
 		}
-		return nil, errors.Forbidden().
+		return nil, ErrForbidden.New().
 			Set("user", token.ApplicationPayload().Login()).
 			Set("role", token.ApplicationPayload().Role()).
-			SetStrs("perms", e.Perms...)
+			Set("perms", e.Perms)
 	}
 
-	return nil, errors.Catch(err).
+	return nil, ErrUnauthorized.New().
 		Set("user", token.ApplicationPayload().Login()).
 		Set("role", token.ApplicationPayload().Role()).
-		SetStrs("perms", e.Perms...).
-		StatusCode(401)
+		Set("perms", e.Perms)
 
 }
 
@@ -630,7 +638,7 @@ func (e *Endpoint) handleDescription(ctx Context) error {
 
 	_, err := ctx.BodyWriter().Write(e.genDescription(c))
 	if err != nil {
-		return errors.Catch(err).StatusCode(500).Msg("description response write failed")
+		return errors.Wrap(err, "description response write failed").StatusCode(500)
 	}
 	return nil
 }
@@ -682,7 +690,7 @@ func decodeParams(ctx *fasthttp.RequestCtx, param interface{}, zcin zerolog.Cont
 
 		uv := ctx.UserValue(tag)
 		if uv == nil {
-			return zc, errors.InternalError().Set("name", tag).Msg("path param not found")
+			return zc, ErrInternalError.New().Set("name", tag).Msg("path param not found")
 		}
 
 		val, ok := uv.(string)
@@ -696,13 +704,13 @@ func decodeParams(ctx *fasthttp.RequestCtx, param interface{}, zcin zerolog.Cont
 		case int, int8, int16, int32, int64:
 			i, err := strconv.ParseInt(val, 10, 64)
 			if err != nil {
-				return zc, errors.ValidationFailed(err.Error())
+				return zc, ErrValidationFailed.Wrap(err)
 			}
 			sf.SetInt(i)
 		case uint, uint8, uint16, uint32, uint64:
 			i, err := strconv.ParseUint(val, 10, 64)
 			if err != nil {
-				return zc, errors.ValidationFailed(err.Error())
+				return zc, ErrValidationFailed.Wrap(err)
 			}
 			sf.SetUint(i)
 		case string:
@@ -710,19 +718,19 @@ func decodeParams(ctx *fasthttp.RequestCtx, param interface{}, zcin zerolog.Cont
 		case bool:
 			b, err := strconv.ParseBool(val)
 			if err != nil {
-				return zc, errors.ValidationFailed(err.Error())
+				return zc, ErrValidationFailed.Wrap(err)
 			}
 			sf.SetBool(b)
 		case float32, float64:
 			f, err := strconv.ParseFloat(val, 64)
 			if err != nil {
-				return zc, errors.ValidationFailed(err.Error())
+				return zc, ErrValidationFailed.Wrap(err)
 			}
 			sf.SetFloat(f)
 		case []string:
 			break
 		default:
-			return zc, errors.ValidationFailed("unsupported go type").Set("tag", tag)
+			return zc, ErrValidationFailed.New().Msg("unsupported go type").Set("tag", tag)
 		}
 	}
 	return zc, nil
@@ -735,9 +743,13 @@ func assign(val string, i interface{}) error {
 func decodeBody(ctx *fasthttp.RequestCtx, dest interface{}) error {
 	buf := ctx.Request.Body()
 	if len(buf) == 0 {
-		return errors.InvalidRequestBody("empty request body. JSON expected")
+		return ErrInvalidRequestBody.New().Msg("empty request body. JSON expected")
 	}
-	return json.Unmarshal(buf, dest)
+
+	if err := json.Unmarshal(buf, dest); err != nil {
+		return ErrInvalidRequestBody.Wrap(err).Msg("request body is not a valid JSON")
+	}
+	return nil
 }
 
 func decodeURLQuery(ctx *fasthttp.RequestCtx, input interface{}, zc zerolog.Context) (zerolog.Context, error) {
@@ -823,7 +835,8 @@ func decodeURLQuery(ctx *fasthttp.RequestCtx, input interface{}, zc zerolog.Cont
 			}
 			sf.SetBool(b)
 		default:
-			return zc, errors.ValidationFailed("unsupported type").Set("val", string(val)).Set("kind", sf.Kind().String())
+			return zc, ErrValidationFailed.New().Msg("unsupported type").
+				Set("val", string(val)).Set("kind", sf.Kind().String())
 		}
 	}
 	return zc, nil
