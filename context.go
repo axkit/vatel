@@ -4,111 +4,148 @@ import (
 	"context"
 	"io"
 	"mime/multipart"
+	"time"
 
+	realip "github.com/axkit/fasthttp-realip"
 	"github.com/valyala/fasthttp"
 )
 
+// Context is the per-request interface passed to every Handler, middleware,
+// and response hook. It wraps the underlying HTTP request and response without
+// exposing the fasthttp implementation.
 type Context interface {
+	// Response writing
 	BodyWriter() io.Writer
 	SetContentType([]byte) Context
 	SetStatusCode(code int) Context
+	SetHeader(name, val []byte) Context
+
+	// Request reading
+	Header(name string) []byte
+	RemoteAddr() string
+	RequestTime() time.Time
+	RequestBody() []byte
+	PathValue(name string) string
+	QueryValue(name string) []byte
+
+	// File handling
 	FormFile(key string) (*multipart.FileHeader, error)
 	FormValue(key string) []byte
 	SaveMultipartFile(fh *multipart.FileHeader, path string) error
-	Header(name string) []byte
-	TokenPayload() TokenPayloader
-	SetTokenPayload(tp TokenPayloader)
-	SetHeader(name, val []byte) Context
-	RequestCtx() *fasthttp.RequestCtx
+
+	// Auth — the payload set by auth middleware, nil if unauthenticated.
+	// Handlers cast it to their concrete type: ctx.TokenPayload().(*MyClaims).
+	TokenPayload() any
+	SetTokenPayload(tp any)
+
+	// VerboseError reports whether the auth middleware requested verbose error
+	// responses for this request (e.g. for debug/admin tokens).
+	VerboseError() bool
+	SetVerboseError(bool)
+
+	// Per-request key-value store (for middleware ↔ handler communication)
 	Set(key string, val interface{}) Context
 	Get(key string) interface{}
 	VisitUserValues(func(key []byte, val interface{}))
+
+	// Standard Go context for deadline/cancellation propagation.
+	Context() context.Context
 }
 
+// VatelContext is the concrete Context implementation wrapping fasthttp.RequestCtx.
 type VatelContext struct {
-	cancel context.CancelFunc
-	fh     *fasthttp.RequestCtx
-	kv     map[string]interface{}
-	tp     TokenPayloader
+	fh         *fasthttp.RequestCtx
+	tp         any
+	verboseErr bool
+	ctx        context.Context
 }
 
-func NewContext(ctx *fasthttp.RequestCtx) Context {
-	c := VatelContext{
-		fh: ctx,
+// NewContext creates a Context wrapping the given fasthttp request context.
+func NewContext(fctx *fasthttp.RequestCtx) Context {
+	return &VatelContext{
+		fh:  fctx,
+		ctx: context.Background(),
 	}
-	return &c
 }
 
-func (ctx *VatelContext) SetTokenPayload(tp TokenPayloader) {
-	ctx.tp = tp
+func (c *VatelContext) BodyWriter() io.Writer {
+	return c.fh.Response.BodyWriter()
 }
 
-func (ctx *VatelContext) TokenPayload() TokenPayloader {
-	return ctx.tp
+func (c *VatelContext) SetContentType(ct []byte) Context {
+	c.fh.Response.Header.SetContentTypeBytes(ct)
+	return c
 }
 
-func (ctx *VatelContext) FormFile(key string) (*multipart.FileHeader, error) {
-	return ctx.fh.FormFile(key)
+func (c *VatelContext) SetStatusCode(code int) Context {
+	c.fh.SetStatusCode(code)
+	return c
 }
 
-func (ctx *VatelContext) FormValue(key string) []byte {
-	return ctx.fh.FormValue(key)
-}
-func (ctx *VatelContext) Header(name string) []byte {
-	return ctx.fh.Request.Header.Peek(name)
+func (c *VatelContext) SetHeader(name, val []byte) Context {
+	c.fh.Response.Header.SetBytesKV(name, val)
+	return c
 }
 
-func (ctx *VatelContext) SaveMultipartFile(fh *multipart.FileHeader, path string) error {
+func (c *VatelContext) Header(name string) []byte {
+	return c.fh.Request.Header.Peek(name)
+}
+
+func (c *VatelContext) RemoteAddr() string {
+	return realip.FromRequest(c.fh)
+}
+
+func (c *VatelContext) RequestTime() time.Time {
+	return c.fh.Time()
+}
+
+func (c *VatelContext) RequestBody() []byte {
+	return c.fh.Request.Body()
+}
+
+func (c *VatelContext) PathValue(name string) string {
+	v := c.fh.UserValue(name)
+	if v == nil {
+		return ""
+	}
+	s, _ := v.(string)
+	return s
+}
+
+func (c *VatelContext) QueryValue(name string) []byte {
+	return c.fh.QueryArgs().Peek(name)
+}
+
+func (c *VatelContext) FormFile(key string) (*multipart.FileHeader, error) {
+	return c.fh.FormFile(key)
+}
+
+func (c *VatelContext) FormValue(key string) []byte {
+	return c.fh.FormValue(key)
+}
+
+func (c *VatelContext) SaveMultipartFile(fh *multipart.FileHeader, path string) error {
 	return fasthttp.SaveMultipartFile(fh, path)
 }
 
-func (ctx *VatelContext) SetContentType(contentType []byte) Context {
-	ctx.fh.Response.Header.SetContentTypeBytes(contentType)
-	return ctx
+func (c *VatelContext) TokenPayload() any      { return c.tp }
+func (c *VatelContext) SetTokenPayload(tp any) { c.tp = tp }
+func (c *VatelContext) VerboseError() bool     { return c.verboseErr }
+func (c *VatelContext) SetVerboseError(v bool) { c.verboseErr = v }
+
+func (c *VatelContext) Set(key string, val interface{}) Context {
+	c.fh.SetUserValue(key, val)
+	return c
 }
 
-func (ctx *VatelContext) SetHeader(name, val []byte) Context {
-	ctx.fh.Response.Header.SetBytesKV(name, val)
-	return ctx
+func (c *VatelContext) Get(key string) interface{} {
+	return c.fh.UserValue(key)
 }
 
-func (ctx *VatelContext) Log(key string, val interface{}) Context {
-	if ctx.kv == nil {
-		ctx.kv = make(map[string]interface{}, 1)
-	}
-	ctx.kv[key] = val
-	return ctx
+func (c *VatelContext) VisitUserValues(f func(key []byte, val interface{})) {
+	c.fh.VisitUserValues(f)
 }
 
-func (ctx *VatelContext) LogValues() map[string]interface{} {
-	return ctx.kv
-}
-
-//
-func (ctx *VatelContext) BodyWriter() io.Writer {
-	return ctx.fh.Response.BodyWriter()
-}
-
-// SetStatusCode sets HTTP status code.
-func (ctx *VatelContext) SetStatusCode(code int) Context {
-	ctx.fh.SetStatusCode(code)
-	return ctx
-}
-
-// RequestCtx returns fasthttp's context.
-func (ctx *VatelContext) RequestCtx() *fasthttp.RequestCtx {
-	return ctx.fh
-}
-
-func (ctx *VatelContext) Get(key string) interface{} {
-	return ctx.fh.UserValue(key)
-}
-
-func (ctx *VatelContext) Set(key string, val interface{}) Context {
-	ctx.fh.SetUserValue(key, val)
-	return ctx
-}
-
-func (ctx *VatelContext) VisitUserValues(f func(key []byte, v interface{})) {
-	ctx.fh.VisitUserValues(f)
+func (c *VatelContext) Context() context.Context {
+	return c.ctx
 }

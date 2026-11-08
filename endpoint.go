@@ -4,36 +4,33 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"path"
 	"reflect"
 	"regexp"
-	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
 
-	"github.com/axkit/date"
 	"github.com/axkit/errors"
 	"github.com/axkit/vatel/jsonmask"
+	realip "github.com/axkit/fasthttp-realip"
 	"github.com/regorov/websocket"
 	"github.com/rs/zerolog"
-
-	//	goon "github.com/shurcooL/go-goon"
-	//	"github.com/hexops/valast"
-	realip "github.com/axkit/fasthttp-realip"
 	"github.com/valyala/fasthttp"
 )
 
+// LogOption is a bitmask controlling per-endpoint log verbosity.
 type LogOption uint32
 
 const (
-	LogSilent LogOption = 1 << iota
-	LogEnter
-	LogExit
-	LogReqBody
-	LogReqInput
-	LogRespBody
-	LogRespOutput
+	LogSilent    LogOption = 1 << iota // suppress all logging for this endpoint
+	LogEnter                           // log when a request arrives
+	LogExit                            // log when a request completes
+	LogReqBody                         // log the raw request body
+	LogReqInput                        // log the decoded input struct
+	LogRespBody                        // log the raw response body (masked if configured)
+	LogRespOutput                      // log the response struct before marshalling
 )
 
 var logOptionString = map[string]LogOption{
@@ -53,472 +50,98 @@ const (
 	LogConfidential           = LogExit
 )
 
-type MiddlewarePos int
-
-const (
-	BeforeAuthorization MiddlewarePos = iota
-	AfterAuthorization
-	OnSuccessResponse
-	OnErrorResponse
-)
-
-type middlewareSet [3][]func(Context) error
-
-// Endpoint describes a REST endpoint attributes and related request Handler.
+// Endpoint describes a single REST or WebSocket endpoint and its configuration.
 type Endpoint struct {
-	staticLoggingLevel bool
-	verboseError       bool
-	logRequestID       bool
-	LogOptions         LogOption
+	// EndpointMeta is the static definition of the endpoint — method, path,
+	// required permissions, and log verbosity. It is passed as-is to every
+	// middleware so middleware can make decisions based on endpoint configuration
+	// without accessing internal state.
+	EndpointMeta
 
-	// Method holds HTTP method name (e.g GET, POST, PUT, DELETE, WS).
-	Method string
+	// Additional public configuration fields.
+	Compress            bool
+	NoInputLog          bool
+	NoResultLog         bool
+	ManualStatusCode    bool
+	SuccessStatusCode   int
+	ResponseContentType string
+	LanguageLabel       string
 
-	// Wraps response by gzip compression function.
-	Compress bool
-
-	// Path holds url path with fasthttp parameters (e.g. /customers/{id}).
-	Path string
-
-	// Perms holds list of permissions. Nil if endpoint is public.
-	Perms []string
-
-	// Controller holds reference to the object implementing interface Handler.
-	Controller func() Handler
-
+	// Controller factories — exactly one must be set.
+	Controller          func() Handler
 	WebsocketController func() WebsocketHandler
 
-	// ResponseContentType by default has "application/json; charset: utf-8;"
-	ResponseContentType string
-	responseContentType []byte
-
-	// NoInputLog defines debug logging rule for request data. If true, endpoint request body
-	// will not be written to the log. (i.e authentication endpoint).
-	NoInputLog bool
-
-	// NoResultLog defines debug logging rule for response data. If true, endpoint response body
-	// will not be written to the log. (i.e authentication  endpoint)
-	NoResultLog bool
-
-	ManualStatusCode bool
-
-	//
-	SuccessStatusCode int
-
+	// Internal — populated by compile().
+	staticLoggingLevel    bool
+	verboseError          bool
+	logRequestID          bool
+	clientErrorFields     []string
+	responseContentType   []byte
 	isPathParametrized    bool
 	isURLQueryExpected    bool
 	isRequestBodyExpected bool
 	hasRespBody           bool
-
-	LanguageLabel string
-	auth          Authorizer
-	td            TokenDecoder
-	pm            PermissionManager
-	rd            RequestDebugger
-	rtc           RevokeTokenChecker
-	perms         []uint
-
-	middlewares middlewareSet
-
-	jm           JsonMasker
-	inputFields  jsonmask.Fields
-	resultFields jsonmask.Fields
-
-	ala      Alarmer
-	mr       MetricReporter
-	wsLogger *zerolog.Logger
+	middlewares           middlewareSet
+	localMdw              middlewareSet // per-endpoint middleware, set via AddMiddleware
+	jm                    JsonMasker
+	inputFields           jsonmask.Fields
+	resultFields          jsonmask.Fields
+	paramFields           []fieldInfo // precomputed path param layout
+	queryFields           []fieldInfo // precomputed query/body input layout
+	ala                   Alarmer
+	mr                    MetricReporter
+	wsLogger              *zerolog.Logger
 }
 
-// NewEndpoint builds Endpoint.
+// NewEndpoint builds an Endpoint. Prefer the GET/POST/PUT/PATCH/DELETE builder
+// functions from options.go for a more readable call site.
 func NewEndpoint(method, path string, perms []string, c func() Handler) *Endpoint {
-	return &Endpoint{Method: method, Path: path, Perms: append([]string{}, perms...), Controller: c}
+	return &Endpoint{
+		EndpointMeta: EndpointMeta{
+			Method: method,
+			Path:   path,
+			Perms:  append([]string{}, perms...),
+		},
+		Controller: c,
+	}
 }
 
-// Endpointer is the interface that wraps a single Endpoints method.
-//
-// Endpoints returns []Endpoints to be handled by API gateway.
+// Endpointer is implemented by any type that exposes a set of endpoints.
 type Endpointer interface {
 	Endpoints() []Endpoint
 }
 
-// Handler is the interface what wraps Handle method.
-//
-// Handle invocates by API gateway mux.
+// Handler is the core interface every controller must implement.
 type Handler interface {
 	Handle(Context) error
 }
 
-// WebsocketHandler is the interface what wraps Handle method.
-//
-// Handle invocates by websocket message processing func.
+// WebsocketHandler is the core interface for WebSocket message controllers.
 type WebsocketHandler interface {
 	Handle(WebsocketContext) error
 }
 
-// Inputer is the interface what wraps Input method.
-//
-// Input returns reference to the object what will be promoted
-// with input data by vatel.
-//
-// If endpoint's handler expects input data, Input method should be
-// implemented.
-//
-// GET, DELETE methods:  input values will be taken from URL query.
-// POST, PUT, PATCH methods: input values will be taken from JSON body.
+// Inputer is implemented by controllers that expect decoded query or body input.
+// For GET/DELETE the framework decodes URL query parameters; for POST/PUT/PATCH
+// it decodes the JSON body. The returned pointer must be stable across the
+// request lifetime (i.e. a field of the controller struct, not a local variable).
 type Inputer interface {
 	Input() interface{}
 }
 
-// Resulter is the interface what wraps a single Result method.
-//
-// Result returns reference to the object what will be
-// send to the client when endpoint handler completes successfully.
-//
-// If endpoint's controller have outgoing data, Result method should be implemented.
+// Resulter is implemented by controllers that produce a JSON response body.
+// Returning nil from Result() suppresses the response body (useful for 304 / 204).
 type Resulter interface {
 	Result() interface{}
 }
 
-// Paramer is the interface what wraps a single Param method.
-//
-// Param returns reference to the struct what will be promoted with
-// values from URL.
-//
-// Example: if we have /customer/{id}/bill/{billnum} then
-// Param() should return reference to struct
-//
-//	{
-//			CustomerID int `param:"id"
-//		 	BillNum string `param:"billnum"`
-//	}
-//
-// If there is URL params and variables like /customer/{id}?sortBy=name&balanceAbove=100
-// methods Param and Input can return reference to the same struct.
+// Paramer is implemented by controllers that bind URL path parameters.
+// The returned pointer must be stable across the request lifetime.
 type Paramer interface {
 	Param() interface{}
 }
 
-func (e *Endpoint) writeErrorResponse(ctx Context, verbose bool, zc *zerolog.Context, err error) {
-	if err == nil {
-		return
-	}
-
-	statusCode := 500
-
-	//fmt.Printf("ce: %#v\n", ce)
-	if xe, ok := err.(*errors.Error); ok {
-		ce := errors.Serialize(xe, errors.WithAttributes(errors.ServerOutputFormat))
-		statusCode = ce.StatusCode
-		if statusCode == 429 {
-			// in case of too many requests, look if error has attribute Retry-After
-			var hv []byte
-			if ra, ok := ce.Fields["Retry-After"]; ok {
-				switch ra.(type) {
-				case int, int64, int32, int16, int8, uint, uint64, uint32, uint16, uint8:
-					hv = []byte(fmt.Sprintf("%d", ra))
-				case string:
-					hv = []byte(ra.(string))
-				case []byte:
-					hv = ra.([]byte)
-				}
-				ctx.SetHeader([]byte("Retry-After"), hv)
-			}
-		}
-	}
-
-	z := *zc
-	ctx.VisitUserValues(func(key []byte, v interface{}) {
-		z = z.Interface(string(key), v)
-	})
-
-	zl := z.RawJSON("err",
-		errors.ToJSON(err,
-			errors.WithAttributes(errors.ServerOutputFormat),
-		)).Logger()
-
-	zl.Error().Msg("request failed")
-
-	ctx.SetContentType([]byte("application/json; charset=utf-8"))
-	ctx.SetStatusCode(statusCode)
-
-	var ff errors.ErrorSerializationRule
-	if verbose {
-		//ff = errors.AddStack | errors.AddFields | errors.AddWrappedErrors
-		ff = errors.AddStack | errors.AddFields | errors.AddWrappedErrors
-	}
-
-	_, xerr := ctx.BodyWriter().Write(errors.ToJSON(err, errors.WithAttributes(ff)))
-
-	if xerr != nil {
-		//zl.With().Error().RawJSON("err", errors.ToServerJSON(xerr)).Msg("writing http response failed")
-	}
-
-	if e.mr != nil {
-		e.mr.ReportMetric(e.Method, e.Path, statusCode, time.Since(ctx.RequestCtx().Time()).Seconds(), len(ctx.RequestCtx().Response.Body()))
-	}
-
-	if e.ala != nil && statusCode >= 500 {
-		e.ala.Alarm(err)
-	}
-
-	return
-}
-
-func (e *Endpoint) handler(l *zerolog.Logger) func(*fasthttp.RequestCtx) {
-
-	return func(fctx *fasthttp.RequestCtx) {
-
-		var (
-			zc  zerolog.Context
-			zco zerolog.Context
-		)
-
-		verbose := e.verboseError
-
-		var lo LogOption
-		if !e.staticLoggingLevel {
-			logLevels := fctx.Request.Header.Peek("X-Set-Log-Level")
-			if len(logLevels) > 0 {
-				lvls := strings.Split(string(logLevels), ",")
-				var n uint32 = 0
-				for _, lvl := range lvls {
-					if v, ok := logOptionString[strings.TrimSpace(lvl)]; ok {
-						n |= uint32(v)
-					}
-				}
-				atomic.StoreUint32((*uint32)(&e.LogOptions), n)
-				fctx.Write([]byte(fmt.Sprintf("new logging rules are accepted: %b", n)))
-				return
-			} else {
-				lo = LogOption(atomic.LoadUint32((*uint32)(&e.LogOptions)))
-			}
-		} else {
-			lo = e.LogOptions
-		}
-
-		ctx := NewContext(fctx)
-
-		zco = l.With().Str("client", realip.FromRequest(fctx))
-		if e.logRequestID {
-			zco = zco.Uint64("reqId", fctx.ID())
-			ctx.Set("reqId", fctx.ID())
-		}
-		zc = zco
-
-		for i := range e.middlewares[BeforeAuthorization] {
-			if err := e.middlewares[BeforeAuthorization][i](ctx); err != nil {
-				e.writeErrorResponse(ctx, verbose, &zc, err)
-				return
-			}
-		}
-
-		// inDebug := e.LogOptions&ConfidentialInput != ConfidentialInput
-		// outDebug := e.LogOptions&ConfidentialOutput != ConfidentialOutput
-
-		at := fctx.Request.Header.Peek("Authorization") // access token
-
-		if e.auth != nil {
-
-			switch len(e.Perms) {
-			case 0:
-				break
-			case 1:
-				zc = zc.Str("perm", e.Perms[0])
-			default:
-				zc = zc.Strs("perms", e.Perms)
-			}
-
-			if len(at) == 0 && len(e.Perms) > 0 {
-				e.writeErrorResponse(ctx, verbose, &zc, ErrAuthorizationHeaderMissed.New())
-				return
-			}
-
-			if len(at) > 0 {
-				token, err := e.authorize(at)
-				if err != nil {
-					e.writeErrorResponse(ctx, verbose, &zc, err)
-					return
-				}
-
-				if e.rd != nil {
-					//	inDebug, outDebug = e.rd.IsDebugRequired(token.ApplicationPayload())
-				}
-				t := token.ApplicationPayload()
-				ctx.SetTokenPayload(t)
-				verbose = verbose || t.Debug()
-			}
-
-		}
-		// if e.auth != nil {
-		// 	if len(e.Perms) > 0 {
-		// 		switch len(e.Perms) {
-		// 		case 0:
-		// 			break
-		// 		case 1:
-		// 			zc = zc.Str("perm", e.Perms[0])
-		// 		default:
-		// 			zc = zc.Strs("perms", e.Perms)
-		// 		}
-
-		// 		if len(at) == 0 {
-		// 			e.writeErrorResponse(ctx, verbose, &zc, ErrAuthorizationHeaderMissed.Capture())
-		// 			return
-		// 		}
-
-		// 		token, err := e.authorize(at)
-		// 		if err != nil {
-		// 			e.writeErrorResponse(ctx, verbose, &zc, err)
-		// 			return
-		// 		}
-
-		// 		if e.rd != nil {
-		// 			//	inDebug, outDebug = e.rd.IsDebugRequired(token.ApplicationPayload())
-		// 		}
-		// 		t := token.ApplicationPayload()
-		// 		ctx.SetTokenPayload(t)
-		// 		verbose = verbose || t.Debug()
-		// 	}
-		// }
-
-		if fctx.QueryArgs().GetBool("description") {
-			if err := e.handleDescription(ctx); err != nil {
-				e.writeErrorResponse(ctx, verbose, &zc, err)
-			}
-			return
-		}
-
-		zc, h, err := e.initController(fctx, lo, zc)
-		if err != nil {
-			e.writeErrorResponse(ctx, verbose, &zc, err)
-			return
-		}
-
-		for i := range e.middlewares[AfterAuthorization] {
-			if err := e.middlewares[AfterAuthorization][i](ctx); err != nil {
-				e.writeErrorResponse(ctx, verbose, &zc, err)
-				return
-			}
-		}
-
-		if lo&LogEnter == LogEnter {
-			ctx.RequestCtx().VisitUserValues(func(key []byte, v interface{}) {
-				zc = zc.Interface(string(key), v)
-			})
-
-			zl := zc.Logger()
-			zl.Debug().Msg("new request")
-			zc = zco
-		}
-
-		if err = h.Handle(ctx); err != nil {
-			e.writeErrorResponse(ctx, verbose, &zc, err)
-			return
-		}
-
-		if e.hasRespBody {
-			if err := e.writeResponse(ctx, lo, h.(Resulter).Result(), &zc); err != nil {
-				e.writeErrorResponse(ctx, verbose, &zc, err)
-				return
-			}
-		}
-
-		dur := time.Since(fctx.Time())
-		if lo&LogExit == LogExit {
-			msg := "completed"
-			if e.LogOptions&LogEnter != LogEnter {
-				msg = "processed"
-			}
-			ctx.VisitUserValues(func(key []byte, v interface{}) {
-				if bytes.Equal(key, []byte("message")) {
-					msg = v.(string)
-					return
-				}
-				zc = zc.Interface(string(key), v)
-			})
-
-			zl := zc.Logger()
-			zl.Debug().Str("dur", dur.String()).Msg(msg)
-		}
-
-		if e.mr != nil {
-			e.mr.ReportMetric(e.Method, e.Path, 200, dur.Seconds(), len(fctx.Response.Body()))
-		}
-
-		for i := range e.middlewares[OnSuccessResponse] {
-			if err := e.middlewares[OnSuccessResponse][i](ctx); err != nil {
-				e.writeErrorResponse(ctx, verbose, &zc, err)
-				return
-			}
-		}
-	}
-}
-
-func (e *Endpoint) writeResponse(ctx Context, lo LogOption, res interface{}, zc *zerolog.Context) error {
-
-	buf, err := json.Marshal(res)
-	if err != nil {
-		*zc = zc.Interface("result", res)
-		return err
-	}
-
-	if lo&LogRespOutput == LogRespOutput {
-		*zc = zc.Interface("result", res)
-	}
-
-	ctx.SetContentType(e.responseContentType)
-
-	if lo&LogRespBody != LogRespBody {
-		_, err = ctx.BodyWriter().Write(buf)
-		return err
-	}
-
-	if e.jm != nil && len(e.resultFields) > 0 {
-		maskedBuf, err := e.jm.Mask(buf, e.resultFields)
-		if err != nil {
-			maskedBuf = []byte(`{"maskingError": "` + err.Error() + `"}`)
-		}
-
-		*zc = zc.RawJSON("maskedRespBody", maskedBuf)
-	} else {
-		*zc = zc.RawJSON("respBody", buf)
-	}
-
-	_, err = ctx.BodyWriter().Write(buf)
-	return err
-}
-
-func (e *Endpoint) wsWriteResponse(c *websocket.Conn, lo LogOption, res interface{}, zc *zerolog.Context) error {
-
-	buf, err := json.Marshal(res)
-	if err != nil {
-		*zc = zc.Interface("result", res)
-		return err
-	}
-
-	if lo&LogRespOutput == LogRespOutput {
-		*zc = zc.Interface("result", res)
-	}
-
-	if lo&LogRespBody != LogRespBody {
-		_, err = c.Write(buf)
-		return err
-	}
-
-	if e.jm != nil && len(e.resultFields) > 0 {
-		maskedBuf, err := e.jm.Mask(buf, e.resultFields)
-		if err != nil {
-			maskedBuf = []byte(`{"maskingError": "` + err.Error() + `"}`)
-		}
-
-		*zc = zc.RawJSON("maskedRespBody", maskedBuf)
-	} else {
-		*zc = zc.RawJSON("respBody", buf)
-	}
-
-	_, err = c.Write(buf)
-	return err
-}
-
+// Sentinel errors.
 var (
 	ErrAuthorizationHeaderMissed = errors.Template("header Authorization missed").Code("VTL-0001").StatusCode(401).Severity(errors.Medium)
 	ErrAccessTokenRevoked        = errors.Template("access token revoked").Code("VTL-0002").StatusCode(401).Severity(errors.Medium)
@@ -529,96 +152,204 @@ var (
 	ErrInvalidRequestBody        = errors.Template("invalid request body").Code("VTL-0007").StatusCode(400).Severity(errors.Tiny)
 )
 
-func (e *Endpoint) authorize(at []byte) (Tokener, error) {
-
-	if e.rtc != nil {
-		isRevoked, err := e.rtc.IsTokenRevoked(string(at))
-		if err != nil {
-			return nil, err
-		}
-
-		if isRevoked {
-			return nil, ErrAccessTokenRevoked.New()
+// parseLogLevelHeader parses a comma-separated X-Set-Log-Level header value
+// into a LogOption bitmask without mutating any shared endpoint state.
+func parseLogLevelHeader(raw []byte) LogOption {
+	var lo LogOption
+	for part := range strings.SplitSeq(string(raw), ",") {
+		if v, ok := logOptionString[strings.TrimSpace(part)]; ok {
+			lo |= v
 		}
 	}
-
-	token, err := e.td.Decode(at)
-	if err != nil {
-		return nil, errors.Wrap(err, "unauthorized").Set("perms", e.Perms)
-	}
-
-	if len(e.Perms) == 0 {
-		return token, nil
-	}
-
-	isAllowed, err := e.auth.IsAllowed(token.ApplicationPayload().Perms(), e.perms...)
-	if err == nil {
-		if isAllowed {
-			return token, nil
-		}
-		return nil, ErrForbidden.New().
-			Set("user", token.ApplicationPayload().Login()).
-			Set("role", token.ApplicationPayload().Role()).
-			Set("perms", e.Perms)
-	}
-
-	return nil, ErrUnauthorized.New().
-		Set("user", token.ApplicationPayload().Login()).
-		Set("role", token.ApplicationPayload().Role()).
-		Set("perms", e.Perms)
-
+	return lo
 }
 
-func (e *Endpoint) initController(ctx *fasthttp.RequestCtx, lo LogOption, zc zerolog.Context) (zerolog.Context, Handler, error) {
+// handler returns the fasthttp handler closure for this endpoint.
+func (e *Endpoint) handler(l *zerolog.Logger) func(*fasthttp.RequestCtx) {
+	return func(fctx *fasthttp.RequestCtx) {
+		verbose := e.verboseError
+		lo := e.resolveLogLevel(fctx)
 
-	var (
-		err error
-		h   = e.Controller()
-	)
+		ctx := NewContext(fctx)
+		zco := l.With().Str("client", realip.FromRequest(fctx))
+		if e.logRequestID {
+			zco = zco.Uint64("reqId", fctx.ID())
+			ctx.Set("reqId", fctx.ID())
+		}
+		zc := zco
+
+		if err := e.runMiddleware(ctx, OnRequest, verbose, &zc, e.EndpointMeta); err != nil {
+			return
+		}
+
+		if err := e.runMiddleware(ctx, OnAuthentication, verbose, &zc, e.EndpointMeta); err != nil {
+			return
+		}
+		// Auth middleware may enable verbose errors for this token/user.
+		verbose = verbose || ctx.VerboseError()
+
+		if err := e.runMiddleware(ctx, OnAuthorization, verbose, &zc, e.EndpointMeta); err != nil {
+			return
+		}
+
+		zc, h, err := e.buildHandler(fctx, lo, zc)
+		if err != nil {
+			e.writeErrorResponse(ctx, verbose, &zc, err, e.EndpointMeta)
+			return
+		}
+
+		if lo&LogEnter == LogEnter {
+			e.logEnter(ctx, &zc, zco)
+		}
+
+		if err := e.runMiddleware(ctx, OnHandle, verbose, &zc, e.EndpointMeta); err != nil {
+			return
+		}
+
+		if err = h.Handle(ctx); err != nil {
+			e.writeErrorResponse(ctx, verbose, &zc, err, e.EndpointMeta)
+			return
+		}
+
+		if e.SuccessStatusCode != 0 && !e.ManualStatusCode {
+			ctx.SetStatusCode(e.SuccessStatusCode)
+		}
+
+		if e.hasRespBody {
+			res := h.(Resulter).Result()
+			if !isNilResult(res) {
+				if err := e.writeResponse(ctx, lo, res, &zc); err != nil {
+					e.writeErrorResponse(ctx, verbose, &zc, err, e.EndpointMeta)
+					return
+				}
+			}
+		}
+
+		dur := time.Since(fctx.Time())
+		if lo&LogExit == LogExit {
+			e.logExit(ctx, lo, &zc, dur)
+		}
+		if e.mr != nil {
+			e.mr.ReportMetric(e.Method, e.Path, fctx.Response.StatusCode(), dur.Seconds(), len(fctx.Response.Body()))
+		}
+
+		e.runMiddleware(ctx, OnSuccessResponse, verbose, &zc, e.EndpointMeta) //nolint:errcheck
+	}
+}
+
+// resolveLogLevel returns the effective LogOption for this request without
+// mutating shared endpoint state.
+func (e *Endpoint) resolveLogLevel(fctx *fasthttp.RequestCtx) LogOption {
+	if e.staticLoggingLevel {
+		return e.LogOptions
+	}
+	if raw := fctx.Request.Header.Peek("X-Set-Log-Level"); len(raw) > 0 {
+		return parseLogLevelHeader(raw)
+	}
+	return LogOption(atomic.LoadUint32((*uint32)(&e.LogOptions)))
+}
+
+
+// AddMiddleware adds per-endpoint middleware at the given pipeline position.
+// Called from EndpointOption functions (e.g. auth.RequirePerms).
+func (e *Endpoint) AddMiddleware(pos MiddlewarePos, f ...func(Context, EndpointMeta) error) {
+	e.localMdw[pos] = append(e.localMdw[pos], f...)
+}
+
+// runMiddleware executes global then per-endpoint middleware at pos in order.
+// On the first error it writes the error response and returns it.
+func (e *Endpoint) runMiddleware(ctx Context, pos MiddlewarePos, verbose bool, zc *zerolog.Context, meta EndpointMeta) error {
+	for _, mw := range e.middlewares[pos] {
+		if err := mw(ctx, e.EndpointMeta); err != nil {
+			e.writeErrorResponse(ctx, verbose, zc, err)
+			return err
+		}
+	}
+	for _, mw := range e.localMdw[pos] {
+		if err := mw(ctx, e.EndpointMeta); err != nil {
+			e.writeErrorResponse(ctx, verbose, zc, err)
+			return err
+		}
+	}
+	return nil
+}
+
+// logEnter logs an "enter" event enriched with current user values, then resets
+// zc back to the base context (zco) so subsequent log entries stay clean.
+func (e *Endpoint) logEnter(ctx Context, zc *zerolog.Context, zco zerolog.Context) {
+	ctx.VisitUserValues(func(key []byte, v any) {
+		*zc = (*zc).Interface(string(key), v)
+	})
+	zl := zc.Logger()
+	zl.Debug().Msg("new request")
+	*zc = zco
+}
+
+// logExit logs an "exit" event with duration and any user values set during the
+// request.
+func (e *Endpoint) logExit(ctx Context, lo LogOption, zc *zerolog.Context, dur time.Duration) {
+	msg := "completed"
+	if lo&LogEnter != LogEnter {
+		msg = "processed"
+	}
+	ctx.VisitUserValues(func(key []byte, v any) {
+		if bytes.Equal(key, []byte("message")) {
+			msg = v.(string)
+			return
+		}
+		*zc = (*zc).Interface(string(key), v)
+	})
+	zl := zc.Logger()
+	zl.Debug().Str("dur", dur.String()).Msg(msg)
+}
+
+// buildHandler instantiates the controller, decodes path params, and decodes
+// query/body input using precomputed field maps.
+func (e *Endpoint) buildHandler(fctx *fasthttp.RequestCtx, lo LogOption, zc zerolog.Context) (zerolog.Context, Handler, error) {
+	h := e.Controller()
+	var err error
 
 	if e.isPathParametrized {
 		p := h.(Paramer).Param()
-		if zc, err = decodeParams(ctx, p, zc); err != nil {
+		if zc, err = decodeParams(fctx, p, e.paramFields, zc); err != nil {
 			return zc, nil, err
 		}
 	}
 
 	if e.isURLQueryExpected {
 		in := h.(Inputer).Input()
-		if zc, err = decodeURLQuery(ctx, in, zc); err != nil {
+		if zc, err = decodeURLQuery(fctx, in, e.queryFields, zc); err != nil {
 			return zc, nil, err
+		}
+		if lo&LogReqInput == LogReqInput {
+			zc = zc.Interface("reqInput", in)
 		}
 	}
 
 	if e.isRequestBodyExpected {
-		if lo&LogReqBody == LogReqBody {
-			var (
-				cJSON *bytes.Buffer // compacted json
-				buf   []byte
-			)
+		body := fctx.Request.Body()
 
-			cJSON = bytes.NewBuffer(nil)
+		if lo&LogReqBody == LogReqBody {
+			compact := bytes.NewBuffer(nil)
 			key := "requestBody"
-			err := json.Compact(cJSON, ctx.Request.Body())
-			if err != nil {
-				zc = zc.Str("requestBodyLoggingFailed", err.Error())
+			if jerr := json.Compact(compact, body); jerr != nil {
+				zc = zc.Str("requestBodyLoggingFailed", jerr.Error())
 			} else {
-				buf = cJSON.Bytes()
+				buf := compact.Bytes()
 				if e.jm != nil && len(e.inputFields) > 0 {
-					if buf, err = e.jm.Mask(cJSON.Bytes(), e.inputFields); err == nil {
+					if masked, merr := e.jm.Mask(buf, e.inputFields); merr == nil {
+						buf = masked
 						key = "maskedRequestBody"
 					} else {
-						zc = zc.Str("maskingRequestAttrsFailed", err.Error())
+						zc = zc.Str("maskingRequestAttrsFailed", merr.Error())
 					}
 				}
-				if err == nil {
-					zc = zc.RawJSON(key, buf)
-				}
+				zc = zc.RawJSON(key, buf)
 			}
 		}
 
 		in := h.(Inputer).Input()
-		if err := decodeBody(ctx, in); err != nil {
+		if err := decodeBody(body, in); err != nil {
 			return zc, nil, err
 		}
 		if lo&LogReqInput == LogReqInput {
@@ -629,241 +360,132 @@ func (e *Endpoint) initController(ctx *fasthttp.RequestCtx, lo LogOption, zc zer
 	return zc, h, nil
 }
 
-// Doc возвращает описание входных и выходных параметров контроллера.
-func (e *Endpoint) handleDescription(ctx Context) error {
+// writeResponse marshals res and writes it to the response body,
+// optionally logging and masking sensitive fields.
+func (e *Endpoint) writeResponse(ctx Context, lo LogOption, res interface{}, zc *zerolog.Context) error {
+	ctx.SetContentType(e.responseContentType)
+	return e.writeJSON(ctx.BodyWriter(), lo, res, zc)
+}
 
-	c := e.Controller()
+// wsWriteResponse marshals res and writes it to a WebSocket connection,
+// optionally logging and masking sensitive fields.
+func (e *Endpoint) wsWriteResponse(c *websocket.Conn, lo LogOption, res interface{}, zc *zerolog.Context) error {
+	return e.writeJSON(c, lo, res, zc)
+}
 
-	ctx.SetContentType([]byte("text/html; charset=utf-8"))
+// isNilResult reports whether a value returned from Resulter.Result() is nil,
+// including typed nils (e.g. (*T)(nil) wrapped in an interface).
+func isNilResult(v interface{}) bool {
+	if v == nil {
+		return true
+	}
+	rv := reflect.ValueOf(v)
+	return rv.Kind() == reflect.Ptr && rv.IsNil()
+}
 
-	_, err := ctx.BodyWriter().Write(e.genDescription(c))
+// writeJSON is the shared marshal-mask-log-write implementation used by both
+// HTTP and WebSocket response paths.
+func (e *Endpoint) writeJSON(w io.Writer, lo LogOption, res interface{}, zc *zerolog.Context) error {
+	buf, err := json.Marshal(res)
 	if err != nil {
-		return errors.Wrap(err, "description response write failed").StatusCode(500)
+		*zc = zc.Interface("result", res)
+		return err
 	}
-	return nil
+
+	if lo&LogRespOutput == LogRespOutput {
+		*zc = zc.Interface("result", res)
+	}
+
+	if lo&LogRespBody == LogRespBody {
+		if e.jm != nil && len(e.resultFields) > 0 {
+			masked, merr := e.jm.Mask(buf, e.resultFields)
+			if merr != nil {
+				masked = []byte(`{"maskingError":"` + merr.Error() + `"}`)
+			}
+			*zc = zc.RawJSON("maskedRespBody", masked)
+		} else {
+			*zc = zc.RawJSON("respBody", buf)
+		}
+	}
+
+	_, err = w.Write(buf)
+	return err
 }
 
-func (e *Endpoint) genDescription(c Handler) []byte {
-	s := "Endpoint description: " + e.Method + " -  " + e.Path
-	if c == nil {
-		s += "No handler"
+// writeErrorResponse logs the error, writes an error JSON body, reports metrics,
+// triggers the alarm if critical, and runs OnErrorResponse middleware.
+func (e *Endpoint) writeErrorResponse(ctx Context, verbose bool, zc *zerolog.Context, err error, meta ...EndpointMeta) {
+	if err == nil {
+		return
 	}
 
-	if e.isPathParametrized {
-		//s += "\n" + goon.SDump(c.(Paramer).Param())
-		//s += "\n" + valast.String(c.(Paramer).Param()) + "\n"
-	}
+	statusCode := 500
 
-	if e.isRequestBodyExpected {
-		//s += "Body input: \n" + valast.String(c.(Inputer).Input())
-	}
-
-	if e.isURLQueryExpected {
-		//s += "URL input\n" + valast.String(c.(Inputer).Input())
-	}
-
-	if e.hasRespBody {
-		//s += "\n" + valast.String(c.(Resulter).Result())
-	}
-
-	return []byte(s)
-}
-
-// TODO: сделать поддержку param не в виде структуры, а в виде одной переменной.
-func decodeParams(ctx *fasthttp.RequestCtx, param interface{}, zcin zerolog.Context) (zerolog.Context, error) {
-
-	zc := zcin
-	s := reflect.ValueOf(param).Elem()
-	tof := s.Type()
-
-	for i := 0; i < tof.NumField(); i++ {
-		sf := s.Field(i)
-
-		if sf.CanSet() == false {
-			continue
-		}
-
-		tag := tof.Field(i).Tag.Get("param")
-		if tag == "" {
-			continue
-		}
-
-		uv := ctx.UserValue(tag)
-		if uv == nil {
-			return zc, ErrInternalError.New().Set("name", tag).Msg("path param not found")
-		}
-
-		val, ok := uv.(string)
-		if !ok {
-			panic("non string param")
-		}
-
-		zc = zc.Interface(tag, val)
-
-		switch sf.Interface().(type) {
-		case int, int8, int16, int32, int64:
-			i, err := strconv.ParseInt(val, 10, 64)
-			if err != nil {
-				return zc, ErrValidationFailed.Wrap(err)
-			}
-			sf.SetInt(i)
-		case uint, uint8, uint16, uint32, uint64:
-			i, err := strconv.ParseUint(val, 10, 64)
-			if err != nil {
-				return zc, ErrValidationFailed.Wrap(err)
-			}
-			sf.SetUint(i)
-		case string:
-			sf.SetString(val)
-		case bool:
-			b, err := strconv.ParseBool(val)
-			if err != nil {
-				return zc, ErrValidationFailed.Wrap(err)
-			}
-			sf.SetBool(b)
-		case float32, float64:
-			f, err := strconv.ParseFloat(val, 64)
-			if err != nil {
-				return zc, ErrValidationFailed.Wrap(err)
-			}
-			sf.SetFloat(f)
-		case []string:
-			break
-		default:
-			return zc, ErrValidationFailed.New().Msg("unsupported go type").Set("tag", tag)
-		}
-	}
-	return zc, nil
-}
-
-func assign(val string, i interface{}) error {
-	return nil
-}
-
-func decodeBody(ctx *fasthttp.RequestCtx, dest interface{}) error {
-	buf := ctx.Request.Body()
-	if len(buf) == 0 {
-		return ErrInvalidRequestBody.New().Msg("empty request body. JSON expected")
-	}
-
-	if err := json.Unmarshal(buf, dest); err != nil {
-		return ErrInvalidRequestBody.Wrap(err).Msg("request body is not a valid JSON")
-	}
-	return nil
-}
-
-func decodeURLQuery(ctx *fasthttp.RequestCtx, input interface{}, zc zerolog.Context) (zerolog.Context, error) {
-
-	s := reflect.ValueOf(input).Elem()
-	tof := s.Type()
-
-	for i := 0; i < tof.NumField(); i++ {
-		sf := s.Field(i)
-		atof := tof.Field(i)
-
-		if sf.CanSet() == false {
-			continue
-		}
-
-		if sf.Kind() == reflect.Struct {
-			if zc, err := decodeURLQuery(ctx, sf.Addr().Interface(), zc); err != nil {
-				return zc, err
-			}
-			continue
-		}
-
-		tag := atof.Tag.Get("param")
-		if tag == "" {
-			continue
-		}
-
-		val := ctx.QueryArgs().Peek(tag)
-		zc = zc.Bytes(tag, val)
-		if val == nil {
-			continue
-		}
-
-		if sf.Kind() == reflect.Ptr {
-			if sf.IsNil() {
-				sf.Set(reflect.New(sf.Type().Elem()))
-			}
-			sf = sf.Elem()
-		}
-
-		if atof.Type.Name() == "Date" {
-			if _, ok := sf.Interface().(date.Date); ok {
-				d, err := date.Parse(string(val))
-				if err != nil {
-					return zc, err
+	if xe, ok := err.(*errors.Error); ok {
+		ce := errors.Serialize(xe, errors.WithAttributes(errors.ServerOutputFormat))
+		statusCode = ce.StatusCode
+		if statusCode == 429 {
+			if ra, ok := ce.Fields["Retry-After"]; ok {
+				var hv []byte
+				switch v := ra.(type) {
+				case string:
+					hv = []byte(v)
+				case []byte:
+					hv = v
+				default:
+					hv = []byte(fmt.Sprintf("%d", ra))
 				}
-				sf.SetUint(uint64(d))
+				ctx.SetHeader([]byte("Retry-After"), hv)
 			}
-			continue
-		}
-
-		switch sf.Kind() {
-		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-			k, err := strconv.ParseInt(string(val), 10, 64)
-			if err != nil {
-				return zc, err
-			}
-			sf.SetInt(k)
-		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-			k, err := strconv.ParseUint(string(val), 10, 64)
-			if err != nil {
-				return zc, err
-			}
-			sf.SetUint(k)
-		case reflect.String:
-			sf.SetString(string(val))
-		case reflect.Float64:
-			k, err := strconv.ParseFloat(string(val), 64)
-			if err != nil {
-				return zc, err
-			}
-			sf.SetFloat(k)
-		case reflect.Float32:
-			k, err := strconv.ParseFloat(string(val), 32)
-			if err != nil {
-				return zc, err
-			}
-			sf.SetFloat(k)
-		case reflect.Bool:
-			b, err := strconv.ParseBool(string(val))
-			if err != nil {
-				return zc, err
-			}
-			sf.SetBool(b)
-		default:
-			return zc, ErrValidationFailed.New().Msg("unsupported type").
-				Set("val", string(val)).Set("kind", sf.Kind().String())
 		}
 	}
-	return zc, nil
+
+	z := *zc
+	ctx.VisitUserValues(func(key []byte, v interface{}) {
+		z = z.Interface(string(key), v)
+	})
+	zl := z.RawJSON("err", errors.ToJSON(err, errors.WithAttributes(errors.ServerOutputFormat))).Logger()
+	zl.Error().Msg("request failed")
+
+	ctx.SetContentType([]byte("application/json; charset=utf-8"))
+	ctx.SetStatusCode(statusCode)
+
+	var ff errors.ErrorSerializationRule
+	if verbose {
+		ff = errors.AddStack | errors.AddFields | errors.AddWrappedErrors
+	}
+	buf := errors.ToJSON(err, errors.WithAttributes(ff), errors.WithRootLevelFields(e.clientErrorFields))
+	ctx.BodyWriter().Write(buf) //nolint:errcheck
+
+	if e.mr != nil {
+		e.mr.ReportMetric(e.Method, e.Path, statusCode, time.Since(ctx.RequestTime()).Seconds(), len(buf))
+	}
+
+	if e.ala != nil && statusCode >= 500 {
+		e.ala.Alarm(err)
+	}
+
+	var m EndpointMeta
+	if len(meta) > 0 {
+		m = meta[0]
+	}
+	for _, mw := range e.middlewares[OnErrorResponse] {
+		mw(ctx, m) //nolint:errcheck
+	}
+	for _, mw := range e.localMdw[OnErrorResponse] {
+		mw(ctx, m) //nolint:errcheck
+	}
 }
 
+
+// compile validates the endpoint configuration and precomputes all reflection
+// data needed at request time. Called once per endpoint during BuildHandlers.
 func (e *Endpoint) compile(v *Vatel) error {
-	opath := e.Path
+	origPath := e.Path
 	e.Path = path.Join(v.cfg.urlPrefix, e.Path)
-	e.auth = v.auth
-	e.td = v.td
-	e.pm = v.pm
-	e.rd = v.rd
-	e.rtc = v.rtc
-	e.middlewares = v.mdw
-	e.staticLoggingLevel = v.cfg.staticLoggingLevel
-	e.verboseError = v.cfg.verboseError
-	e.logRequestID = true // v.cfg.logRequestID
-	e.jm = v.cfg.jm
-	e.ala = v.cfg.ala
-	e.mr = v.cfg.mr
 
-	if e.LogOptions == LogUnknown {
-		e.LogOptions = v.cfg.defaultLogOption
-	}
-
-	if e.LogOptions&LogSilent == e.LogOptions {
-		e.LogOptions = e.LogOptions
+	if err := compileCommon(v, e); err != nil {
+		return err
 	}
 
 	if e.ResponseContentType != "" {
@@ -872,64 +494,69 @@ func (e *Endpoint) compile(v *Vatel) error {
 		e.responseContentType = []byte("application/json; charset=utf-8")
 	}
 
-	if len(e.Perms) > 0 {
-		if e.auth == nil && !v.authDisabled {
-			return fmt.Errorf("endpoint %s %s requires calling SetAuthorizer() before", e.Method, opath)
-		}
-		if e.td == nil && !v.authDisabled {
-			return fmt.Errorf("endpoint %s %s requires calling SetTokenDecode() before", e.Method, opath)
-		}
-
-		if e.pm == nil && !v.authDisabled {
-			return fmt.Errorf("endpoint %s %s requires calling SetPermissionManager() before", e.Method, opath)
-		}
-
-		for i := range e.Perms {
-			pb, ok := v.pm.PermissionBitPos(e.Perms[i])
-			if !ok {
-				return fmt.Errorf("endpoint %s %s mentioned unknown permission %s", e.Method, opath, e.Perms[i])
-			}
-			e.perms = append(e.perms, pb)
-		}
-	}
 	c := e.Controller()
 
-	// looking for "{ }"" in the path
-	re, err := regexp.Compile(`(?s)\{(.*)\}`)
-	if err != nil {
-		return fmt.Errorf("endpoint %s %s cannot be parsed by regexp", e.Method, opath)
-	}
-
-	_, isParamer := c.(Paramer)
+	// Validate path param / Paramer consistency.
+	re := regexp.MustCompile(`(?s)\{(.*)\}`)
 	pathHasParam := re.Match([]byte(e.Path))
+	_, isParamer := c.(Paramer)
 
 	if !isParamer && pathHasParam {
-		return fmt.Errorf("endpoint %s %s path has parameters, but controller does not implement Paramer", e.Method, opath)
+		return fmt.Errorf("endpoint %s %s: path has parameters but controller does not implement Paramer", e.Method, origPath)
 	}
-
 	if isParamer && !pathHasParam {
-		return fmt.Errorf("endpoint %s %s path has no parameters, but controller implement Paramer", e.Method, opath)
+		return fmt.Errorf("endpoint %s %s: controller implements Paramer but path has no parameters", e.Method, origPath)
 	}
-	e.isPathParametrized = isParamer
 
+	e.isPathParametrized = isParamer
+	if isParamer {
+		e.paramFields = buildParamFields(reflect.TypeOf(c.(Paramer).Param()).Elem())
+	}
+
+	// Precompute JSON masking field maps.
 	ri, hasRespBody := c.(Resulter)
+	e.hasRespBody = hasRespBody
 	if hasRespBody && e.jm != nil {
 		e.resultFields = e.jm.Fields(ri.Result(), "mask")
 	}
-	e.hasRespBody = hasRespBody
 
 	ii, isInputer := c.(Inputer)
 	if isInputer && e.jm != nil {
 		e.inputFields = e.jm.Fields(ii.Input(), "mask")
 	}
 
+	// Route input decoding based on HTTP method.
 	switch e.Method {
 	case "GET", "DELETE":
 		e.isURLQueryExpected = isInputer
+		if isInputer {
+			e.queryFields = buildQueryFields(reflect.TypeOf(ii.Input()).Elem())
+		}
 	case "POST", "PUT", "PATCH":
 		e.isRequestBodyExpected = isInputer
 	default:
-		return fmt.Errorf("endpoint %s has unknown HTTP method %s", opath, e.Method)
+		return fmt.Errorf("endpoint %s has unknown HTTP method", origPath)
 	}
+
+	return nil
+}
+
+// compileCommon copies shared Vatel config into the endpoint.
+// Auth fields (auth, perms) are left to compileWS for WS endpoints, or to
+// per-endpoint middleware (vatel/auth) for HTTP endpoints.
+func compileCommon(v *Vatel, e *Endpoint) error {
+	e.middlewares = v.mdw
+	e.staticLoggingLevel = v.cfg.staticLoggingLevel
+	e.verboseError = v.cfg.verboseError
+	e.logRequestID = v.cfg.logRequestID
+	e.clientErrorFields = v.cfg.clientErrorFields
+	e.jm = v.cfg.jm
+	e.ala = v.cfg.ala
+	e.mr = v.cfg.mr
+
+	if e.LogOptions == LogUnknown {
+		e.LogOptions = v.cfg.defaultLogOption
+	}
+
 	return nil
 }

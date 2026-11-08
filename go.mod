@@ -6,11 +6,12 @@ toolchain go1.24.1
 
 //replace github.com/axkit/errors => /Users/gera/go/src/github.com/axkit/errors
 //replace github.com/regorov/websocket => /home/gera/go/src/github.com/regorov/websocket
-//replace github.com/axkit/bitset => /Users/gera/go/src/github.com/axkit/bitset
+replace github.com/axkit/bitset => /Users/gera/go/src/github.com/axkit/bitset
 
 require (
+	github.com/axkit/bitset v0.0.0
 	github.com/axkit/date v1.0.1
-	github.com/axkit/errors v1.0.3
+	github.com/axkit/errors v1.1.0
 	github.com/axkit/fasthttp-realip v1.0.1
 	github.com/axkit/tinymap v0.0.2
 	github.com/fasthttp/router v1.4.4

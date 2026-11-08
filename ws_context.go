@@ -1,7 +1,6 @@
 package vatel
 
 import (
-	"context"
 	"io"
 	"time"
 
@@ -9,10 +8,12 @@ import (
 	"github.com/regorov/websocket"
 )
 
+// WebsocketContext is the per-message interface passed to WebSocket handlers
+// and middleware.
 type WebsocketContext interface {
 	BodyWriter() io.Writer
-	TokenPayload() TokenPayloader
-	SetTokenPayload(tp TokenPayloader)
+	TokenPayload() any
+	SetTokenPayload(tp any)
 	Set(key string, val interface{}) WebsocketContext
 	Get(key string) interface{}
 	VisitValues(func(key []byte, val interface{}))
@@ -20,14 +21,15 @@ type WebsocketContext interface {
 	ID() uint64
 }
 
+// WsContext is the concrete WebsocketContext implementation.
 type WsContext struct {
-	cancel  context.CancelFunc
 	kv      tinymap.TinyMap
-	tp      TokenPayloader
+	tp      any
 	conn    *websocket.Conn
 	created time.Time
 }
 
+// NewWsContext creates a WebsocketContext for the given connection.
 func NewWsContext(c *websocket.Conn) WebsocketContext {
 	return &WsContext{
 		conn:    c,
@@ -35,38 +37,14 @@ func NewWsContext(c *websocket.Conn) WebsocketContext {
 	}
 }
 
-func (ctx *WsContext) SetTokenPayload(tp TokenPayloader) {
-	ctx.tp = tp
-}
+func (ctx *WsContext) SetTokenPayload(tp any) { ctx.tp = tp }
+func (ctx *WsContext) TokenPayload() any      { return ctx.tp }
+func (ctx *WsContext) ID() uint64                         { return ctx.conn.ID() }
+func (ctx *WsContext) Created() time.Time                 { return ctx.created }
 
-func (ctx *WsContext) TokenPayload() TokenPayloader {
-	return ctx.tp
-}
+func (ctx *WsContext) BodyWriter() io.Writer { return ctx.conn }
 
-func (ctx *WsContext) ID() uint64 {
-	return ctx.conn.ID()
-}
-
-// func (ctx *WsContext) Log(key string, val interface{}) *WsContext {
-// 	if ctx.kv == nil {
-// 		ctx.kv = make(map[string]interface{}, 1)
-// 	}
-// 	ctx.kv[key] = val
-// 	return ctx
-// }
-
-// func (ctx *WsContext) LogValues() map[string]interface{} {
-// 	return ctx.kv
-// }
-//
-
-func (ctx *WsContext) BodyWriter() io.Writer {
-	return ctx.conn
-}
-
-func (ctx *WsContext) Get(key string) interface{} {
-	return ctx.kv.Get(key)
-}
+func (ctx *WsContext) Get(key string) interface{} { return ctx.kv.Get(key) }
 
 func (ctx *WsContext) Set(key string, val interface{}) WebsocketContext {
 	ctx.kv.Set(key, val)
@@ -75,8 +53,4 @@ func (ctx *WsContext) Set(key string, val interface{}) WebsocketContext {
 
 func (ctx *WsContext) VisitValues(f func(key []byte, v interface{})) {
 	ctx.kv.VisitValues(f)
-}
-
-func (ctx *WsContext) Created() time.Time {
-	return ctx.created
 }
