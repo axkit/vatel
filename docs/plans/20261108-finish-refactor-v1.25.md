@@ -102,6 +102,10 @@
 - новое: контекст запроса. `ctx.Context()` — дочерний от базового контекста `Vatel` (раньше `context.Background()`); `Shutdown` отменяет его — после ожидания запросов в полёте (до дедлайна `ctx` из `Shutdown`), а без сервера из `ListenAndServe` сразу; повторный `Shutdown` безопасен. Отмены по разрыву соединения клиентом нет (fasthttp его не видит). Таймаут: `vatel.WithTimeout(d)` (поле `Endpoint.Timeout`) на эндпоинт и `vatel.WithDefaultTimeout(d)` на `Vatel`; контекст с таймаутом отменяется и в конце обработки запроса. Таймаут не прерывает обработчик сам — только код, слушающий контекст. Ошибка без своего статуса (не `*errors.Error` или `*errors.Error` со статусом 0), в цепочке которой `context.DeadlineExceeded`, → 504, `context.Canceled` → 503; явный статус ошибки главнее. `*errors.Error` без статуса (например, `errors.Wrap(err, "msg")` от обычной ошибки) теперь даёт 500, а не 200. `NewContext(fctx)` по-прежнему с `context.Background()`.
 - WS: ошибка разбора поля `data` сообщения во вход `Inputer` → `ErrInvalidRequestBody` (400, код `VTL-0007`, сообщение «ws message data is not valid JSON»); раньше — необёрнутая ошибка `json.Unmarshal` и статус 500 (в журнале, метриках и `Alarm`).
 - auth: `RequirePerms` дописывает имена прав (отсортированно) в `Endpoint.Perms` — middleware видят их в `EndpointMeta.Perms` (на WS-эндпоинте это требует `WithWsAuthFunc`, иначе ошибка `BuildHandlers`). `Config.Disabled` проверяется во время запроса и в `RequirePerms` (раньше — только при создании опции; `RequireAuth` и `Middleware` уже проверяли во время запроса). `Config.Authorizer == nil` при `RequirePerms` → 500 `ErrInternalError` вместо panic. Комментарий `vatel.Perms`: для HTTP это только метаданные, проверку делает `auth`.
+- журнал: `LogSilent` теперь действительно глушит журнал — на эндпоинте (HTTP и WS) не пишется ничего, включая ошибки 4xx из middleware, разбора и обработчика; пишутся только ошибки 5xx (раньше `LogSilent` ничего не отключал, ошибки писались всегда). `LogSilent` главнее остальных битов; заголовок `X-Set-Log-Level` не отменяет `LogSilent` эндпоинта, а `silent` в заголовке глушит запрос.
+- middleware `OnErrorResponse` всегда получает метаданные эндпоинта (`Method`, `Path`, `Perms`, `LogOptions`); раньше при ошибке из middleware (`OnRequest`/`OnAuthentication`/`OnAuthorization`/`OnHandle`) приходил пустой `EndpointMeta`.
+- удалена опция `WithLanguageLabel` (вместе с полем `LanguageLabel`).
+- WS: ошибка без статуса (не `*errors.Error` или `*errors.Error` со статусом 0) в журнале/метриках/`Alarm` считается как в HTTP — 500 (`context.DeadlineExceeded` → 504, `context.Canceled` → 503); раньше `*errors.Error` без статуса давал в метриках статус 0 и не вызывал `Alarm`.
 
 ## What Goes Where
 - **Implementation Steps**: код, тесты, документация в этом репозитории, коммиты на ветке `refactor`.
@@ -232,12 +236,12 @@
 - Modify: `endpoint.go`, `options.go`, `ws_vatel.go`
 - Modify: `handler_test.go`, `carriers_test.go` (TestEndpointOptions)
 
-- [ ] тест: `OnErrorResponse` получает Method/Path, когда `OnAuthorization` отвергает запрос
-- [ ] тесты (журнал в буфер) для `LogSilent`: успех; 4xx из middleware, из разбора, из обработчика — пусто; 5xx — пишется; заголовок `X-Set-Log-Level` не отменяет `LogSilent`
-- [ ] тесты WS (журнал в буфер, `wsWriteErrorResponse` пишет в `io.Writer`, чтобы тестировать без настоящего соединения): `LogSilent` — 4xx пусто, 5xx пишется
-- [ ] передать уровень журнала в `runMiddleware`/`writeErrorResponse`/`wsWriteErrorResponse`, всегда `e.EndpointMeta`; реализовать `LogSilent`
-- [ ] удалить `NoInputLog`, `NoResultLog`, `LanguageLabel`, `WithLanguageLabel`, `atomic.Load` для `LogOptions` (HTTP и WS); обновить затронутые тесты
-- [ ] run tests — must pass before next task
+- [x] тест: `OnErrorResponse` получает Method/Path, когда `OnAuthorization` отвергает запрос
+- [x] тесты (журнал в буфер) для `LogSilent`: успех; 4xx из middleware, из разбора, из обработчика — пусто; 5xx — пишется; заголовок `X-Set-Log-Level` не отменяет `LogSilent`
+- [x] тесты WS (журнал в буфер, `wsWriteErrorResponse` пишет в `io.Writer`, чтобы тестировать без настоящего соединения): `LogSilent` — 4xx пусто, 5xx пишется
+- [x] передать уровень журнала в `runMiddleware`/`writeErrorResponse`/`wsWriteErrorResponse`, всегда `e.EndpointMeta`; реализовать `LogSilent`
+- [x] удалить `NoInputLog`, `NoResultLog`, `LanguageLabel`, `WithLanguageLabel`, `atomic.Load` для `LogOptions` (HTTP и WS); обновить затронутые тесты
+- [x] run tests — must pass before next task
 
 ### Task 12: BuildHandlers без panic, OnTokenUpdate
 **Files:**

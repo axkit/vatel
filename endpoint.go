@@ -10,7 +10,6 @@ import (
 	"path"
 	"reflect"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/axkit/errors"
@@ -25,7 +24,7 @@ import (
 type LogOption uint32
 
 const (
-	LogSilent     LogOption = 1 << iota // suppress all logging for this endpoint
+	LogSilent     LogOption = 1 << iota // log nothing but 5xx errors; overrides all other bits
 	LogEnter                            // log when a request arrives
 	LogExit                             // log when a request completes
 	LogReqBody                          // log the raw request body (masked by `mask` tags)
@@ -61,12 +60,9 @@ type Endpoint struct {
 
 	// Additional public configuration fields.
 	Compress            bool
-	NoInputLog          bool
-	NoResultLog         bool
 	ManualStatusCode    bool
 	SuccessStatusCode   int
 	ResponseContentType string
-	LanguageLabel       string
 
 	// OptionalBody allows an empty request body on POST/PUT/PATCH.
 	// See WithOptionalBody.
@@ -207,23 +203,23 @@ func (e *Endpoint) handler(l *zerolog.Logger) func(*fasthttp.RequestCtx) {
 		}
 		zc := zco
 
-		if err := e.runMiddleware(ctx, OnRequest, verbose, &zc, e.EndpointMeta); err != nil {
+		if err := e.runMiddleware(ctx, OnRequest, lo, verbose, &zc); err != nil {
 			return
 		}
 
-		if err := e.runMiddleware(ctx, OnAuthentication, verbose, &zc, e.EndpointMeta); err != nil {
+		if err := e.runMiddleware(ctx, OnAuthentication, lo, verbose, &zc); err != nil {
 			return
 		}
 		// Auth middleware may enable verbose errors for this token/user.
 		verbose = verbose || ctx.VerboseError()
 
-		if err := e.runMiddleware(ctx, OnAuthorization, verbose, &zc, e.EndpointMeta); err != nil {
+		if err := e.runMiddleware(ctx, OnAuthorization, lo, verbose, &zc); err != nil {
 			return
 		}
 
 		zc, h, err := e.buildHandler(fctx, lo, zc)
 		if err != nil {
-			e.writeErrorResponse(ctx, verbose, &zc, err, e.EndpointMeta)
+			e.writeErrorResponse(ctx, lo, verbose, &zc, err)
 			return
 		}
 
@@ -231,12 +227,12 @@ func (e *Endpoint) handler(l *zerolog.Logger) func(*fasthttp.RequestCtx) {
 			e.logEnter(ctx, &zc, zco)
 		}
 
-		if err := e.runMiddleware(ctx, OnHandle, verbose, &zc, e.EndpointMeta); err != nil {
+		if err := e.runMiddleware(ctx, OnHandle, lo, verbose, &zc); err != nil {
 			return
 		}
 
 		if err = h.Handle(ctx); err != nil {
-			e.writeErrorResponse(ctx, verbose, &zc, err, e.EndpointMeta)
+			e.writeErrorResponse(ctx, lo, verbose, &zc, err)
 			return
 		}
 
@@ -248,7 +244,7 @@ func (e *Endpoint) handler(l *zerolog.Logger) func(*fasthttp.RequestCtx) {
 			res := h.(Resulter).Result()
 			if !isNilResult(res) {
 				if err := e.writeResponse(ctx, lo, res, &zc); err != nil {
-					e.writeErrorResponse(ctx, verbose, &zc, err, e.EndpointMeta)
+					e.writeErrorResponse(ctx, lo, verbose, &zc, err)
 					return
 				}
 			}
@@ -262,7 +258,7 @@ func (e *Endpoint) handler(l *zerolog.Logger) func(*fasthttp.RequestCtx) {
 			e.mr.ReportMetric(e.Method, e.Path, fctx.Response.StatusCode(), dur.Seconds(), len(fctx.Response.Body()))
 		}
 
-		e.runMiddleware(ctx, OnSuccessResponse, verbose, &zc, e.EndpointMeta) //nolint:errcheck
+		e.runMiddleware(ctx, OnSuccessResponse, lo, verbose, &zc) //nolint:errcheck
 	}
 }
 
@@ -281,15 +277,32 @@ func (e *Endpoint) requestContext() (context.Context, context.CancelFunc) {
 }
 
 // resolveLogLevel returns the effective LogOption for this request without
-// mutating shared endpoint state.
+// mutating shared endpoint state. The X-Set-Log-Level header replaces the
+// endpoint level, unless WithStaticLoggingLevel is set or the endpoint is
+// LogSilent: the header cannot turn LogSilent off.
 func (e *Endpoint) resolveLogLevel(fctx *fasthttp.RequestCtx) LogOption {
-	if e.staticLoggingLevel {
-		return e.LogOptions
+	lo := e.LogOptions
+	if !e.staticLoggingLevel {
+		if raw := fctx.Request.Header.Peek("X-Set-Log-Level"); len(raw) > 0 {
+			lo = parseLogLevelHeader(raw) | e.LogOptions&LogSilent
+		}
 	}
-	if raw := fctx.Request.Header.Peek("X-Set-Log-Level"); len(raw) > 0 {
-		return parseLogLevelHeader(raw)
+	return effectiveLogLevel(lo)
+}
+
+// effectiveLogLevel applies the precedence of LogSilent: when it is set, all
+// other bits are dropped.
+func effectiveLogLevel(lo LogOption) LogOption {
+	if lo&LogSilent != 0 {
+		return LogSilent
 	}
-	return LogOption(atomic.LoadUint32((*uint32)(&e.LogOptions)))
+	return lo
+}
+
+// isErrorLogged reports whether an error response with statusCode is logged
+// at level lo: LogSilent logs 5xx errors only.
+func isErrorLogged(lo LogOption, statusCode int) bool {
+	return lo&LogSilent == 0 || statusCode >= 500
 }
 
 // AddMiddleware adds per-endpoint middleware at the given pipeline position.
@@ -300,17 +313,13 @@ func (e *Endpoint) AddMiddleware(pos MiddlewarePos, f ...func(Context, EndpointM
 
 // runMiddleware executes global then per-endpoint middleware at pos in order.
 // On the first error it writes the error response and returns it.
-func (e *Endpoint) runMiddleware(ctx Context, pos MiddlewarePos, verbose bool, zc *zerolog.Context, meta EndpointMeta) error {
-	for _, mw := range e.middlewares[pos] {
-		if err := mw(ctx, e.EndpointMeta); err != nil {
-			e.writeErrorResponse(ctx, verbose, zc, err)
-			return err
-		}
-	}
-	for _, mw := range e.localMdw[pos] {
-		if err := mw(ctx, e.EndpointMeta); err != nil {
-			e.writeErrorResponse(ctx, verbose, zc, err)
-			return err
+func (e *Endpoint) runMiddleware(ctx Context, pos MiddlewarePos, lo LogOption, verbose bool, zc *zerolog.Context) error {
+	for _, mws := range [2][]func(Context, EndpointMeta) error{e.middlewares[pos], e.localMdw[pos]} {
+		for _, mw := range mws {
+			if err := mw(ctx, e.EndpointMeta); err != nil {
+				e.writeErrorResponse(ctx, lo, verbose, zc, err)
+				return err
+			}
 		}
 	}
 	return nil
@@ -531,9 +540,10 @@ func (e *Endpoint) writeJSON(w io.Writer, lo LogOption, res interface{}, zc *zer
 	return err
 }
 
-// writeErrorResponse logs the error, writes an error JSON body, reports metrics,
-// triggers the alarm if critical, and runs OnErrorResponse middleware.
-func (e *Endpoint) writeErrorResponse(ctx Context, verbose bool, zc *zerolog.Context, err error, meta ...EndpointMeta) {
+// writeErrorResponse logs the error (at level lo), writes an error JSON body,
+// reports metrics, triggers the alarm if critical, and runs OnErrorResponse
+// middleware with the endpoint metadata.
+func (e *Endpoint) writeErrorResponse(ctx Context, lo LogOption, verbose bool, zc *zerolog.Context, err error) {
 	if err == nil {
 		return
 	}
@@ -562,15 +572,17 @@ func (e *Endpoint) writeErrorResponse(ctx Context, verbose bool, zc *zerolog.Con
 		statusCode = defaultErrorStatus(err)
 	}
 
-	z := *zc
-	ctx.VisitUserValues(func(key []byte, v interface{}) {
-		if e.isPathParamKey(key) {
-			return
-		}
-		z = z.Interface(string(key), v)
-	})
-	zl := z.RawJSON("err", errors.ToJSON(err, errors.WithAttributes(errors.ServerOutputFormat))).Logger()
-	zl.Error().Msg("request failed")
+	if isErrorLogged(lo, statusCode) {
+		z := *zc
+		ctx.VisitUserValues(func(key []byte, v interface{}) {
+			if e.isPathParamKey(key) {
+				return
+			}
+			z = z.Interface(string(key), v)
+		})
+		zl := z.RawJSON("err", errors.ToJSON(err, errors.WithAttributes(errors.ServerOutputFormat))).Logger()
+		zl.Error().Msg("request failed")
+	}
 
 	ctx.SetContentType([]byte("application/json; charset=utf-8"))
 	ctx.SetStatusCode(statusCode)
@@ -590,15 +602,11 @@ func (e *Endpoint) writeErrorResponse(ctx Context, verbose bool, zc *zerolog.Con
 		e.ala.Alarm(err)
 	}
 
-	var m EndpointMeta
-	if len(meta) > 0 {
-		m = meta[0]
-	}
 	for _, mw := range e.middlewares[OnErrorResponse] {
-		mw(ctx, m) //nolint:errcheck
+		mw(ctx, e.EndpointMeta) //nolint:errcheck
 	}
 	for _, mw := range e.localMdw[OnErrorResponse] {
-		mw(ctx, m) //nolint:errcheck
+		mw(ctx, e.EndpointMeta) //nolint:errcheck
 	}
 }
 

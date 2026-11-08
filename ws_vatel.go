@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/axkit/errors"
@@ -257,12 +257,7 @@ func (wv *WebsocketVatel) onMessage(c *websocket.Conn, isBinary bool, data []byt
 
 	verbose := e.verboseError
 
-	var lo LogOption
-	if e.staticLoggingLevel {
-		lo = e.LogOptions
-	} else {
-		lo = LogOption(atomic.LoadUint32((*uint32)(&e.LogOptions)))
-	}
+	lo := effectiveLogLevel(e.LogOptions)
 
 	zco := e.wsLogger.With().Str("client", c.RemoteAddr().String())
 	if e.logRequestID {
@@ -286,7 +281,7 @@ func (wv *WebsocketVatel) onMessage(c *websocket.Conn, isBinary bool, data []byt
 			}
 		}
 		if err := wv.cfg.authFunc(ctx, msg.Path, e.Perms); err != nil {
-			wsWriteErrorResponse(e, c, verbose, &zc, ctx.Created(), err)
+			wsWriteErrorResponse(e, c, lo, verbose, &zc, ctx.Created(), err)
 			return
 		}
 	}
@@ -302,14 +297,14 @@ func (wv *WebsocketVatel) onMessage(c *websocket.Conn, isBinary bool, data []byt
 	// ── Input decoding ───────────────────────────────────────────────────────
 	if input, ok := h.(Inputer); ok {
 		if err := decodeWSInput(msg.Data, input.Input()); err != nil {
-			wsWriteErrorResponse(e, c, verbose, &zc, ctx.Created(), err)
+			wsWriteErrorResponse(e, c, lo, verbose, &zc, ctx.Created(), err)
 			return
 		}
 	}
 
 	// ── Handler ──────────────────────────────────────────────────────────────
 	if err := h.Handle(ctx); err != nil {
-		wsWriteErrorResponse(e, c, verbose, &zc, ctx.Created(), err)
+		wsWriteErrorResponse(e, c, lo, verbose, &zc, ctx.Created(), err)
 		return
 	}
 
@@ -318,7 +313,7 @@ func (wv *WebsocketVatel) onMessage(c *websocket.Conn, isBinary bool, data []byt
 		res := h.(Resulter).Result()
 		if !isNilResult(res) {
 			if err := e.wsWriteResponse(c, lo, res, &zc); err != nil {
-				wsWriteErrorResponse(e, c, verbose, &zc, ctx.Created(), err)
+				wsWriteErrorResponse(e, c, lo, verbose, &zc, ctx.Created(), err)
 				return
 			}
 		}
@@ -356,21 +351,26 @@ func decodeWSInput(data []byte, dest interface{}) error {
 	return nil
 }
 
-// wsWriteErrorResponse logs an error and sends it to the WebSocket client.
-func wsWriteErrorResponse(e *Endpoint, c *websocket.Conn, verbose bool, zc *zerolog.Context, created time.Time, err error) {
+// wsWriteErrorResponse logs an error (at level lo) and sends it to the
+// WebSocket client w.
+func wsWriteErrorResponse(e *Endpoint, w io.Writer, lo LogOption, verbose bool, zc *zerolog.Context, created time.Time, err error) {
 	if err == nil {
 		return
 	}
 
-	statusCode := 500
+	statusCode := 0
 	if xe, ok := err.(*errors.Error); ok {
 		ce := errors.Serialize(xe, errors.WithAttributes(errors.ServerOutputFormat))
 		statusCode = ce.StatusCode
 	}
+	if statusCode == 0 {
+		statusCode = defaultErrorStatus(err)
+	}
 
-	z := *zc
-	zl := z.RawJSON("err", errors.ToJSON(err, errors.WithAttributes(errors.ServerOutputFormat))).Logger()
-	zl.Error().Msg("ws request failed")
+	if isErrorLogged(lo, statusCode) {
+		zl := zc.RawJSON("err", errors.ToJSON(err, errors.WithAttributes(errors.ServerOutputFormat))).Logger()
+		zl.Error().Msg("ws request failed")
+	}
 
 	var ff errors.ErrorSerializationRule
 	if verbose {
@@ -381,7 +381,7 @@ func wsWriteErrorResponse(e *Endpoint, c *websocket.Conn, verbose bool, zc *zero
 		rootFields = e.clientErrorFields
 	}
 	buf := errors.ToJSON(err, errors.WithAttributes(ff), errors.WithRootLevelFields(rootFields))
-	c.Write(buf) //nolint:errcheck
+	w.Write(buf) //nolint:errcheck
 
 	if e != nil && e.mr != nil {
 		e.mr.ReportMetric(e.Method, e.Path, statusCode, time.Since(created).Seconds(), len(buf))

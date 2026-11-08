@@ -1977,3 +1977,110 @@ func TestContext_ErrorStatus(t *testing.T) {
 		})
 	}
 }
+
+// ── OnErrorResponse metadata and LogSilent ───────────────────────────────────
+
+func TestHandler_OnErrorResponse_MetaOnAuthorizationReject(t *testing.T) {
+	v := noAuthVatel()
+	v.AddMiddleware(OnAuthorization, func(Context, EndpointMeta) error {
+		return ErrForbidden.New()
+	})
+	var got EndpointMeta
+	called := false
+	v.AddMiddleware(OnErrorResponse, func(_ Context, m EndpointMeta) error {
+		called = true
+		got = m
+		return nil
+	})
+	fctx := newGETCtx("/items")
+
+	run(v, GET("/items", func() Handler { return &plainHandler{} }), fctx)
+
+	if responseStatus(fctx) != 403 {
+		t.Fatalf("want 403, got %d", responseStatus(fctx))
+	}
+	if !called {
+		t.Fatal("OnErrorResponse not called")
+	}
+	if got.Method != "GET" || got.Path != "/items" {
+		t.Errorf("OnErrorResponse meta = %+v, want GET /items", got)
+	}
+}
+
+func TestHandler_LogSilent(t *testing.T) {
+	type tc struct {
+		name       string
+		method     string
+		body       string
+		header     string
+		lo         LogOption
+		mdwErr     error // returned by an OnRequest middleware
+		handlerErr error
+		wantStatus int
+		wantLog    bool
+	}
+	cases := []tc{
+		{name: "success", method: "GET", lo: LogSilent, wantStatus: 200},
+		{name: "silent wins over other bits", method: "GET", lo: LogSilent | LogEnter | LogExit | LogReqInput, wantStatus: 200},
+		{name: "4xx from middleware", method: "GET", lo: LogSilent, mdwErr: ErrForbidden.New(), wantStatus: 403},
+		{name: "4xx from decoding", method: "POST", body: `{"title":`, lo: LogSilent, wantStatus: 400},
+		{name: "4xx from handler", method: "GET", lo: LogSilent, handlerErr: ErrValidationFailed.New(), wantStatus: 400},
+		{name: "5xx from handler is logged", method: "GET", lo: LogSilent, handlerErr: fmt.Errorf("boom"), wantStatus: 500, wantLog: true},
+		{name: "5xx from middleware is logged", method: "GET", lo: LogSilent, mdwErr: ErrInternalError.New(), wantStatus: 500, wantLog: true},
+		{name: "header does not override silent", method: "GET", header: "enter,exit,req-input", lo: LogSilent, wantStatus: 200},
+		{name: "header does not override silent on 4xx", method: "GET", header: "enter,exit", lo: LogSilent, handlerErr: ErrValidationFailed.New(), wantStatus: 400},
+		{name: "silent set by header", method: "GET", header: "silent,exit", lo: LogFull, wantStatus: 200},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			v := noAuthVatel()
+			if c.mdwErr != nil {
+				err := c.mdwErr
+				v.AddMiddleware(OnRequest, func(Context, EndpointMeta) error { return err })
+			}
+			var fctx *fasthttp.RequestCtx
+			var ep Endpoint
+			if c.method == "POST" {
+				fctx = newPOSTCtx("/items", []byte(c.body))
+				ep = POST("/items", func() Handler { return &bodyHandler{} }, WithLogOption(c.lo))
+			} else {
+				fctx = newGETCtx("/items")
+				herr := c.handlerErr
+				ep = GET("/items", func() Handler { return &plainHandler{retErr: herr} }, WithLogOption(c.lo))
+			}
+			if c.header != "" {
+				fctx.Request.Header.Set("X-Set-Log-Level", c.header)
+			}
+
+			runLogged(t, v, ep, fctx, &buf)
+
+			if responseStatus(fctx) != c.wantStatus {
+				t.Fatalf("want status %d, got %d", c.wantStatus, responseStatus(fctx))
+			}
+			if !c.wantLog {
+				if buf.Len() != 0 {
+					t.Errorf("want empty log, got %s", buf.String())
+				}
+				return
+			}
+			m := lastLogLine(t, &buf)
+			if m["message"] != "request failed" {
+				t.Errorf("want error log line, got %s", buf.String())
+			}
+		})
+	}
+}
+
+func TestHandler_NotSilent_4xxLogged(t *testing.T) {
+	var buf bytes.Buffer
+	fctx := newGETCtx("/items")
+
+	runLogged(t, noAuthVatel(), GET("/items", func() Handler {
+		return &plainHandler{retErr: ErrValidationFailed.New()}
+	}, WithLogOption(LogExit)), fctx, &buf)
+
+	if m := lastLogLine(t, &buf); m["message"] != "request failed" {
+		t.Errorf("4xx must be logged without LogSilent, got %s", buf.String())
+	}
+}

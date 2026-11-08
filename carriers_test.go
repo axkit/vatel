@@ -259,7 +259,6 @@ func TestEndpointOptions(t *testing.T) {
 		WithSuccessStatusCode(201),
 		WithContentType("text/plain"),
 		WithManualStatusCode(),
-		WithLanguageLabel("en"),
 	)
 
 	if len(ep.Perms) != 2 || ep.Perms[0] != "read" || ep.Perms[1] != "write" {
@@ -279,9 +278,6 @@ func TestEndpointOptions(t *testing.T) {
 	}
 	if !ep.ManualStatusCode {
 		t.Error("ManualStatusCode should be true")
-	}
-	if ep.LanguageLabel != "en" {
-		t.Errorf("LanguageLabel: %s", ep.LanguageLabel)
 	}
 }
 

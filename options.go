@@ -64,11 +64,6 @@ func WithTimeout(d time.Duration) EndpointOption {
 	return func(e *Endpoint) { e.Timeout = d }
 }
 
-// WithLanguageLabel sets a language label for the endpoint (for i18n use).
-func WithLanguageLabel(label string) EndpointOption {
-	return func(e *Endpoint) { e.LanguageLabel = label }
-}
-
 // GET creates a GET endpoint with the given path, controller factory, and options.
 func GET(path string, ctrl func() Handler, opts ...EndpointOption) Endpoint {
 	return buildEndpoint("GET", path, ctrl, opts...)
