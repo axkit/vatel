@@ -7,7 +7,6 @@ import (
 	"io"
 	"path"
 	"reflect"
-	"regexp"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -82,7 +81,8 @@ type Endpoint struct {
 	clientErrorFields     []string
 	responseContentType   []byte
 	isPathParametrized    bool
-	isQuerier             bool // controller implements Querier
+	pathParamKeys         []string // {name} keys of the path template; logged by decodeParams only
+	isQuerier             bool     // controller implements Querier
 	isURLQueryExpected    bool
 	isRequestBodyExpected bool
 	hasRespBody           bool
@@ -293,10 +293,25 @@ func (e *Endpoint) runMiddleware(ctx Context, pos MiddlewarePos, verbose bool, z
 	return nil
 }
 
+// isPathParamKey reports whether the user value key is a path param of the
+// endpoint. Path params are logged (masked) by decodeParams, so user value
+// visitors skip them.
+func (e *Endpoint) isPathParamKey(key []byte) bool {
+	for _, k := range e.pathParamKeys {
+		if string(key) == k {
+			return true
+		}
+	}
+	return false
+}
+
 // logEnter logs an "enter" event enriched with current user values, then resets
 // zc back to the base context (zco) so subsequent log entries stay clean.
 func (e *Endpoint) logEnter(ctx Context, zc *zerolog.Context, zco zerolog.Context) {
 	ctx.VisitUserValues(func(key []byte, v any) {
+		if e.isPathParamKey(key) {
+			return
+		}
 		*zc = (*zc).Interface(string(key), v)
 	})
 	zl := zc.Logger()
@@ -314,6 +329,9 @@ func (e *Endpoint) logExit(ctx Context, lo LogOption, zc *zerolog.Context, dur t
 	ctx.VisitUserValues(func(key []byte, v any) {
 		if bytes.Equal(key, []byte("message")) {
 			msg = v.(string)
+			return
+		}
+		if e.isPathParamKey(key) {
 			return
 		}
 		*zc = (*zc).Interface(string(key), v)
@@ -520,6 +538,9 @@ func (e *Endpoint) writeErrorResponse(ctx Context, verbose bool, zc *zerolog.Con
 
 	z := *zc
 	ctx.VisitUserValues(func(key []byte, v interface{}) {
+		if e.isPathParamKey(key) {
+			return
+		}
 		z = z.Interface(string(key), v)
 	})
 	zl := z.RawJSON("err", errors.ToJSON(err, errors.WithAttributes(errors.ServerOutputFormat))).Logger()
@@ -574,8 +595,8 @@ func (e *Endpoint) compile(v *Vatel) error {
 	c := e.Controller()
 
 	// Validate path param / Paramer consistency.
-	re := regexp.MustCompile(`(?s)\{(.*)\}`)
-	pathHasParam := re.Match([]byte(e.Path))
+	e.pathParamKeys = parsePathParamKeys(e.Path)
+	pathHasParam := len(e.pathParamKeys) > 0
 	_, isParamer := c.(Paramer)
 
 	if !isParamer && pathHasParam {
@@ -621,6 +642,38 @@ func (e *Endpoint) compile(v *Vatel) error {
 	}
 
 	return nil
+}
+
+// parsePathParamKeys returns the param names of a fasthttp/router path
+// template: "id" for {id}, {id?}, {id:regex} and {id:*}. Braces inside a regex
+// are balanced.
+func parsePathParamKeys(p string) []string {
+	var keys []string
+	for i := 0; i < len(p); i++ {
+		if p[i] != '{' {
+			continue
+		}
+		start := i + 1
+		end := start
+		for end < len(p) && p[end] != '}' && p[end] != ':' && p[end] != '?' {
+			end++
+		}
+		if end > start {
+			keys = append(keys, p[start:end])
+		}
+		// Skip to the matching closing brace.
+		depth := 1
+		for i = start; i < len(p) && depth > 0; i++ {
+			switch p[i] {
+			case '{':
+				depth++
+			case '}':
+				depth--
+			}
+		}
+		i--
+	}
+	return keys
 }
 
 // resultPrototyper is implemented by OptionalOutput, whose Result() is nil

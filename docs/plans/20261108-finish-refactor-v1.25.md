@@ -98,6 +98,7 @@
 - новое: builders `vatel.HEAD` и `vatel.OPTIONS` (раньше эти методы давали ошибку `BuildHandlers` «unknown HTTP method»). Вход `Inputer` на HEAD/OPTIONS разбирается из query, как на GET; `WithOptionalBody()` на них — ошибка `BuildHandlers`. Тело ответа на HEAD отбрасывает сервер fasthttp. CORS preflight — `mux.GlobalOPTIONS` (вызывается только для зарегистрированных путей, неизвестный путь — 404); явный `vatel.OPTIONS` на пути заменяет `GlobalOPTIONS`; `RequireAuth`/`RequirePerms` на OPTIONS ломает preflight.
 - jsonmask: `Fields` больше не паникует (nil, скаляры, map → пустые правила; новый `Fields.HasRules()`), поддерживает рекурсивные типы, корень-срез/массив (`*[]T`, `[]*T`), заходит в `*Struct`, `[]Struct`, `[]*Struct`. Поле с непустым тегом `mask` — лист: значение-структура (`time.Time`, вложенная структура, указатель, срез) маскируется или удаляется целиком. Тег на встроенной структуре без json-имени применяется к каждому её продвинутому полю. Незарегистрированное имя функции теперь даёт `"***"` (раньше значение оставалось открытым). Отсутствующее поле (`omitempty`) не добавляется. Карты и interface не обходятся.
 - журнал: поля с тегом `mask` маскируются всегда — без `WithJsonMasker` используется `jsonmask.New()` (незарегистрированное имя функции → `"***"`). Маскируются `requestBody`, `reqInput`, `reqQuery`, `respBody`, `result`, в том числе в элементах массивов (`Body[[]T]`, `Output[[]T]`) и в `OptionalOutput[T]`; ответ клиенту не маскируется. Ключи `maskedRequestBody`/`maskedRespBody` убраны — замаскированное тело пишется под прежними `requestBody`/`respBody`. `result` пишется как сериализованный ответ (тот же JSON, что получил клиент, после маскирования), а не через `Interface`. При ошибке маскирования в журнал идёт только ошибка (`requestBodyMaskingFailed`, `reqInputMaskingFailed`, `respMaskingFailed`), без незамаскированного значения (раньше тело запроса писалось открытым). При ошибке `json.Marshal` ответа объект ответа в журнал не пишется (раньше — `result`). Тип без тегов `mask` логируется как прежде.
+- журнал: path- и query-параметры с тегом `mask` маскируются — `mask:"-"` не пишется, любой другой непустой `mask` → `"***"` (функции jsonmask к параметрам не применяются); тег `mask` на вложенной структуре query-входа действует на её поля без своего тега. Значения в структуре входа не меняются. Path-параметры пишутся только из разбора `Paramer` (ключ больше не дублируется в журнале; параметр пути, которого нет в структуре `Paramer`, больше не пишется), user values с именами `{name}` из шаблона пути в журнал не попадают; при `LogEnter|LogExit` path-параметры — только в строке входа (раньше дублировались в строке выхода через user values).
 
 ## What Goes Where
 - **Implementation Steps**: код, тесты, документация в этом репозитории, коммиты на ветке `refactor`.
@@ -185,11 +186,11 @@
 - Modify: `endpoint.go`, `decode.go`
 - Modify: `handler_test.go` (или новый `logging_test.go`)
 
-- [ ] тесты через `router.New()` + `BuildHandlers`, журнал выхода и журнал ошибки: path-параметр с `mask:"secret"` → `"***"`, с `mask:"-"` — отсутствует, ключ не дублируется
-- [ ] те же тесты для query-параметров
-- [ ] тест: значения в структуре входа не изменены; параметры без тега пишутся как раньше
-- [ ] `fieldInfo.mask`, логирование в `decodeParams`/`decodeURLQuery`, `pathParamKeys` из шаблона пути, пропуск этих ключей в `logEnter`/`logExit`/`writeErrorResponse`
-- [ ] run tests — must pass before next task
+- [x] тесты через `router.New()` + `BuildHandlers`, журнал выхода и журнал ошибки: path-параметр с `mask:"secret"` → `"***"`, с `mask:"-"` — отсутствует, ключ не дублируется
+- [x] те же тесты для query-параметров
+- [x] тест: значения в структуре входа не изменены; параметры без тега пишутся как раньше
+- [x] `fieldInfo.mask`, логирование в `decodeParams`/`decodeURLQuery`, `pathParamKeys` из шаблона пути, пропуск этих ключей в `logEnter`/`logExit`/`writeErrorResponse`
+- [x] run tests — must pass before next task
 
 ### Task 8: Контекст запроса — Shutdown и таймаут
 **Files:**

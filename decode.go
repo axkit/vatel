@@ -8,6 +8,7 @@ import (
 
 	"github.com/axkit/date"
 	"github.com/axkit/errors"
+	"github.com/axkit/vatel/jsonmask"
 	"github.com/rs/zerolog"
 	"github.com/valyala/fasthttp"
 )
@@ -20,6 +21,21 @@ type fieldInfo struct {
 	kind    reflect.Kind // field kind after pointer dereferencing
 	isDate  bool         // true for github.com/axkit/date.Date
 	isPtr   bool         // true if the field is a pointer type
+	mask    string       // mask tag value: "" logs the value, "-" omits it, any other masks it
+}
+
+// logParam adds the path or query parameter val to zc under its tag, honouring
+// the field's mask tag: "-" omits it, any other non-empty value logs
+// jsonmask.DefaultMask. Masking functions are not applied to parameters.
+func logParam[V string | []byte](zc zerolog.Context, fi *fieldInfo, val V) zerolog.Context {
+	switch fi.mask {
+	case "":
+		return zc.Str(fi.tag, string(val))
+	case "-":
+		return zc
+	default:
+		return zc.Str(fi.tag, jsonmask.DefaultMask)
+	}
 }
 
 // buildParamFields reflects on a path-param struct type and returns precomputed
@@ -42,29 +58,35 @@ func buildParamFields(t reflect.Type) []fieldInfo {
 			indices: []int{i},
 			tag:     tag,
 			kind:    f.Type.Kind(),
+			mask:    f.Tag.Get("mask"),
 		})
 	}
 	return fields
 }
 
 // buildQueryFields reflects on a query/body input struct type and returns
-// precomputed field metadata, flattening nested structs.
+// precomputed field metadata, flattening nested structs. A mask tag on a
+// nested struct applies to its fields that have no mask tag of their own.
 func buildQueryFields(t reflect.Type) []fieldInfo {
 	if t.Kind() == reflect.Ptr {
 		t = t.Elem()
 	}
 	var fields []fieldInfo
-	flattenQueryFields(t, nil, &fields)
+	flattenQueryFields(t, nil, "", &fields)
 	return fields
 }
 
 var dateType = reflect.TypeOf(date.Date(0))
 
-func flattenQueryFields(t reflect.Type, path []int, fields *[]fieldInfo) {
+func flattenQueryFields(t reflect.Type, path []int, parentMask string, fields *[]fieldInfo) {
 	for i := 0; i < t.NumField(); i++ {
 		f := t.Field(i)
 		if !f.IsExported() {
 			continue
+		}
+		mask := f.Tag.Get("mask")
+		if mask == "" {
+			mask = parentMask
 		}
 
 		ft := f.Type
@@ -85,6 +107,7 @@ func flattenQueryFields(t reflect.Type, path []int, fields *[]fieldInfo) {
 					tag:     tag,
 					isDate:  true,
 					isPtr:   isPtr,
+					mask:    mask,
 				})
 			}
 			continue
@@ -92,7 +115,7 @@ func flattenQueryFields(t reflect.Type, path []int, fields *[]fieldInfo) {
 
 		if ft.Kind() == reflect.Struct {
 			// Recurse into nested struct (embedded or named field without a tag).
-			flattenQueryFields(ft, indices, fields)
+			flattenQueryFields(ft, indices, mask, fields)
 			continue
 		}
 
@@ -106,6 +129,7 @@ func flattenQueryFields(t reflect.Type, path []int, fields *[]fieldInfo) {
 			tag:     tag,
 			kind:    ft.Kind(),
 			isPtr:   isPtr,
+			mask:    mask,
 		})
 	}
 }
@@ -127,10 +151,13 @@ func fieldByIndices(v reflect.Value, indices []int) reflect.Value {
 
 // decodeParams fills path parameters into the struct pointed to by param
 // using precomputed field infos. Path params arrive as fasthttp user values.
+// Each param is added to zc, masked by its mask tag; this is the only place
+// path params are logged.
 func decodeParams(fctx *fasthttp.RequestCtx, param interface{}, fields []fieldInfo, zc zerolog.Context) (zerolog.Context, error) {
 	s := reflect.ValueOf(param).Elem()
 
-	for _, fi := range fields {
+	for i := range fields {
+		fi := &fields[i]
 		uv := fctx.UserValue(fi.tag)
 		if uv == nil {
 			return zc, ErrInternalError.New().Set("param", fi.tag).Msg("path param not found")
@@ -139,7 +166,7 @@ func decodeParams(fctx *fasthttp.RequestCtx, param interface{}, fields []fieldIn
 		if !ok {
 			return zc, ErrInternalError.New().Set("param", fi.tag).Msg("path param is not a string")
 		}
-		zc = zc.Str(fi.tag, val)
+		zc = logParam(zc, fi, val)
 
 		sf := s.Field(fi.indices[0])
 
@@ -181,13 +208,15 @@ func decodeParams(fctx *fasthttp.RequestCtx, param interface{}, fields []fieldIn
 }
 
 // decodeURLQuery fills query string parameters into the struct pointed to by input
-// using precomputed field infos.
+// using precomputed field infos. Each variable is added to zc, masked by its
+// mask tag.
 func decodeURLQuery(fctx *fasthttp.RequestCtx, input interface{}, fields []fieldInfo, zc zerolog.Context) (zerolog.Context, error) {
 	s := reflect.ValueOf(input).Elem()
 
-	for _, fi := range fields {
+	for i := range fields {
+		fi := &fields[i]
 		val := fctx.QueryArgs().Peek(fi.tag)
-		zc = zc.Bytes(fi.tag, val)
+		zc = logParam(zc, fi, val)
 		if val == nil {
 			continue
 		}
