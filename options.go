@@ -5,8 +5,12 @@ import "time"
 // EndpointOption is a functional option for configuring an Endpoint.
 type EndpointOption func(*Endpoint)
 
-// Perms sets the required permissions for the endpoint.
-// An empty list makes the endpoint public (no auth check).
+// Perms appends permission names to the endpoint's metadata (EndpointMeta.Perms).
+//
+// On HTTP endpoints Perms is metadata only: vatel does not check it. The check
+// is done by middleware, e.g. auth.RequirePerms, which also appends its
+// permission names here. On WS endpoints non-empty Perms require
+// WithWsAuthFunc, which receives them; without it BuildHandlers fails.
 func Perms(p ...string) EndpointOption {
 	return func(e *Endpoint) {
 		e.Perms = append(e.Perms, p...)

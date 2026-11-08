@@ -21,6 +21,7 @@ package auth
 
 import (
 	"encoding/json"
+	"sort"
 
 	"github.com/axkit/vatel"
 )
@@ -46,6 +47,8 @@ type Config struct {
 	RevokeCheck vatel.RevokeTokenChecker
 
 	// Disabled skips all auth checks. Useful for tests and local development.
+	// It is checked on every request, so it may be changed after the
+	// middleware and options are created.
 	Disabled bool
 }
 
@@ -151,22 +154,32 @@ func (c *Config) RequireAuth() vatel.EndpointOption {
 // middleware verifying the token holds all of the named permissions.
 //
 // perms maps each permission name to its bit position in the token's
-// permission bytes. Names are used only for error reporting; bit positions
-// are passed directly to Authorizer.IsAllowed.
+// permission bytes. Bit positions are passed directly to Authorizer.IsAllowed;
+// names are used for error reporting and are appended, sorted, to the
+// endpoint's Perms, so middleware sees them in EndpointMeta.Perms.
+//
+// Config.Disabled is checked on every request, so it may be set after the
+// option is created. A nil Config.Authorizer fails the request with
+// vatel.ErrInternalError (500).
 func (c *Config) RequirePerms(perms map[string]uint) vatel.EndpointOption {
-	if c.Disabled {
-		return func(*vatel.Endpoint) {}
+	names := make([]string, 0, len(perms))
+	for name := range perms {
+		names = append(names, name)
 	}
+	sort.Strings(names)
 
 	bits := make([]uint, 0, len(perms))
-	names := make([]string, 0, len(perms))
-	for name, bit := range perms {
-		names = append(names, name)
-		bits = append(bits, bit)
+	for _, name := range names {
+		bits = append(bits, perms[name])
 	}
 
 	return func(e *vatel.Endpoint) {
+		e.Perms = append(e.Perms, names...)
 		e.AddMiddleware(vatel.OnAuthorization, func(ctx vatel.Context, _ vatel.EndpointMeta) error {
+			if c.Disabled {
+				return nil
+			}
+
 			tp := ctx.TokenPayload()
 			if tp == nil {
 				if err := tokenError(ctx); err != nil {
@@ -185,7 +198,7 @@ func (c *Config) RequirePerms(perms map[string]uint) vatel.EndpointOption {
 			}
 
 			if c.Authorizer == nil {
-				panic("vatel/auth: Config.Authorizer must be set to use RequirePerms")
+				return vatel.ErrInternalError.New().Msg("auth: Config.Authorizer is not set")
 			}
 
 			allowed, err := c.Authorizer.IsAllowed(pa.Perms(), bits...)

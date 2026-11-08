@@ -101,6 +101,7 @@
 - журнал: path- и query-параметры с тегом `mask` маскируются — `mask:"-"` не пишется, любой другой непустой `mask` → `"***"` (функции jsonmask к параметрам не применяются); тег `mask` на вложенной структуре query-входа действует на её поля без своего тега. Значения в структуре входа не меняются. Path-параметры пишутся только из разбора `Paramer` (ключ больше не дублируется в журнале; параметр пути, которого нет в структуре `Paramer`, больше не пишется), user values с именами `{name}` из шаблона пути в журнал не попадают; при `LogEnter|LogExit` path-параметры — только в строке входа (раньше дублировались в строке выхода через user values).
 - новое: контекст запроса. `ctx.Context()` — дочерний от базового контекста `Vatel` (раньше `context.Background()`); `Shutdown` отменяет его — после ожидания запросов в полёте (до дедлайна `ctx` из `Shutdown`), а без сервера из `ListenAndServe` сразу; повторный `Shutdown` безопасен. Отмены по разрыву соединения клиентом нет (fasthttp его не видит). Таймаут: `vatel.WithTimeout(d)` (поле `Endpoint.Timeout`) на эндпоинт и `vatel.WithDefaultTimeout(d)` на `Vatel`; контекст с таймаутом отменяется и в конце обработки запроса. Таймаут не прерывает обработчик сам — только код, слушающий контекст. Ошибка без своего статуса (не `*errors.Error` или `*errors.Error` со статусом 0), в цепочке которой `context.DeadlineExceeded`, → 504, `context.Canceled` → 503; явный статус ошибки главнее. `*errors.Error` без статуса (например, `errors.Wrap(err, "msg")` от обычной ошибки) теперь даёт 500, а не 200. `NewContext(fctx)` по-прежнему с `context.Background()`.
 - WS: ошибка разбора поля `data` сообщения во вход `Inputer` → `ErrInvalidRequestBody` (400, код `VTL-0007`, сообщение «ws message data is not valid JSON»); раньше — необёрнутая ошибка `json.Unmarshal` и статус 500 (в журнале, метриках и `Alarm`).
+- auth: `RequirePerms` дописывает имена прав (отсортированно) в `Endpoint.Perms` — middleware видят их в `EndpointMeta.Perms` (на WS-эндпоинте это требует `WithWsAuthFunc`, иначе ошибка `BuildHandlers`). `Config.Disabled` проверяется во время запроса и в `RequirePerms` (раньше — только при создании опции; `RequireAuth` и `Middleware` уже проверяли во время запроса). `Config.Authorizer == nil` при `RequirePerms` → 500 `ErrInternalError` вместо panic. Комментарий `vatel.Perms`: для HTTP это только метаданные, проверку делает `auth`.
 
 ## What Goes Where
 - **Implementation Steps**: код, тесты, документация в этом репозитории, коммиты на ветке `refactor`.
@@ -220,11 +221,11 @@
 - Modify: `auth/auth.go`, `options.go` (комментарий `Perms`)
 - Modify: `auth/auth_test.go`
 
-- [ ] тест: middleware на `OnHandle` видит в `EndpointMeta.Perms` отсортированные имена из `RequirePerms`
-- [ ] тест: `Config.Disabled = true`, выставленный после создания опций, отключает и `RequirePerms`, и `RequireAuth`
-- [ ] тест: `Authorizer == nil` → 500, процесс не падает
-- [ ] реализовать; уточнить комментарий `vatel.Perms` (HTTP — метаданные; WS — требует `WithWsAuthFunc`)
-- [ ] run tests — must pass before next task
+- [x] тест: middleware на `OnHandle` видит в `EndpointMeta.Perms` отсортированные имена из `RequirePerms`
+- [x] тест: `Config.Disabled = true`, выставленный после создания опций, отключает и `RequirePerms`, и `RequireAuth`
+- [x] тест: `Authorizer == nil` → 500, процесс не падает
+- [x] реализовать; уточнить комментарий `vatel.Perms` (HTTP — метаданные; WS — требует `WithWsAuthFunc`)
+- [x] run tests — must pass before next task
 
 ### Task 11: LogSilent, метаданные в OnErrorResponse, удаление неиспользуемого
 **Files:**
