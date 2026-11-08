@@ -33,7 +33,9 @@ func TestPathParams_ImplementsParamer(t *testing.T) {
 }
 
 func TestPathParams_ReturnsSamePointer(t *testing.T) {
-	type P struct{ ID int `param:"id"` }
+	type P struct {
+		ID int `param:"id"`
+	}
 	pp := &PathParams[P]{}
 	a := pp.Param()
 	b := pp.Param()
@@ -413,25 +415,25 @@ func (c *uploadMockCtx) SaveMultipartFile(_ *multipart.FileHeader, path string) 
 	c.savedPath = path
 	return nil
 }
-func (c *uploadMockCtx) BodyWriter() io.Writer                          { return nil }
-func (c *uploadMockCtx) SetContentType([]byte) Context                  { return c }
-func (c *uploadMockCtx) SetStatusCode(int) Context                      { return c }
-func (c *uploadMockCtx) SetHeader(_, _ []byte) Context                  { return c }
-func (c *uploadMockCtx) Header(string) []byte                           { return nil }
-func (c *uploadMockCtx) RemoteAddr() string                             { return "" }
-func (c *uploadMockCtx) RequestTime() time.Time                         { return time.Time{} }
-func (c *uploadMockCtx) RequestBody() []byte                            { return nil }
-func (c *uploadMockCtx) PathValue(string) string                        { return "" }
-func (c *uploadMockCtx) QueryValue(string) []byte                       { return nil }
-func (c *uploadMockCtx) FormValue(string) []byte                        { return nil }
-func (c *uploadMockCtx) TokenPayload() any                              { return nil }
-func (c *uploadMockCtx) SetTokenPayload(any)                            {}
-func (c *uploadMockCtx) VerboseError() bool                             { return false }
-func (c *uploadMockCtx) SetVerboseError(bool)                           {}
-func (c *uploadMockCtx) Set(string, interface{}) Context                { return c }
-func (c *uploadMockCtx) Get(string) interface{}                         { return nil }
-func (c *uploadMockCtx) VisitUserValues(func([]byte, interface{}))      {}
-func (c *uploadMockCtx) Context() context.Context                       { return context.Background() }
+func (c *uploadMockCtx) BodyWriter() io.Writer                     { return nil }
+func (c *uploadMockCtx) SetContentType([]byte) Context             { return c }
+func (c *uploadMockCtx) SetStatusCode(int) Context                 { return c }
+func (c *uploadMockCtx) SetHeader(_, _ []byte) Context             { return c }
+func (c *uploadMockCtx) Header(string) []byte                      { return nil }
+func (c *uploadMockCtx) RemoteAddr() string                        { return "" }
+func (c *uploadMockCtx) RequestTime() time.Time                    { return time.Time{} }
+func (c *uploadMockCtx) RequestBody() []byte                       { return nil }
+func (c *uploadMockCtx) PathValue(string) string                   { return "" }
+func (c *uploadMockCtx) QueryValue(string) []byte                  { return nil }
+func (c *uploadMockCtx) FormValue(string) []byte                   { return nil }
+func (c *uploadMockCtx) TokenPayload() any                         { return nil }
+func (c *uploadMockCtx) SetTokenPayload(any)                       {}
+func (c *uploadMockCtx) VerboseError() bool                        { return false }
+func (c *uploadMockCtx) SetVerboseError(bool)                      {}
+func (c *uploadMockCtx) Set(string, interface{}) Context           { return c }
+func (c *uploadMockCtx) Get(string) interface{}                    { return nil }
+func (c *uploadMockCtx) VisitUserValues(func([]byte, interface{})) {}
+func (c *uploadMockCtx) Context() context.Context                  { return context.Background() }
 
 // makeFileHeader builds a real *multipart.FileHeader containing content.
 func makeFileHeader(filename, content string) *multipart.FileHeader {

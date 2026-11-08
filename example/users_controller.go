@@ -67,7 +67,7 @@ func UserEndpoints(cfg *auth.Config) vatel.Endpoints {
 
 	return vatel.Endpoints{
 		// /users/me must come before /users/{id} so the router matches it first.
-		vatel.GET("/users/me",   func() vatel.Handler { return &GetMeController{} },  cfg.RequireAuth()),
+		vatel.GET("/users/me", func() vatel.Handler { return &GetMeController{} }, cfg.RequireAuth()),
 		vatel.GET("/users/{id}", func() vatel.Handler { return &GetUserController{} }, read),
 	}
 }

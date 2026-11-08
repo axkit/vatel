@@ -28,7 +28,7 @@ func (c *Claims) Debug() bool   { return c.IsDebug }
 // jwtTokener wraps decoded claims and satisfies vatel.Tokener.
 type jwtTokener struct{ claims *Claims }
 
-func (t *jwtTokener) SystemPayload() map[string]any      { return nil }
+func (t *jwtTokener) SystemPayload() map[string]any         { return nil }
 func (t *jwtTokener) ApplicationPayload() vatel.AuthPayload { return t.claims }
 
 // JWTDecoder decodes JWT tokens by base64-decoding the payload segment.

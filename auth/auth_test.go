@@ -19,7 +19,7 @@ func (p *payload) Debug() bool   { return false }
 
 type tokener struct{ p vatel.AuthPayload }
 
-func (t *tokener) SystemPayload() map[string]any        { return nil }
+func (t *tokener) SystemPayload() map[string]any         { return nil }
 func (t *tokener) ApplicationPayload() vatel.AuthPayload { return t.p }
 
 // decoder accepts the token "good" and rejects anything else as expired.

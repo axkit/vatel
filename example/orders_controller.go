@@ -149,15 +149,15 @@ func (c *DeleteOrderController) Handle(_ vatel.Context) error {
 // ── Endpoint Registration ─────────────────────────────────────────────────────
 
 func OrderEndpoints(cfg *auth.Config) vatel.Endpoints {
-	read  := cfg.RequirePerms(map[string]uint{"orders:read": Permissions["orders:read"]})
+	read := cfg.RequirePerms(map[string]uint{"orders:read": Permissions["orders:read"]})
 	write := cfg.RequirePerms(map[string]uint{"orders:write": Permissions["orders:write"]})
 
 	return vatel.Endpoints{
-		vatel.GET("/orders",         func() vatel.Handler { return &ListOrdersController{} },  read),
-		vatel.GET("/orders/{id}",    func() vatel.Handler { return &GetOrderController{} },    read),
-		vatel.POST("/orders",        func() vatel.Handler { return &CreateOrderController{} }, write,
+		vatel.GET("/orders", func() vatel.Handler { return &ListOrdersController{} }, read),
+		vatel.GET("/orders/{id}", func() vatel.Handler { return &GetOrderController{} }, read),
+		vatel.POST("/orders", func() vatel.Handler { return &CreateOrderController{} }, write,
 			vatel.WithSuccessStatusCode(201)),
-		vatel.PUT("/orders/{id}",    func() vatel.Handler { return &UpdateOrderController{} }, write),
+		vatel.PUT("/orders/{id}", func() vatel.Handler { return &UpdateOrderController{} }, write),
 		vatel.DELETE("/orders/{id}", func() vatel.Handler { return &DeleteOrderController{} }, write,
 			vatel.WithSuccessStatusCode(204)),
 	}

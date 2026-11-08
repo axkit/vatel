@@ -4,10 +4,10 @@ package vatel
 type MiddlewarePos int
 
 const (
-	OnRequest         MiddlewarePos = iota // first: IP rate limit, request logging
-	OnAuthentication                       // decode token, populate request context
-	OnAuthorization                        // check required permissions per endpoint
-	OnHandle                               // pre-handler: per-user rate limit, audit, tx setup
+	OnRequest        MiddlewarePos = iota // first: IP rate limit, request logging
+	OnAuthentication                      // decode token, populate request context
+	OnAuthorization                       // check required permissions per endpoint
+	OnHandle                              // pre-handler: per-user rate limit, audit, tx setup
 	OnSuccessResponse
 	OnErrorResponse
 )

@@ -26,7 +26,7 @@ func (m *mockPayload) Debug() bool        { return m.debug }
 
 type mockTokener struct{ payload AuthPayload }
 
-func (m *mockTokener) SystemPayload() map[string]any { return nil }
+func (m *mockTokener) SystemPayload() map[string]any   { return nil }
 func (m *mockTokener) ApplicationPayload() AuthPayload { return m.payload }
 
 type mockDecoder struct {
@@ -43,7 +43,10 @@ type mockAuthorizer struct {
 
 func (m *mockAuthorizer) IsAllowed([]byte, ...uint) (bool, error) { return m.allowed, m.err }
 
-type mockRevoker struct{ revoked bool; err error }
+type mockRevoker struct {
+	revoked bool
+	err     error
+}
 
 func (m *mockRevoker) IsTokenRevoked(string) (bool, error) { return m.revoked, m.err }
 
@@ -87,7 +90,7 @@ type queryHandler struct {
 	called bool
 }
 
-func (h *queryHandler) Input() interface{}        { return &h.in }
+func (h *queryHandler) Input() interface{}       { return &h.in }
 func (h *queryHandler) Handle(ctx Context) error { h.called = true; return nil }
 
 // bodyHandler decodes a POST body.
@@ -99,7 +102,7 @@ type bodyHandler struct {
 	called bool
 }
 
-func (h *bodyHandler) Input() interface{}        { return &h.in }
+func (h *bodyHandler) Input() interface{}       { return &h.in }
 func (h *bodyHandler) Handle(ctx Context) error { h.called = true; return nil }
 
 // pathHandler decodes URL path parameters.
@@ -110,7 +113,7 @@ type pathHandler struct {
 	called bool
 }
 
-func (h *pathHandler) Param() interface{}        { return &h.param }
+func (h *pathHandler) Param() interface{}       { return &h.param }
 func (h *pathHandler) Handle(ctx Context) error { h.called = true; return nil }
 
 // resultHandler produces a JSON response.
@@ -129,7 +132,7 @@ func (h *resultHandler) Handle(ctx Context) error {
 // nilResultHandler returns nil from Result(), signalling no response body.
 type nilResultHandler struct{ out *struct{ V int } }
 
-func (h *nilResultHandler) Result() interface{} { return h.out }
+func (h *nilResultHandler) Result() interface{}      { return h.out }
 func (h *nilResultHandler) Handle(ctx Context) error { return nil }
 
 // tokenHandler records the token payload it sees.

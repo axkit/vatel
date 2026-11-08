@@ -39,8 +39,8 @@ func NewWsContext(c *websocket.Conn) WebsocketContext {
 
 func (ctx *WsContext) SetTokenPayload(tp any) { ctx.tp = tp }
 func (ctx *WsContext) TokenPayload() any      { return ctx.tp }
-func (ctx *WsContext) ID() uint64                         { return ctx.conn.ID() }
-func (ctx *WsContext) Created() time.Time                 { return ctx.created }
+func (ctx *WsContext) ID() uint64             { return ctx.conn.ID() }
+func (ctx *WsContext) Created() time.Time     { return ctx.created }
 
 func (ctx *WsContext) BodyWriter() io.Writer { return ctx.conn }
 

@@ -99,7 +99,6 @@ func WithWebsocketSupport(wv *WebsocketVatel) func(*Option) {
 	return func(o *Option) { o.wv = wv }
 }
 
-
 func WithUrlPrefix(s string) func(*Option) {
 	return func(o *Option) { o.urlPrefix = s }
 }
@@ -137,7 +136,6 @@ func WithJsonMasker(jm JsonMasker) func(*Option) {
 func WithAlarmer(ala Alarmer) func(*Option) {
 	return func(o *Option) { o.ala = ala }
 }
-
 
 // Add appends endpoints to the registry. Validation happens in BuildHandlers.
 func (v *Vatel) Add(e ...Endpointer) {

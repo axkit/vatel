@@ -13,8 +13,8 @@ import (
 	"time"
 
 	"github.com/axkit/errors"
-	"github.com/axkit/vatel/jsonmask"
 	realip "github.com/axkit/fasthttp-realip"
+	"github.com/axkit/vatel/jsonmask"
 	"github.com/regorov/websocket"
 	"github.com/rs/zerolog"
 	"github.com/valyala/fasthttp"
@@ -24,13 +24,13 @@ import (
 type LogOption uint32
 
 const (
-	LogSilent    LogOption = 1 << iota // suppress all logging for this endpoint
-	LogEnter                           // log when a request arrives
-	LogExit                            // log when a request completes
-	LogReqBody                         // log the raw request body
-	LogReqInput                        // log the decoded input struct
-	LogRespBody                        // log the raw response body (masked if configured)
-	LogRespOutput                      // log the response struct before marshalling
+	LogSilent     LogOption = 1 << iota // suppress all logging for this endpoint
+	LogEnter                            // log when a request arrives
+	LogExit                             // log when a request completes
+	LogReqBody                          // log the raw request body
+	LogReqInput                         // log the decoded input struct
+	LogRespBody                         // log the raw response body (masked if configured)
+	LogRespOutput                       // log the response struct before marshalling
 )
 
 var logOptionString = map[string]LogOption{
@@ -248,7 +248,6 @@ func (e *Endpoint) resolveLogLevel(fctx *fasthttp.RequestCtx) LogOption {
 	}
 	return LogOption(atomic.LoadUint32((*uint32)(&e.LogOptions)))
 }
-
 
 // AddMiddleware adds per-endpoint middleware at the given pipeline position.
 // Called from EndpointOption functions (e.g. auth.RequirePerms).
@@ -476,7 +475,6 @@ func (e *Endpoint) writeErrorResponse(ctx Context, verbose bool, zc *zerolog.Con
 		mw(ctx, m) //nolint:errcheck
 	}
 }
-
 
 // compile validates the endpoint configuration and precomputes all reflection
 // data needed at request time. Called once per endpoint during BuildHandlers.
