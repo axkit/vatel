@@ -298,10 +298,11 @@
 - `OnTokenUpdate` — `TestOnTokenUpdate`.
 
 ### Task 15: [Final] Update documentation
-- [ ] README.md: быстрый старт на новом API, carriers (`Validate()` на именованном типе), middleware, `auth`, `WithClientErrorFields`, `WithOptionalBody`, маскирование `mask` (параметры → `"***"`), контекст и таймауты (что таймаут не прерывает обработчик сам), CORS через `mux.GlobalOPTIONS` (только зарегистрированные пути; не ставить `Require*` на OPTIONS)
-- [ ] MIGRATION.md (v0.14 → v1.25): соответствие старого и нового API + все пункты раздела «Для MIGRATION.md» этого плана; проверить, что каждый пункт раздела перенесён
-- [ ] CLAUDE.md — новая архитектура; уровень журнала по умолчанию 0 (только ошибки), а не `LogFullOnExit`
-- [ ] move this plan to `docs/plans/completed/`
+- [x] README.md: быстрый старт на новом API, carriers (`Validate()` на именованном типе), middleware, `auth`, `WithClientErrorFields`, `WithOptionalBody`, маскирование `mask` (параметры → `"***"`), контекст и таймауты (что таймаут не прерывает обработчик сам), CORS через `mux.GlobalOPTIONS` (только зарегистрированные пути; не ставить `Require*` на OPTIONS)
+- [x] MIGRATION.md (v0.14 → v1.25): соответствие старого и нового API + все пункты раздела «Для MIGRATION.md» этого плана; проверить, что каждый пункт раздела перенесён
+- [x] CLAUDE.md — новая архитектура; уровень журнала по умолчанию 0 (только ошибки), а не `LogFullOnExit`
+- [x] move this plan to `docs/plans/completed/` (done by orchestrator after reviews)
+- ➕ в MIGRATION.md добавлены отличия от v0.14.1, найденные сравнением с `git show v0.14.1:*` (не из раздела «Для MIGRATION.md»): без токена на защищённом эндпоинте теперь `VTL-0004` вместо `VTL-0001`; у `ErrForbidden` нет полей `user`/`role`; `reqId` только с `WithRequestID()` (в v0.14 всегда); `Result()` = nil → нет тела (было `null`); ошибка разбора query → 400 `VTL-0006` (было 500); ошибка `OnSuccessResponse` игнорируется; `OnErrorResponse` в v0.14 паниковал при добавлении; убран `?description=true`; `X-Set-Log-Level` в v0.14 не обрабатывал запрос
 
 ## Post-Completion
 *Items requiring manual intervention or external systems — no checkboxes, informational only*
