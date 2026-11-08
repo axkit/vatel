@@ -48,7 +48,10 @@ type Context interface {
 	Get(key string) interface{}
 	VisitUserValues(func(key []byte, val interface{}))
 
-	// Standard Go context for deadline/cancellation propagation.
+	// Context returns the request context. It is cancelled by Vatel.Shutdown
+	// and, when the endpoint has a timeout (WithTimeout, WithDefaultTimeout),
+	// when the timeout expires or the request ends. fasthttp cannot detect a
+	// client disconnect, so it is not cancelled when the client goes away.
 	Context() context.Context
 }
 
@@ -61,10 +64,16 @@ type VatelContext struct {
 }
 
 // NewContext creates a Context wrapping the given fasthttp request context.
+// Its Context() is context.Background().
 func NewContext(fctx *fasthttp.RequestCtx) Context {
+	return newContext(fctx, context.Background())
+}
+
+// newContext creates a Context wrapping fctx with ctx as its Go context.
+func newContext(fctx *fasthttp.RequestCtx, ctx context.Context) *VatelContext {
 	return &VatelContext{
 		fh:  fctx,
-		ctx: context.Background(),
+		ctx: ctx,
 	}
 }
 

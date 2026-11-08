@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/axkit/errors"
 	"github.com/axkit/vatel/jsonmask"
@@ -64,6 +65,12 @@ type Vatel struct {
 	cfg   Option
 	srv   *fasthttp.Server
 	built bool
+
+	// baseCtx is the parent of every request context; Shutdown cancels it.
+	// fasthttp's RequestCtx.Done() is not used: it is the server's done
+	// channel, closed only by Server.Shutdown.
+	baseCtx context.Context
+	cancel  context.CancelFunc
 }
 
 // NewVatel returns a new Vatel instance. The root GET / endpoint (table of
@@ -73,6 +80,7 @@ func NewVatel(optFunc ...func(*Option)) *Vatel {
 	for i := range optFunc {
 		optFunc[i](&v.cfg)
 	}
+	v.baseCtx, v.cancel = context.WithCancel(context.Background())
 	v.ep = []Endpoint{{EndpointMeta: EndpointMeta{Method: "GET", Path: "/"}, Controller: func() Handler { return &tocController{s: &v} }}}
 	return &v
 }
@@ -85,6 +93,7 @@ type Option struct {
 	verboseError       bool
 	logRequestID       bool
 	clientErrorFields  []string
+	defaultTimeout     time.Duration
 	jm                 JsonMasker
 	ala                Alarmer
 	mr                 MetricReporter
@@ -123,6 +132,12 @@ func WithVerboseError(b bool) func(*Option) {
 //	vatel.WithClientErrorFields("reason", "suggestedName")
 func WithClientErrorFields(fields ...string) func(*Option) {
 	return func(o *Option) { o.clientErrorFields = fields }
+}
+
+// WithDefaultTimeout sets the request context timeout of endpoints without
+// their own WithTimeout. See WithTimeout.
+func WithDefaultTimeout(d time.Duration) func(*Option) {
+	return func(o *Option) { o.defaultTimeout = d }
 }
 
 func WithDefaultLogOption(lo LogOption) func(*Option) {
@@ -238,6 +253,10 @@ func (v *Vatel) ListenAndServe(addr string, mux *router.Router, l *zerolog.Logge
 // Shutdown gracefully stops the server. It first closes all active WebSocket
 // connections (clients receive a "going away" frame and can reconnect), then
 // waits for in-flight HTTP requests to finish or until ctx is cancelled.
+// Finally it cancels the request contexts (Context.Context()) of requests
+// still in flight, so handlers listening to them can stop. Without a server
+// started by ListenAndServe the request contexts are cancelled at once.
+// Calling Shutdown again is safe.
 //
 // Pass a context with a deadline to enforce a hard cutoff:
 //
@@ -245,6 +264,9 @@ func (v *Vatel) ListenAndServe(addr string, mux *router.Router, l *zerolog.Logge
 //	defer cancel()
 //	v.Shutdown(ctx)
 func (v *Vatel) Shutdown(ctx context.Context) error {
+	if v.cancel != nil {
+		defer v.cancel()
+	}
 	if v.cfg.wv != nil {
 		v.cfg.wv.Shutdown()
 	}

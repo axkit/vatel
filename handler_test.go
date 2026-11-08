@@ -2,13 +2,16 @@ package vatel
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"io"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/axkit/errors"
 	"github.com/axkit/vatel/jsonmask"
 	"github.com/fasthttp/router"
 	"github.com/rs/zerolog"
@@ -1764,5 +1767,213 @@ func TestHandler_Log_MarshalErrorOmitsResult(t *testing.T) {
 	}
 	if strings.Contains(buf.String(), "leak") {
 		t.Errorf("response object leaked to log: %s", buf.String())
+	}
+}
+
+// ── request context: Shutdown and timeout ─────────────────────────────────────
+
+// ctxWaitHandler signals started, then waits until its request context is
+// done (or a safety timeout expires), sends the context error to errc and
+// returns it.
+type ctxWaitHandler struct {
+	started chan struct{}
+	errc    chan error
+}
+
+func newCtxWaitHandler() *ctxWaitHandler {
+	return &ctxWaitHandler{started: make(chan struct{}), errc: make(chan error, 1)}
+}
+
+func (h *ctxWaitHandler) Handle(ctx Context) error {
+	close(h.started)
+	var err error
+	select {
+	case <-ctx.Context().Done():
+		err = ctx.Context().Err()
+	case <-time.After(10 * time.Second):
+		err = fmt.Errorf("request context was not cancelled")
+	}
+	h.errc <- err
+	return err
+}
+
+func TestContext_ShutdownCancelsHandlerContext(t *testing.T) {
+	v := noAuthVatel()
+	h := newCtxWaitHandler()
+	fctx := newGETCtx("/wait")
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		run(v, GET("/wait", func() Handler { return h }), fctx)
+	}()
+	<-h.started
+
+	if err := v.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	<-done
+
+	if err := <-h.errc; !stderrors.Is(err, context.Canceled) {
+		t.Errorf("handler context error = %v, want context.Canceled", err)
+	}
+	if got := responseStatus(fctx); got != 503 {
+		t.Errorf("want 503, got %d", got)
+	}
+	if err := v.Shutdown(context.Background()); err != nil {
+		t.Errorf("second Shutdown: %v", err)
+	}
+}
+
+func TestContext_ShutdownWithServer_CancelsAfterDeadline(t *testing.T) {
+	v := noAuthVatel()
+	h := newCtxWaitHandler()
+	v.Add(Endpoints{GET("/wait", func() Handler { return h })})
+	mux := router.New()
+	if err := v.BuildHandlers(mux, discardLogger()); err != nil {
+		t.Fatalf("BuildHandlers: %v", err)
+	}
+
+	ln := fasthttputil.NewInmemoryListener()
+	v.srv = &fasthttp.Server{Handler: mux.Handler}
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		_ = v.srv.Serve(ln)
+	}()
+
+	conn, err := ln.Dial()
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	if _, err := conn.Write([]byte("GET /wait HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	<-h.started
+
+	// The in-flight request keeps waiting on its context, so the server cannot
+	// stop before the shutdown deadline; then the base context is cancelled.
+	sctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if err := v.Shutdown(sctx); !stderrors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("Shutdown = %v, want context.DeadlineExceeded", err)
+	}
+
+	raw, _ := io.ReadAll(conn)
+	if !strings.HasPrefix(string(raw), "HTTP/1.1 503") {
+		t.Errorf("response = %q, want 503", raw)
+	}
+	<-served
+	if err := <-h.errc; !stderrors.Is(err, context.Canceled) {
+		t.Errorf("handler context error = %v, want context.Canceled", err)
+	}
+}
+
+func TestContext_EndpointTimeout(t *testing.T) {
+	h := newCtxWaitHandler()
+	var deadlineSet bool
+	fctx := newGETCtx("/wait")
+
+	run(noAuthVatel(), GET("/wait", Func(func(ctx Context) error {
+		_, deadlineSet = ctx.Context().Deadline()
+		return h.Handle(ctx)
+	}), WithTimeout(50*time.Millisecond)), fctx)
+
+	if !deadlineSet {
+		t.Error("Deadline() not set")
+	}
+	if err := <-h.errc; !stderrors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("handler context error = %v, want context.DeadlineExceeded", err)
+	}
+	if got := responseStatus(fctx); got != 504 {
+		t.Errorf("want 504, got %d", got)
+	}
+}
+
+func TestContext_DefaultTimeout(t *testing.T) {
+	deadline := func(v *Vatel, opts ...EndpointOption) (time.Duration, bool) {
+		var d time.Duration
+		var ok bool
+		run(v, GET("/d", Func(func(ctx Context) error {
+			var dl time.Time
+			dl, ok = ctx.Context().Deadline()
+			d = time.Until(dl)
+			return nil
+		}), opts...), newGETCtx("/d"))
+		return d, ok
+	}
+
+	v := noAuthVatel(WithDefaultTimeout(time.Hour))
+
+	d, ok := deadline(v)
+	if !ok || d <= 30*time.Minute || d > time.Hour {
+		t.Errorf("default timeout: deadline in %v (set %v), want about 1h", d, ok)
+	}
+	d, ok = deadline(v, WithTimeout(3*time.Hour))
+	if !ok || d <= 2*time.Hour {
+		t.Errorf("own timeout: deadline in %v (set %v), want about 3h", d, ok)
+	}
+}
+
+func TestContext_TimeoutCancelledAfterRequest(t *testing.T) {
+	var reqCtx context.Context
+	run(noAuthVatel(), GET("/d", Func(func(ctx Context) error {
+		reqCtx = ctx.Context()
+		return nil
+	}), WithTimeout(time.Hour)), newGETCtx("/d"))
+
+	if !stderrors.Is(reqCtx.Err(), context.Canceled) {
+		t.Errorf("request context error after request = %v, want context.Canceled", reqCtx.Err())
+	}
+}
+
+func TestContext_NoTimeout_NoDeadline(t *testing.T) {
+	var reqCtx context.Context
+	var deadlineSet bool
+	run(noAuthVatel(), GET("/d", Func(func(ctx Context) error {
+		reqCtx = ctx.Context()
+		_, deadlineSet = reqCtx.Deadline()
+		return nil
+	})), newGETCtx("/d"))
+
+	if deadlineSet {
+		t.Error("Deadline() set without a timeout")
+	}
+	if reqCtx.Err() != nil {
+		t.Errorf("request context error = %v, want nil before Shutdown", reqCtx.Err())
+	}
+
+	ctx := NewContext(&fasthttp.RequestCtx{})
+	if ctx.Context() == nil || ctx.Context().Err() != nil {
+		t.Errorf("NewContext: Context() = %v", ctx.Context())
+	}
+	if _, ok := ctx.Context().Deadline(); ok {
+		t.Error("NewContext: Deadline() set")
+	}
+}
+
+func TestContext_ErrorStatus(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want int
+	}{
+		{"deadline", context.DeadlineExceeded, 504},
+		{"canceled", context.Canceled, 503},
+		{"wrapped deadline", fmt.Errorf("query: %w", context.DeadlineExceeded), 504},
+		{"axkit wrapped canceled", errors.Wrap(context.Canceled, "query"), 503},
+		{"explicit status wins", ErrValidationFailed.Wrap(context.DeadlineExceeded), 400},
+		{"plain error", fmt.Errorf("boom"), 500},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fctx := newGETCtx("/e")
+			run(noAuthVatel(), GET("/e", Func(func(Context) error { return tt.err })), fctx)
+			if got := responseStatus(fctx); got != tt.want {
+				t.Errorf("want %d, got %d (%s)", tt.want, got, fctx.Response.Body())
+			}
+		})
 	}
 }

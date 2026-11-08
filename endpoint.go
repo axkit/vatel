@@ -2,7 +2,9 @@ package vatel
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"io"
 	"path"
@@ -70,11 +72,16 @@ type Endpoint struct {
 	// See WithOptionalBody.
 	OptionalBody bool
 
+	// Timeout of the request context; zero takes the Vatel default
+	// (WithDefaultTimeout), if any. See WithTimeout.
+	Timeout time.Duration
+
 	// Controller factories — exactly one must be set.
 	Controller          func() Handler
 	WebsocketController func() WebsocketHandler
 
 	// Internal — populated by compile().
+	baseCtx               context.Context // parent of request contexts, cancelled by Vatel.Shutdown
 	staticLoggingLevel    bool
 	verboseError          bool
 	logRequestID          bool
@@ -190,7 +197,9 @@ func (e *Endpoint) handler(l *zerolog.Logger) func(*fasthttp.RequestCtx) {
 		verbose := e.verboseError
 		lo := e.resolveLogLevel(fctx)
 
-		ctx := NewContext(fctx)
+		reqCtx, cancel := e.requestContext()
+		defer cancel()
+		ctx := newContext(fctx, reqCtx)
 		zco := l.With().Str("client", realip.FromRequest(fctx))
 		if e.logRequestID {
 			zco = zco.Uint64("reqId", fctx.ID())
@@ -255,6 +264,20 @@ func (e *Endpoint) handler(l *zerolog.Logger) func(*fasthttp.RequestCtx) {
 
 		e.runMiddleware(ctx, OnSuccessResponse, verbose, &zc, e.EndpointMeta) //nolint:errcheck
 	}
+}
+
+// requestContext returns the Go context of a request: the Vatel base context,
+// with the endpoint timeout if one is set. The returned cancel must be called
+// when the request ends.
+func (e *Endpoint) requestContext() (context.Context, context.CancelFunc) {
+	base := e.baseCtx
+	if base == nil {
+		base = context.Background()
+	}
+	if e.Timeout > 0 {
+		return context.WithTimeout(base, e.Timeout)
+	}
+	return base, func() {}
 }
 
 // resolveLogLevel returns the effective LogOption for this request without
@@ -515,7 +538,7 @@ func (e *Endpoint) writeErrorResponse(ctx Context, verbose bool, zc *zerolog.Con
 		return
 	}
 
-	statusCode := 500
+	statusCode := 0
 
 	if xe, ok := err.(*errors.Error); ok {
 		ce := errors.Serialize(xe, errors.WithAttributes(errors.ServerOutputFormat))
@@ -534,6 +557,9 @@ func (e *Endpoint) writeErrorResponse(ctx Context, verbose bool, zc *zerolog.Con
 				ctx.SetHeader([]byte("Retry-After"), hv)
 			}
 		}
+	}
+	if statusCode == 0 {
+		statusCode = defaultErrorStatus(err)
 	}
 
 	z := *zc
@@ -574,6 +600,19 @@ func (e *Endpoint) writeErrorResponse(ctx Context, verbose bool, zc *zerolog.Con
 	for _, mw := range e.localMdw[OnErrorResponse] {
 		mw(ctx, m) //nolint:errcheck
 	}
+}
+
+// defaultErrorStatus returns the HTTP status of an error without its own
+// status code: 504 for a context deadline, 503 for a cancelled context
+// (Vatel.Shutdown), 500 otherwise.
+func defaultErrorStatus(err error) int {
+	switch {
+	case stderrors.Is(err, context.DeadlineExceeded):
+		return fasthttp.StatusGatewayTimeout
+	case stderrors.Is(err, context.Canceled):
+		return fasthttp.StatusServiceUnavailable
+	}
+	return fasthttp.StatusInternalServerError
 }
 
 // compile validates the endpoint configuration and precomputes all reflection
@@ -710,6 +749,10 @@ var defaultMasker = jsonmask.New()
 // per-endpoint middleware (vatel/auth) for HTTP endpoints.
 func compileCommon(v *Vatel, e *Endpoint) error {
 	e.middlewares = v.mdw
+	e.baseCtx = v.baseCtx
+	if e.Timeout == 0 {
+		e.Timeout = v.cfg.defaultTimeout
+	}
 	e.staticLoggingLevel = v.cfg.staticLoggingLevel
 	e.verboseError = v.cfg.verboseError
 	e.logRequestID = v.cfg.logRequestID

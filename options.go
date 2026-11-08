@@ -1,5 +1,7 @@
 package vatel
 
+import "time"
+
 // EndpointOption is a functional option for configuring an Endpoint.
 type EndpointOption func(*Endpoint)
 
@@ -47,6 +49,15 @@ func WithManualStatusCode() EndpointOption {
 // a compile error returned from BuildHandlers.
 func WithOptionalBody() EndpointOption {
 	return func(e *Endpoint) { e.OptionalBody = true }
+}
+
+// WithTimeout sets the timeout of the request context returned by
+// Context.Context(); it overrides WithDefaultTimeout. The timeout does not
+// interrupt the handler by itself: only code that listens to the context
+// (database queries, HTTP calls, select on Done()) stops. A handler returning
+// context.DeadlineExceeded gets 504, context.Canceled gets 503.
+func WithTimeout(d time.Duration) EndpointOption {
+	return func(e *Endpoint) { e.Timeout = d }
 }
 
 // WithLanguageLabel sets a language label for the endpoint (for i18n use).
