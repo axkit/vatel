@@ -33,40 +33,53 @@ type Authorizer interface {
 	IsAllowed(requestPerms []byte, endpointPerms ...uint) (bool, error)
 }
 
-// Config holds the auth dependencies for HTTP endpoints. All fields are
-// optional — omit those you don't need (e.g. RevokeCheck for stateless JWTs).
+// Config holds the auth dependencies for HTTP endpoints.
 type Config struct {
-	// Decoder decodes the raw Authorization header value into a Tokener.
+	// Decoder decodes the Authorization header value into a Tokener. It is
+	// required when Middleware is used. It receives the raw header value:
+	// nothing strips a "Bearer " prefix, so strip it in the decoder if your
+	// clients send one. If Decoder is nil, a request carrying an
+	// Authorization header is treated like one with a bad token: public
+	// endpoints serve it as unauthenticated, RequireAuth and RequirePerms
+	// reject it with vatel.ErrInternalError (500).
 	Decoder vatel.TokenDecoder
 
 	// Authorizer checks whether the token's permission bytes satisfy the
-	// endpoint's required permissions.
+	// endpoint's required permissions. It is required by RequirePerms; a nil
+	// Authorizer fails RequirePerms endpoints with vatel.ErrInternalError (500).
 	Authorizer Authorizer
 
-	// RevokeCheck optionally verifies that the token has not been revoked.
+	// RevokeCheck optionally verifies that the token has not been revoked
+	// (omit it for stateless JWTs). Like Decoder, it receives the raw
+	// Authorization header value. If it returns an error, RequireAuth and
+	// RequirePerms endpoints fail with vatel.ErrInternalError (500); public
+	// endpoints serve the request as unauthenticated.
 	RevokeCheck vatel.RevokeTokenChecker
 
 	// Disabled skips all auth checks. Useful for tests and local development.
-	// It is checked on every request, so it may be changed after the
-	// middleware and options are created.
+	// Set it before the server starts serving; it is read on every request
+	// without synchronisation, so changing it while requests are served is a
+	// data race.
 	Disabled bool
 }
 
 // tokenErrKey is the context key under which Middleware stores a token
-// error (invalid, expired or revoked token) for RequireAuth/RequirePerms.
+// error (invalid, expired or revoked token, failed revocation check or unset
+// Decoder) for RequireAuth/RequirePerms.
 const tokenErrKey = "authTokenError"
 
 // Middleware returns a OnAuthentication middleware that:
 //  1. Reads the Authorization header.
 //  2. Optionally checks token revocation (if RevokeCheck is set).
 //  3. Decodes the token and stores the payload on ctx via SetTokenPayload.
-//  4. If the payload implements interface{ Debug() bool } and Debug() is true,
-//     calls ctx.SetVerboseError(true) to enable detailed error responses for
-//     this request.
+//  4. If the payload's Debug() is true, calls ctx.SetVerboseError(true) to
+//     enable detailed error responses for this request.
 //
 // A bad token (invalid, expired, revoked) does not fail the request here:
 // public endpoints ignore it and serve the request as unauthenticated.
-// RequireAuth and RequirePerms reject the request with the token error.
+// RequireAuth and RequirePerms reject the request with the token error
+// (401). A failed revocation check or an unset Decoder is handled the same
+// way, except that RequireAuth and RequirePerms reject with 500.
 //
 // Endpoints that require authentication or specific permissions should add
 // RequirePerms (or RequireAuth) as an additional EndpointOption.
@@ -89,7 +102,7 @@ func (c *Config) Middleware() func(vatel.Context, vatel.EndpointMeta) error {
 		ctx.SetTokenPayload(ap)
 
 		// Enable verbose errors if the token requests debug mode.
-		if d, ok := ap.(interface{ Debug() bool }); ok && d.Debug() {
+		if ap != nil && ap.Debug() {
 			ctx.SetVerboseError(true)
 		}
 
@@ -98,10 +111,13 @@ func (c *Config) Middleware() func(vatel.Context, vatel.EndpointMeta) error {
 }
 
 func (c *Config) decode(at []byte) (vatel.AuthPayload, error) {
+	if c.Decoder == nil {
+		return nil, vatel.ErrInternalError.New().Msg("auth: Config.Decoder is not set")
+	}
 	if c.RevokeCheck != nil {
 		revoked, err := c.RevokeCheck.IsTokenRevoked(string(at))
 		if err != nil {
-			return nil, err
+			return nil, vatel.ErrInternalError.Wrap(err).Msg("auth: token revocation check failed")
 		}
 		if revoked {
 			return nil, vatel.ErrAccessTokenRevoked.New()
@@ -159,7 +175,8 @@ func (c *Config) RequireAuth() vatel.EndpointOption {
 // endpoint's Perms, so middleware sees them in EndpointMeta.Perms.
 //
 // Config.Disabled is checked on every request, so it may be set after the
-// option is created. A nil Config.Authorizer fails the request with
+// option is created, but before the server starts serving (see
+// Config.Disabled). A nil Config.Authorizer fails the request with
 // vatel.ErrInternalError (500).
 func (c *Config) RequirePerms(perms map[string]uint) vatel.EndpointOption {
 	names := make([]string, 0, len(perms))
@@ -190,6 +207,8 @@ func (c *Config) RequirePerms(perms map[string]uint) vatel.EndpointOption {
 					Msg("authentication required")
 			}
 
+			// TokenPayload is any: a custom middleware may have set a payload
+			// that is not a vatel.AuthPayload. Only Perms is needed here.
 			pa, ok := tp.(interface{ Perms() []byte })
 			if !ok {
 				return vatel.ErrUnauthorized.New().

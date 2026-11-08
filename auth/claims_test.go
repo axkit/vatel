@@ -1,11 +1,19 @@
-package vatel
+package auth
 
-// This file demonstrates how to use vatel/auth-style middleware with
-// project-specific JWT claims. The framework only requires that auth
-// middleware calls ctx.SetTokenPayload(). Everything else (UserID type,
-// field names, roles) is defined by the project.
+// This file demonstrates how to use the auth package with project-specific
+// JWT claims. The framework only requires that auth middleware calls
+// ctx.SetTokenPayload(). Everything else (UserID type, field names, roles) is
+// defined by the project; Config.Middleware stores whatever payload the
+// project's Decoder returns, and handlers type-assert it to the concrete type.
 
-import "testing"
+import (
+	"bytes"
+	"errors"
+	"reflect"
+	"testing"
+
+	"github.com/axkit/vatel"
+)
 
 // ── Project A: integer user IDs ───────────────────────────────────────────────
 
@@ -38,15 +46,37 @@ func (c *uuidClaims) Roles() []string { return c.roles }
 
 // ── Shared token decoder helpers ──────────────────────────────────────────────
 
-type staticTokener struct{ payload AuthPayload }
+type claimsTokener struct{ payload vatel.AuthPayload }
 
-func (t *staticTokener) SystemPayload() map[string]any   { return nil }
-func (t *staticTokener) ApplicationPayload() AuthPayload { return t.payload }
+func (t *claimsTokener) SystemPayload() map[string]any         { return nil }
+func (t *claimsTokener) ApplicationPayload() vatel.AuthPayload { return t.payload }
 
-type staticDecoder struct{ payload AuthPayload }
+const claimsToken = "test-token"
 
-func (d *staticDecoder) Decode([]byte) (Tokener, error) {
-	return &staticTokener{payload: d.payload}, nil
+// claimsDecoder stands in for a real JWT decoder: it returns payload for
+// claimsToken. Config.Decoder receives the raw Authorization header value,
+// so the decoder strips the "Bearer " prefix itself.
+type claimsDecoder struct{ payload vatel.AuthPayload }
+
+func (d *claimsDecoder) Decode(at []byte) (vatel.Tokener, error) {
+	tok, ok := bytes.CutPrefix(at, []byte("Bearer "))
+	if !ok || string(tok) != claimsToken {
+		return nil, errors.New("invalid token")
+	}
+	return &claimsTokener{payload: d.payload}, nil
+}
+
+// newClaimsServer serves h at path behind cfg.Middleware, adding opts to the
+// endpoint.
+func newClaimsServer(t *testing.T, cfg *Config, path string, h vatel.Handler, opts ...vatel.EndpointOption) func(token string) int {
+	t.Helper()
+	v := vatel.NewVatel()
+	v.AddMiddleware(vatel.OnAuthentication, cfg.Middleware())
+	v.Add(vatel.Endpoints{vatel.GET(path, func() vatel.Handler { return h }, opts...)})
+	srv := build(t, v)
+	return func(token string) int {
+		return get(srv, path, token).Response.StatusCode()
+	}
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
@@ -56,7 +86,7 @@ type intClaimsHandler struct {
 	gotLogin  string
 }
 
-func (h *intClaimsHandler) Handle(ctx Context) error {
+func (h *intClaimsHandler) Handle(ctx vatel.Context) error {
 	claims := ctx.TokenPayload().(*intClaims)
 	h.gotUserID = claims.UserID()
 	h.gotLogin = claims.Login()
@@ -69,7 +99,7 @@ type uuidClaimsHandler struct {
 	gotRoles  []string
 }
 
-func (h *uuidClaimsHandler) Handle(ctx Context) error {
+func (h *uuidClaimsHandler) Handle(ctx vatel.Context) error {
 	claims := ctx.TokenPayload().(*uuidClaims)
 	h.gotUserID = claims.UserID()
 	h.gotEmail = claims.Email()
@@ -81,39 +111,26 @@ func (h *uuidClaimsHandler) Handle(ctx Context) error {
 
 func TestCustomClaims_IntUserID(t *testing.T) {
 	claims := &intClaims{userID: 42, login: "alice", perms: []byte{0xFF}}
-	dec := &staticDecoder{payload: claims}
-	auth := &mockAuthorizer{allowed: true}
-	cfg := authConfig((*mockDecoder)(nil), auth)
-	cfg.dec = &mockDecoder{token: &staticTokener{payload: claims}}
-
-	v := NewVatel()
-	v.AddMiddleware(OnAuthentication, func(ctx Context, _ EndpointMeta) error {
-		at := ctx.Header("Authorization")
-		if len(at) == 0 {
-			return nil
-		}
-		token, err := dec.Decode(at)
-		if err != nil {
-			return ErrUnauthorized.Wrap(err)
-		}
-		ctx.SetTokenPayload(token.ApplicationPayload())
-		return nil
-	})
+	cfg := &Config{Decoder: &claimsDecoder{payload: claims}, Authorizer: allowAll{}}
 
 	h := &intClaimsHandler{}
-	fctx := newGETCtx("/profile")
-	fctx.Request.Header.Set("Authorization", "Bearer test-token")
+	do := newClaimsServer(t, cfg, "/profile", h, cfg.RequirePerms(map[string]uint{"profile:read": 0}))
 
-	run(v, GET("/profile", func() Handler { return h }, cfg.RequirePerms(map[string]uint{"profile:read": 0})), fctx)
-
-	if responseStatus(fctx) != 200 {
-		t.Fatalf("want 200, got %d", responseStatus(fctx))
+	if st := do("Bearer " + claimsToken); st != 200 {
+		t.Fatalf("want 200, got %d", st)
 	}
 	if h.gotUserID != 42 {
 		t.Errorf("userID: want 42, got %d", h.gotUserID)
 	}
 	if h.gotLogin != "alice" {
 		t.Errorf("login: want alice, got %s", h.gotLogin)
+	}
+
+	if st := do(""); st != 401 {
+		t.Errorf("no token: want 401, got %d", st)
+	}
+	if st := do(claimsToken); st != 401 {
+		t.Errorf("token without Bearer prefix: want 401, got %d", st)
 	}
 }
 
@@ -125,32 +142,13 @@ func TestCustomClaims_UUIDUserID(t *testing.T) {
 		roles:  []string{"admin", "editor"},
 		perms:  []byte{0xFF},
 	}
-	dec := &staticDecoder{payload: claims}
-	auth := &mockAuthorizer{allowed: true}
-	cfg := authConfig((*mockDecoder)(nil), auth)
-
-	v := NewVatel()
-	v.AddMiddleware(OnAuthentication, func(ctx Context, _ EndpointMeta) error {
-		at := ctx.Header("Authorization")
-		if len(at) == 0 {
-			return nil
-		}
-		token, err := dec.Decode(at)
-		if err != nil {
-			return ErrUnauthorized.Wrap(err)
-		}
-		ctx.SetTokenPayload(token.ApplicationPayload())
-		return nil
-	})
+	cfg := &Config{Decoder: &claimsDecoder{payload: claims}, Authorizer: allowAll{}}
 
 	h := &uuidClaimsHandler{}
-	fctx := newGETCtx("/content")
-	fctx.Request.Header.Set("Authorization", "Bearer test-token")
+	do := newClaimsServer(t, cfg, "/content", h, cfg.RequirePerms(map[string]uint{"content:write": 0}))
 
-	run(v, GET("/content", func() Handler { return h }, cfg.RequirePerms(map[string]uint{"content:write": 0})), fctx)
-
-	if responseStatus(fctx) != 200 {
-		t.Fatalf("want 200, got %d", responseStatus(fctx))
+	if st := do("Bearer " + claimsToken); st != 200 {
+		t.Fatalf("want 200, got %d", st)
 	}
 	if h.gotUserID != uid {
 		t.Errorf("userID: want %s, got %s", uid, h.gotUserID)
@@ -158,37 +156,23 @@ func TestCustomClaims_UUIDUserID(t *testing.T) {
 	if h.gotEmail != "alice@example.com" {
 		t.Errorf("email: want alice@example.com, got %s", h.gotEmail)
 	}
-	if len(h.gotRoles) != 2 || h.gotRoles[0] != "admin" {
-		t.Errorf("roles: want [admin editor], got %v", h.gotRoles)
+	if want := []string{"admin", "editor"}; !reflect.DeepEqual(h.gotRoles, want) {
+		t.Errorf("roles: want %v, got %v", want, h.gotRoles)
 	}
 }
 
 // TestCustomClaims_NoAuth shows that the payload is available on public
-// endpoints — the auth middleware sets it whenever a token is present.
+// endpoints — the auth middleware sets it whenever a valid token is present.
 func TestCustomClaims_NoAuth(t *testing.T) {
 	claims := &intClaims{userID: 7, login: "bob", perms: []byte{}}
-	dec := &staticDecoder{payload: claims}
-
-	v := NewVatel()
-	v.AddMiddleware(OnAuthentication, func(ctx Context, _ EndpointMeta) error {
-		at := ctx.Header("Authorization")
-		if len(at) == 0 {
-			return nil
-		}
-		token, _ := dec.Decode(at)
-		ctx.SetTokenPayload(token.ApplicationPayload())
-		return nil
-	})
+	cfg := &Config{Decoder: &claimsDecoder{payload: claims}}
 
 	h := &intClaimsHandler{}
-	fctx := newGETCtx("/public")
-	fctx.Request.Header.Set("Authorization", "Bearer test-token")
-
 	// No RequirePerms — public endpoint, no permission check.
-	run(v, GET("/public", func() Handler { return h }), fctx)
+	do := newClaimsServer(t, cfg, "/public", h)
 
-	if responseStatus(fctx) != 200 {
-		t.Fatalf("want 200, got %d", responseStatus(fctx))
+	if st := do("Bearer " + claimsToken); st != 200 {
+		t.Fatalf("want 200, got %d", st)
 	}
 	if h.gotUserID != 7 {
 		t.Errorf("want userID=7, got %d", h.gotUserID)
