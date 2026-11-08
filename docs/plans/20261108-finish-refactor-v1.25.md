@@ -108,6 +108,7 @@
 - WS: ошибка без статуса (не `*errors.Error` или `*errors.Error` со статусом 0) в журнале/метриках/`Alarm` считается как в HTTP — 500 (`context.DeadlineExceeded` → 504, `context.Canceled` → 503); раньше `*errors.Error` без статуса давал в метриках статус 0 и не вызывал `Alarm`.
 - `BuildHandlers`: WS-эндпоинт без `WithWebsocketSupport` и повторный WS-путь теперь возвращают ошибку с путём эндпоинта (раньше — panic; `MustBuildHandlers` по-прежнему паникует). Ошибка повторного WS-пути из `WebsocketVatel.RegisterEndpoint` — обычная ошибка «WS endpoint <path>: already registered», а не `*errors.Error` с полем `path`. После неудачной сборки `Vatel` непригоден: повторный `BuildHandlers` и `ListenAndServe` возвращают ошибку «previous build failed» (раньше `ListenAndServe` после неудачного `BuildHandlers` запускал сервер с частью маршрутов).
 - новое: `WebsocketVatel.OnTokenUpdate(f func(cid uint64, tp AuthPayload) error)` — вызывается из `UpdateAccessToken` после сохранения payload; ошибка `f` возвращается из `UpdateAccessToken` (и уходит клиенту эндпоинта `updateAccessToken`).
+- модуль: версия v1.24.2 отозвана (`retract` в go.mod, опубликована по ошибке — переходить на v1.25.0 или новее); `github.com/axkit/bitset` — обычная зависимость v1.0.4 (без `replace`).
 
 ## What Goes Where
 - **Implementation Steps**: код, тесты, документация в этом репозитории, коммиты на ветке `refactor`.
@@ -259,12 +260,13 @@
 ### Task 13: Подготовка релиза — зависимости, retract, пример
 **Files:**
 - Modify: `go.mod`, `go.sum`, `example/main.go`
+- Create: `example/cors.go`, `example/cors_test.go`
 
-- [ ] заменить `replace github.com/axkit/bitset` на `require github.com/axkit/bitset v1.0.4`, `go mod tidy`
-- [ ] добавить `retract v1.24.2 // published by mistake, use v1.25.0 or later`
-- [ ] проверить в чистом окружении: `GOFLAGS=-mod=mod GOWORK=off go build ./... && go test ./...`
-- [ ] пример: адрес из переменной `ADDR` (по умолчанию `:8080`); CORS preflight через `mux.GlobalOPTIONS`
-- [ ] запустить пример на свободном порту и проверить curl: healthcheck 200; плохой токен на публичном эндпоинте 200; без токена на защищённом 401; создание заказа с правами 201; удаление 204; OPTIONS на зарегистрированный путь — CORS-заголовки
+- [x] заменить `replace github.com/axkit/bitset` на `require github.com/axkit/bitset v1.0.4`, `go mod tidy`
+- [x] добавить `retract v1.24.2 // published by mistake, use v1.25.0 or later`
+- [x] проверить в чистом окружении: `GOFLAGS=-mod=mod GOWORK=off go build ./... && go test ./...` (дополнительно `go build` с пустым `GOMODCACHE` из proxy.golang.org — ок)
+- [x] пример: адрес из переменной `ADDR` (по умолчанию `:8080`); CORS preflight через `mux.GlobalOPTIONS` (`example/cors.go`, тест `example/cors_test.go`; `Access-Control-Allow-Origin` на обычных ответах — middleware `OnRequest`)
+- [x] запустить пример на свободном порту и проверить curl: healthcheck 200; плохой токен на публичном эндпоинте 200; без токена на защищённом 401; создание заказа с правами 201; удаление 204; OPTIONS на зарегистрированный путь — CORS-заголовки (порт 18080, наблюдалось: 200, 200, 401, 201, 204; OPTIONS /orders → 204 с `Allow`/`Access-Control-Allow-*`; OPTIONS на неизвестный путь → 404; 401 тоже несёт `Access-Control-Allow-Origin`)
 
 ### Task 14: Verify acceptance criteria
 - [ ] Гостли №2, №4, №6, №7, №10, №11 закрыты или имеют описанный способ; №5 — осознанно нет

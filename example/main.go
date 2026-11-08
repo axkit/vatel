@@ -1,6 +1,10 @@
 // Package main demonstrates a complete vatel API server setup.
 // It shows JWT-based auth via vatel/auth, permission-gated endpoints,
-// struct-based controllers with carrier embedding, and graceful shutdown.
+// struct-based controllers with carrier embedding, CORS preflight and
+// graceful shutdown.
+//
+// The listen address is taken from the ADDR environment variable
+// (default ":8080").
 package main
 
 import (
@@ -33,6 +37,7 @@ func main() {
 	// Decode the Authorization header and store the payload on every request.
 	// Endpoints that require auth add RequireAuth / RequirePerms via authCfg.
 	v.AddMiddleware(vatel.OnAuthentication, authCfg.Middleware())
+	v.AddMiddleware(vatel.OnRequest, corsMiddleware)
 
 	v.Add(
 		HealthEndpoints(),
@@ -42,14 +47,20 @@ func main() {
 	)
 
 	mux := router.New()
+	mux.GlobalOPTIONS = corsPreflight
 	v.MustBuildHandlers(mux, &log)
+
+	addr := os.Getenv("ADDR")
+	if addr == "" {
+		addr = ":8080"
+	}
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
-		log.Info().Str("addr", ":8080").Msg("server started")
-		if err := v.ListenAndServe(":8080", mux, &log); err != nil {
+		log.Info().Str("addr", addr).Msg("server started")
+		if err := v.ListenAndServe(addr, mux, &log); err != nil {
 			log.Fatal().Err(err).Msg("server stopped unexpectedly")
 		}
 	}()

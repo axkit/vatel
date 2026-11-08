@@ -4,12 +4,8 @@ go 1.24
 
 toolchain go1.24.1
 
-//replace github.com/axkit/errors => /Users/gera/go/src/github.com/axkit/errors
-//replace github.com/regorov/websocket => /home/gera/go/src/github.com/regorov/websocket
-replace github.com/axkit/bitset => /Users/gera/go/src/github.com/axkit/bitset
-
 require (
-	github.com/axkit/bitset v0.0.0
+	github.com/axkit/bitset v1.0.4
 	github.com/axkit/date v1.0.1
 	github.com/axkit/errors v1.1.0
 	github.com/axkit/fasthttp-realip v1.0.1
@@ -31,3 +27,5 @@ require (
 	github.com/tidwall/pretty v1.2.0 // indirect
 	github.com/valyala/bytebufferpool v1.0.0 // indirect
 )
+
+retract v1.24.2 // published by mistake, use v1.25.0 or later

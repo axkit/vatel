@@ -1,10 +1,10 @@
 github.com/andybalholm/brotli v1.0.2/go.mod h1:loMXtMfwqflxFJPmdbJO0a3KNoPuLBgiu3qAvBg8x/Y=
 github.com/andybalholm/brotli v1.0.4 h1:V7DdXeJtZscaqfNuAdSRuRFzuiKlHSC/Zh3zl9qY3JY=
 github.com/andybalholm/brotli v1.0.4/go.mod h1:fO7iG3H7G2nSZ7m0zPUDn85XEX2GTukHGRSepvi9Eig=
+github.com/axkit/bitset v1.0.4 h1:o9xOCDp4kSOy6R1K3F812gFLqKYrxxVqFAv0B5HWv+A=
+github.com/axkit/bitset v1.0.4/go.mod h1:V7/LebTpLeu/Imut08Z1hH40maMwAHdv4F0qJk5H68A=
 github.com/axkit/date v1.0.1 h1:ln57GtJDV64fltilyK8LYPYFsFx6JzF96sm8Au2Q5FY=
 github.com/axkit/date v1.0.1/go.mod h1:rzrdioi20pV1+Y6dYmq4qX5xNqbLSRupJ4FwUUSrHYk=
-github.com/axkit/errors v1.0.3 h1:iULh620PPa1zBCbvTBt1iaMa7hrGAKeNPj62WvUgucU=
-github.com/axkit/errors v1.0.3/go.mod h1:mjZgyJmHz0k7TBVenWKi9q7rmAygzWg3SX8Zkrw4cCQ=
 github.com/axkit/errors v1.1.0 h1:we3DOd1Va36Qp0lfm/TUIzxdkHhA/OmXxE+p9UEd2B4=
 github.com/axkit/errors v1.1.0/go.mod h1:mjZgyJmHz0k7TBVenWKi9q7rmAygzWg3SX8Zkrw4cCQ=
 github.com/axkit/fasthttp-realip v1.0.1 h1:K5QM8p9WvmYK+rviaYBRBfO3fV9zYawLn6szZNB79+I=
