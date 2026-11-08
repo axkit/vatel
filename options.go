@@ -39,6 +39,16 @@ func WithManualStatusCode() EndpointOption {
 	return func(e *Endpoint) { e.ManualStatusCode = true }
 }
 
+// WithOptionalBody allows an empty request body on a POST/PUT/PATCH endpoint.
+// When the body is empty or contains only whitespace, decoding is skipped: the
+// input stays zero and Validator.Validate() is not called. A non-empty body is
+// decoded and validated as usual; invalid JSON is still rejected with 400.
+// Using it on a method without a request body (GET, DELETE) is a compile error
+// returned from BuildHandlers.
+func WithOptionalBody() EndpointOption {
+	return func(e *Endpoint) { e.OptionalBody = true }
+}
+
 // WithLanguageLabel sets a language label for the endpoint (for i18n use).
 func WithLanguageLabel(label string) EndpointOption {
 	return func(e *Endpoint) { e.LanguageLabel = label }

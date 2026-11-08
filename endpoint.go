@@ -67,6 +67,10 @@ type Endpoint struct {
 	ResponseContentType string
 	LanguageLabel       string
 
+	// OptionalBody allows an empty request body on POST/PUT/PATCH.
+	// See WithOptionalBody.
+	OptionalBody bool
+
 	// Controller factories — exactly one must be set.
 	Controller          func() Handler
 	WebsocketController func() WebsocketHandler
@@ -327,36 +331,47 @@ func (e *Endpoint) buildHandler(fctx *fasthttp.RequestCtx, lo LogOption, zc zero
 
 	if e.isRequestBodyExpected {
 		body := fctx.Request.Body()
-
-		if lo&LogReqBody == LogReqBody {
-			compact := bytes.NewBuffer(nil)
-			key := "requestBody"
-			if jerr := json.Compact(compact, body); jerr != nil {
-				zc = zc.Str("requestBodyLoggingFailed", jerr.Error())
-			} else {
-				buf := compact.Bytes()
-				if e.jm != nil && len(e.inputFields) > 0 {
-					if masked, merr := e.jm.Mask(buf, e.inputFields); merr == nil {
-						buf = masked
-						key = "maskedRequestBody"
-					} else {
-						zc = zc.Str("maskingRequestAttrsFailed", merr.Error())
-					}
-				}
-				zc = zc.RawJSON(key, buf)
-			}
-		}
-
 		in := h.(Inputer).Input()
-		if err := decodeBody(body, in); err != nil {
+
+		decoded, err := decodeBody(body, in, e.OptionalBody)
+		// A skipped optional body has nothing to log.
+		if lo&LogReqBody == LogReqBody && (decoded || err != nil) {
+			zc = e.logRequestBody(zc, body)
+		}
+		if err != nil {
 			return zc, nil, err
 		}
-		if lo&LogReqInput == LogReqInput {
-			zc = zc.Interface("reqInput", in)
+		if decoded {
+			if lo&LogReqInput == LogReqInput {
+				zc = zc.Interface("reqInput", in)
+			}
+			if err := validate(in); err != nil {
+				return zc, nil, err
+			}
 		}
 	}
 
 	return zc, h, nil
+}
+
+// logRequestBody adds the compacted (and masked, if configured) request body
+// to zc.
+func (e *Endpoint) logRequestBody(zc zerolog.Context, body []byte) zerolog.Context {
+	compact := bytes.NewBuffer(nil)
+	if jerr := json.Compact(compact, body); jerr != nil {
+		return zc.Str("requestBodyLoggingFailed", jerr.Error())
+	}
+	buf := compact.Bytes()
+	key := "requestBody"
+	if e.jm != nil && len(e.inputFields) > 0 {
+		if masked, merr := e.jm.Mask(buf, e.inputFields); merr == nil {
+			buf = masked
+			key = "maskedRequestBody"
+		} else {
+			zc = zc.Str("maskingRequestAttrsFailed", merr.Error())
+		}
+	}
+	return zc.RawJSON(key, buf)
 }
 
 // writeResponse marshals res and writes it to the response body,
@@ -526,6 +541,9 @@ func (e *Endpoint) compile(v *Vatel) error {
 	// Route input decoding based on HTTP method.
 	switch e.Method {
 	case "GET", "DELETE":
+		if e.OptionalBody {
+			return fmt.Errorf("endpoint %s %s: WithOptionalBody is not allowed for a method without a request body", e.Method, origPath)
+		}
 		e.isURLQueryExpected = isInputer
 		if isInputer {
 			e.queryFields = buildQueryFields(reflect.TypeOf(ii.Input()).Elem())

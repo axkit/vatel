@@ -93,6 +93,7 @@
 - `X-Set-Log-Level` действует на один запрос (в v0.14 сохранялся на эндпоинте);
 - удалены `NoInputLog`, `NoResultLog`, `LanguageLabel` (были публичными и в v0.14);
 - тело у DELETE не поддерживается — query (`QueryParams`).
+- новое: `WithOptionalBody()` (поле `Endpoint.OptionalBody`) для POST/PUT/PATCH — пустое тело или тело из пробелов допустимо, вход остаётся нулевым, `Validate()` не вызывается; на GET/DELETE — ошибка `BuildHandlers`. Без опции тело из одних пробелов теперь даёт 400 «empty request body» (раньше — 400 «not valid JSON»).
 
 ## What Goes Where
 - **Implementation Steps**: код, тесты, документация в этом репозитории, коммиты на ветке `refactor`.
@@ -105,23 +106,23 @@
 - Delete: `vatel_test.gox`
 - Modify: все изменённые и новые файлы рабочей копии
 
-- [ ] убедиться, что `go test -race ./...` и `go vet ./...` проходят
-- [ ] удалить `vatel_test.gox`
-- [ ] коммит «refactor: new endpoint API, carriers, positional middleware, auth package» — всё, кроме `docs/` и `CLAUDE.md` (CLAUDE.md обновляется в Task 15; go.mod пока с локальным replace — исправляется в Task 13)
-- [ ] `gofmt -w .`, тесты, отдельный коммит «style: gofmt»
-- [ ] отдельные коммиты: этот план; пункт бэклога `docs/backlog/log-level-header-overrides-confidential.md`
+- [x] убедиться, что `go test -race ./...` и `go vet ./...` проходят
+- [x] удалить `vatel_test.gox`
+- [x] коммит «refactor: new endpoint API, carriers, positional middleware, auth package» — всё, кроме `docs/` и `CLAUDE.md` (CLAUDE.md обновляется в Task 15; go.mod пока с локальным replace — исправляется в Task 13)
+- [x] `gofmt -w .`, тесты, отдельный коммит «style: gofmt»
+- [x] отдельные коммиты: этот план; пункт бэклога `docs/backlog/log-level-header-overrides-confidential.md`
 
 ### Task 2: Необязательное тело запроса и отдельный шаг Validator
 **Files:**
 - Modify: `options.go`, `endpoint.go`, `decode.go`
 - Modify: `handler_test.go`, `endpoint_test.go`
 
-- [ ] тесты: POST с `WithOptionalBody()` — пустое тело и тело из пробелов → 200, вход нулевой; с телом → разобран; невалидный JSON → 400; без опции пустое тело → 400 (регрессия)
-- [ ] тест: `WithOptionalBody()` на GET → ошибка compile
-- [ ] тест: при пустом теле `Validator` не вызывается; при непустом — вызывается (через `buildHandler`)
-- [ ] обновить `TestDecodeBody_ValidatorSuccess`/`Failure` под вынесенный `validate`
-- [ ] реализовать `OptionalBody`, `WithOptionalBody()`, `decodeBody(..., optional)`, `validate(in)` в `buildHandler`
-- [ ] run tests — must pass before next task
+- [x] тесты: POST с `WithOptionalBody()` — пустое тело и тело из пробелов → 200, вход нулевой; с телом → разобран; невалидный JSON → 400; без опции пустое тело → 400 (регрессия)
+- [x] тест: `WithOptionalBody()` на GET → ошибка compile
+- [x] тест: при пустом теле `Validator` не вызывается; при непустом — вызывается (через `buildHandler`)
+- [x] обновить `TestDecodeBody_ValidatorSuccess`/`Failure` под вынесенный `validate`
+- [x] реализовать `OptionalBody`, `WithOptionalBody()`, `decodeBody(..., optional)`, `validate(in)` в `buildHandler`
+- [x] run tests — must pass before next task
 
 ### Task 3: Querier — query отдельно от body, Validator для query
 **Files:**

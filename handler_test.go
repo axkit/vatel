@@ -839,3 +839,117 @@ func (t *orderTracker) Handle(ctx Context) error {
 	*t.order = append(*t.order, t.label)
 	return t.inner.Handle(ctx)
 }
+
+// ── optional body (WithOptionalBody) ─────────────────────────────────────────
+
+func TestHandler_OptionalBody(t *testing.T) {
+	tests := []struct {
+		name       string
+		body       []byte
+		wantStatus int
+		wantCalled bool
+		wantTitle  string
+		wantCount  int
+	}{
+		{name: "nil body", body: nil, wantStatus: 200, wantCalled: true},
+		{name: "empty body", body: []byte{}, wantStatus: 200, wantCalled: true},
+		{name: "whitespace body", body: []byte(" \r\n\t "), wantStatus: 200, wantCalled: true},
+		{name: "json body", body: []byte(`{"title":"x","count":2}`), wantStatus: 200, wantCalled: true, wantTitle: "x", wantCount: 2},
+		{name: "invalid json", body: []byte(`not json`), wantStatus: 400},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := &bodyHandler{}
+			fctx := newPOSTCtx("/items", tt.body)
+
+			run(noAuthVatel(), POST("/items", func() Handler { return h }, WithOptionalBody()), fctx)
+
+			if got := responseStatus(fctx); got != tt.wantStatus {
+				t.Fatalf("want %d, got %d (body %s)", tt.wantStatus, got, fctx.Response.Body())
+			}
+			if h.called != tt.wantCalled {
+				t.Fatalf("handler called = %v, want %v", h.called, tt.wantCalled)
+			}
+			if h.in.Title != tt.wantTitle || h.in.Count != tt.wantCount {
+				t.Errorf("unexpected input: %+v", h.in)
+			}
+		})
+	}
+}
+
+func TestHandler_WithoutOptionalBody_BlankBodyRejected(t *testing.T) {
+	for _, body := range [][]byte{nil, []byte("  \n ")} {
+		h := &bodyHandler{}
+		fctx := newPOSTCtx("/items", body)
+
+		run(noAuthVatel(), POST("/items", func() Handler { return h }), fctx)
+
+		if got := responseStatus(fctx); got != 400 {
+			t.Errorf("body %q: want 400, got %d", body, got)
+		}
+		if h.called {
+			t.Errorf("body %q: handler must not be called", body)
+		}
+	}
+}
+
+func TestCompile_OptionalBodyOnGET(t *testing.T) {
+	e := GET("/items", func() Handler { return &plainHandler{} }, WithOptionalBody())
+	if err := e.compile(noAuthVatel()); err == nil {
+		t.Error("expected compile error for WithOptionalBody on GET")
+	}
+}
+
+// countingInput is a body input whose Validate() counts calls and rejects
+// an empty Name.
+type countingInput struct {
+	Name  string `json:"name"`
+	calls int
+}
+
+func (c *countingInput) Validate() error {
+	c.calls++
+	if c.Name == "" {
+		return ErrValidationFailed.New().Msg("name is required")
+	}
+	return nil
+}
+
+type validatedBodyHandler struct {
+	in     countingInput
+	called bool
+}
+
+func (h *validatedBodyHandler) Input() interface{}       { return &h.in }
+func (h *validatedBodyHandler) Handle(ctx Context) error { h.called = true; return nil }
+
+func TestHandler_OptionalBody_Validator(t *testing.T) {
+	tests := []struct {
+		name       string
+		body       []byte
+		wantStatus int
+		wantCalls  int
+	}{
+		{name: "empty body skips validator", body: nil, wantStatus: 200, wantCalls: 0},
+		{name: "valid body", body: []byte(`{"name":"a"}`), wantStatus: 200, wantCalls: 1},
+		{name: "invalid body", body: []byte(`{"name":""}`), wantStatus: 400, wantCalls: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := &validatedBodyHandler{}
+			fctx := newPOSTCtx("/items", tt.body)
+
+			run(noAuthVatel(), POST("/items", func() Handler { return h }, WithOptionalBody()), fctx)
+
+			if got := responseStatus(fctx); got != tt.wantStatus {
+				t.Fatalf("want %d, got %d", tt.wantStatus, got)
+			}
+			if h.in.calls != tt.wantCalls {
+				t.Errorf("Validate calls = %d, want %d", h.in.calls, tt.wantCalls)
+			}
+			if h.called != (tt.wantStatus == 200) {
+				t.Errorf("handler called = %v", h.called)
+			}
+		})
+	}
+}

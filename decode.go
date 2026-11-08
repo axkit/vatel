@@ -1,6 +1,7 @@
 package vatel
 
 import (
+	"bytes"
 	"encoding/json"
 	"reflect"
 	"strconv"
@@ -252,19 +253,32 @@ func decodeURLQuery(fctx *fasthttp.RequestCtx, input interface{}, fields []field
 	return zc, nil
 }
 
-// decodeBody unmarshals the request body JSON into dest.
-// If dest implements Validator, Validate() is called after successful unmarshal.
-func decodeBody(body []byte, dest interface{}) error {
-	if len(body) == 0 {
-		return ErrInvalidRequestBody.New().Msg("empty request body, JSON expected")
+// decodeBody unmarshals the request body JSON into dest. A body that is empty
+// or contains only whitespace is rejected with ErrInvalidRequestBody unless
+// optional is true, in which case dest is left untouched and decoded is false.
+// Validation is a separate step (see validate).
+func decodeBody(body []byte, dest interface{}, optional bool) (decoded bool, err error) {
+	if len(bytes.TrimSpace(body)) == 0 {
+		if optional {
+			return false, nil
+		}
+		return false, ErrInvalidRequestBody.New().Msg("empty request body, JSON expected")
 	}
 	if err := json.Unmarshal(body, dest); err != nil {
-		return ErrInvalidRequestBody.Wrap(err).Msg("request body is not valid JSON")
+		return false, ErrInvalidRequestBody.Wrap(err).Msg("request body is not valid JSON")
 	}
-	if v, ok := dest.(Validator); ok {
-		if err := v.Validate(); err != nil {
-			return errors.Wrap(err, "validation failed").StatusCode(400)
-		}
+	return true, nil
+}
+
+// validate calls Validate() if in implements Validator. A validation error is
+// returned with HTTP status 400.
+func validate(in interface{}) error {
+	v, ok := in.(Validator)
+	if !ok {
+		return nil
+	}
+	if err := v.Validate(); err != nil {
+		return errors.Wrap(err, "validation failed").StatusCode(400)
 	}
 	return nil
 }
@@ -273,6 +287,10 @@ func decodeBody(body []byte, dest interface{}) error {
 // a value implementing Validator, the framework calls Validate() automatically
 // after decoding and before invoking Handle(). Return a non-nil error to reject
 // the request with a 400 status.
+//
+// Validate() is not called when the endpoint uses WithOptionalBody and the
+// request body is empty: the input stays zero, so a Validate() that fills in
+// default values does not run.
 type Validator interface {
 	Validate() error
 }

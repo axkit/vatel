@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/axkit/date"
+	"github.com/axkit/errors"
 	"github.com/rs/zerolog"
 	"github.com/valyala/fasthttp"
 )
@@ -205,7 +206,7 @@ func TestDecodeBody_Success(t *testing.T) {
 		Age  int    `json:"age"`
 	}
 	var dest in
-	if err := decodeBody([]byte(`{"name":"Alice","age":30}`), &dest); err != nil {
+	if _, err := decodeBody([]byte(`{"name":"Alice","age":30}`), &dest, false); err != nil {
 		t.Fatal(err)
 	}
 	if dest.Name != "Alice" || dest.Age != 30 {
@@ -215,18 +216,46 @@ func TestDecodeBody_Success(t *testing.T) {
 
 func TestDecodeBody_EmptyBody(t *testing.T) {
 	var dest struct{}
-	if err := decodeBody(nil, &dest); err == nil {
-		t.Error("expected error for nil body")
+	for _, body := range [][]byte{nil, {}, []byte(" \n\t ")} {
+		if _, err := decodeBody(body, &dest, false); err == nil {
+			t.Errorf("body %q: expected error", body)
+		}
 	}
-	if err := decodeBody([]byte{}, &dest); err == nil {
-		t.Error("expected error for empty body")
+}
+
+func TestDecodeBody_OptionalEmptyBody(t *testing.T) {
+	for _, body := range [][]byte{nil, {}, []byte(" \n\t ")} {
+		dest := struct{ Name string }{Name: "keep"}
+		decoded, err := decodeBody(body, &dest, true)
+		if err != nil {
+			t.Fatalf("body %q: unexpected error: %v", body, err)
+		}
+		if decoded {
+			t.Errorf("body %q: decoded must be false", body)
+		}
+		if dest.Name != "keep" {
+			t.Errorf("body %q: dest must be untouched, got %+v", body, dest)
+		}
 	}
 }
 
 func TestDecodeBody_InvalidJSON(t *testing.T) {
 	var dest struct{ Name string }
-	if err := decodeBody([]byte(`not json`), &dest); err == nil {
-		t.Error("expected error for invalid JSON")
+	for _, optional := range []bool{false, true} {
+		if _, err := decodeBody([]byte(`not json`), &dest, optional); err == nil {
+			t.Errorf("optional=%v: expected error for invalid JSON", optional)
+		}
+	}
+}
+
+func TestDecodeBody_DoesNotValidate(t *testing.T) {
+	var dest validInput
+	decoded, err := decodeBody([]byte(`{"name":""}`), &dest, false)
+	if err != nil {
+		t.Fatalf("decodeBody must not call Validate, got %v", err)
+	}
+	if !decoded {
+		t.Error("decoded must be true")
 	}
 }
 
@@ -243,16 +272,26 @@ func (v *validInput) Validate() error {
 }
 
 func TestDecodeBody_ValidatorSuccess(t *testing.T) {
-	var dest validInput
-	if err := decodeBody([]byte(`{"name":"Alice"}`), &dest); err != nil {
+	if err := validate(&validInput{Name: "Alice"}); err != nil {
+		t.Fatal(err)
+	}
+	// Inputs that do not implement Validator are always valid.
+	if err := validate(&struct{ Name string }{}); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func TestDecodeBody_ValidatorFailure(t *testing.T) {
-	var dest validInput
-	if err := decodeBody([]byte(`{"name":""}`), &dest); err == nil {
-		t.Error("expected validation error")
+	err := validate(&validInput{})
+	if err == nil {
+		t.Fatal("expected validation error")
+	}
+	xe, ok := err.(*errors.Error)
+	if !ok {
+		t.Fatalf("want *errors.Error, got %T", err)
+	}
+	if sc := errors.Serialize(xe, errors.WithAttributes(errors.ServerOutputFormat)).StatusCode; sc != 400 {
+		t.Errorf("want status 400, got %d", sc)
 	}
 }
 
