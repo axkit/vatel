@@ -7,7 +7,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/axkit/errors"
 	"github.com/axkit/vatel/jsonmask"
 	"github.com/fasthttp/router"
 	"github.com/rs/zerolog"
@@ -65,6 +64,9 @@ type Vatel struct {
 	cfg   Option
 	srv   *fasthttp.Server
 	built bool
+	// buildErr is the error of a failed BuildHandlers. The router may hold the
+	// routes registered before the failure, so the Vatel is unusable after it.
+	buildErr error
 
 	// baseCtx is the parent of every request context; Shutdown cancels it.
 	// fasthttp's RequestCtx.Done() is not used: it is the server's done
@@ -173,16 +175,32 @@ func (v *Vatel) MustBuildHandlers(mux *router.Router, l *zerolog.Logger) {
 	}
 }
 
-// BuildHandlers registers all endpoints with the router. Returns errors instead of panicking.
+// BuildHandlers registers all endpoints with the router. It returns an error
+// instead of panicking: an invalid endpoint, a WS endpoint without
+// WithWebsocketSupport or a duplicate WS path.
+//
+// BuildHandlers may be called only once. Registration is not transactional:
+// after a failed build the router may already hold some of the routes and
+// they cannot be removed, so the Vatel is unusable. A further BuildHandlers
+// or ListenAndServe returns a "previous build failed" error; create a new
+// Vatel and router instead.
 func (v *Vatel) BuildHandlers(mux *router.Router, l *zerolog.Logger) error {
 	return v.buildHandlers(mux, l)
 }
 
 func (v *Vatel) buildHandlers(mux *router.Router, l *zerolog.Logger) error {
 	if v.built {
+		if v.buildErr != nil {
+			return fmt.Errorf("vatel: previous build failed: %w", v.buildErr)
+		}
 		return fmt.Errorf("vatel: handlers already built")
 	}
 	v.built = true
+	v.buildErr = v.registerEndpoints(mux, l)
+	return v.buildErr
+}
+
+func (v *Vatel) registerEndpoints(mux *router.Router, l *zerolog.Logger) error {
 
 	if v.cfg.wv != nil {
 		v.ep = append(v.ep, v.cfg.wv.Endpoints()...)
@@ -205,10 +223,10 @@ func (v *Vatel) buildHandlers(mux *router.Router, l *zerolog.Logger) error {
 
 		if e.Method == "WS" {
 			if v.cfg.wv == nil {
-				panic("websocket server was not assigned")
+				return fmt.Errorf("WS endpoint %s: websocket support is not set (WithWebsocketSupport)", e.Path)
 			}
 			if err := v.cfg.wv.RegisterEndpoint(v, e, &logger); err != nil {
-				panic(string(errors.ToJSON(err, errors.WithAttributes(errors.ServerDebugOutputFormat))))
+				return err
 			}
 			continue
 		}
@@ -245,6 +263,8 @@ func (v *Vatel) ListenAndServe(addr string, mux *router.Router, l *zerolog.Logge
 		if err := v.buildHandlers(mux, l); err != nil {
 			return err
 		}
+	} else if v.buildErr != nil {
+		return fmt.Errorf("vatel: previous build failed: %w", v.buildErr)
 	}
 	v.srv = &fasthttp.Server{Handler: mux.Handler}
 	return v.srv.ListenAndServe(addr)

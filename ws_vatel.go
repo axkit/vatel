@@ -142,7 +142,7 @@ func (wv *WebsocketVatel) Endpoints() []Endpoint {
 // RegisterEndpoint is called by Vatel.buildHandlers for every endpoint with method "WS".
 func (wv *WebsocketVatel) RegisterEndpoint(v *Vatel, e *Endpoint, l *zerolog.Logger) error {
 	if _, ok := wv.path[e.Path]; ok {
-		return errors.Template("websocket endpoint already registered").New().Set("path", e.Path)
+		return fmt.Errorf("WS endpoint %s: already registered", e.Path)
 	}
 	if err := wv.compileWS(v, e, l); err != nil {
 		return err
@@ -184,6 +184,14 @@ func (wv *WebsocketVatel) OnOpen(f func(*websocket.Conn)) { wv.callbackOnOpen = 
 
 // OnClose registers a callback invoked when a WebSocket connection closes.
 func (wv *WebsocketVatel) OnClose(f func(*websocket.Conn, error)) { wv.callbackOnClose = f }
+
+// OnTokenUpdate registers a callback invoked by UpdateAccessToken after the
+// token is decoded and its payload is stored for the connection cid. An error
+// returned by f is returned from UpdateAccessToken (and so sent to the client
+// of the updateAccessToken endpoint); the payload stays stored.
+func (wv *WebsocketVatel) OnTokenUpdate(f func(cid uint64, tp AuthPayload) error) {
+	wv.callbackOnTokenUpdate = f
+}
 
 func (wv *WebsocketVatel) onOpen(c *websocket.Conn) {
 	wv.registry.add(c)
@@ -392,8 +400,8 @@ func wsWriteErrorResponse(e *Endpoint, w io.Writer, lo LogOption, verbose bool, 
 	}
 }
 
-// UpdateAccessToken decodes a new access token, stores it in the connection
-// store, and notifies any registered callback.
+// UpdateAccessToken decodes a new access token, stores its payload for the
+// connection cid and calls the OnTokenUpdate callback, returning its error.
 func (wv *WebsocketVatel) UpdateAccessToken(cid uint64, token string) error {
 	if wv.cfg.td == nil {
 		return nil
@@ -405,7 +413,7 @@ func (wv *WebsocketVatel) UpdateAccessToken(cid uint64, token string) error {
 	tp := at.ApplicationPayload()
 	wv.store.set(cid, tp)
 	if wv.callbackOnTokenUpdate != nil {
-		wv.callbackOnTokenUpdate(cid, tp)
+		return wv.callbackOnTokenUpdate(cid, tp)
 	}
 	return nil
 }

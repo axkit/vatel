@@ -106,6 +106,8 @@
 - middleware `OnErrorResponse` всегда получает метаданные эндпоинта (`Method`, `Path`, `Perms`, `LogOptions`); раньше при ошибке из middleware (`OnRequest`/`OnAuthentication`/`OnAuthorization`/`OnHandle`) приходил пустой `EndpointMeta`.
 - удалена опция `WithLanguageLabel` (вместе с полем `LanguageLabel`).
 - WS: ошибка без статуса (не `*errors.Error` или `*errors.Error` со статусом 0) в журнале/метриках/`Alarm` считается как в HTTP — 500 (`context.DeadlineExceeded` → 504, `context.Canceled` → 503); раньше `*errors.Error` без статуса давал в метриках статус 0 и не вызывал `Alarm`.
+- `BuildHandlers`: WS-эндпоинт без `WithWebsocketSupport` и повторный WS-путь теперь возвращают ошибку с путём эндпоинта (раньше — panic; `MustBuildHandlers` по-прежнему паникует). Ошибка повторного WS-пути из `WebsocketVatel.RegisterEndpoint` — обычная ошибка «WS endpoint <path>: already registered», а не `*errors.Error` с полем `path`. После неудачной сборки `Vatel` непригоден: повторный `BuildHandlers` и `ListenAndServe` возвращают ошибку «previous build failed» (раньше `ListenAndServe` после неудачного `BuildHandlers` запускал сервер с частью маршрутов).
+- новое: `WebsocketVatel.OnTokenUpdate(f func(cid uint64, tp AuthPayload) error)` — вызывается из `UpdateAccessToken` после сохранения payload; ошибка `f` возвращается из `UpdateAccessToken` (и уходит клиенту эндпоинта `updateAccessToken`).
 
 ## What Goes Where
 - **Implementation Steps**: код, тесты, документация в этом репозитории, коммиты на ветке `refactor`.
@@ -248,11 +250,11 @@
 - Modify: `vatel.go`, `ws_vatel.go`, `example/users_controller.go`
 - Modify: `ws_vatel_test.go`
 
-- [ ] тесты: WS-эндпоинт без `WithWebsocketSupport` → `BuildHandlers` возвращает ошибку; повторный WS-путь → ошибка; `MustBuildHandlers` в этих случаях паникует
-- [ ] тест: после неудачной сборки повторный `BuildHandlers` возвращает ошибку «previous build failed», а не регистрирует маршруты частично второй раз
-- [ ] тест: `OnTokenUpdate(f)` + `UpdateAccessToken` → `f` вызван с payload; ошибка `f` возвращается из `UpdateAccessToken`
-- [ ] заменить panic на ошибки в `buildHandlers`; добавить `OnTokenUpdate`; убрать неверный комментарий про порядок `/users/me` в примере
-- [ ] run tests — must pass before next task
+- [x] тесты: WS-эндпоинт без `WithWebsocketSupport` → `BuildHandlers` возвращает ошибку; повторный WS-путь → ошибка; `MustBuildHandlers` в этих случаях паникует
+- [x] тест: после неудачной сборки повторный `BuildHandlers` возвращает ошибку «previous build failed», а не регистрирует маршруты частично второй раз
+- [x] тест: `OnTokenUpdate(f)` + `UpdateAccessToken` → `f` вызван с payload; ошибка `f` возвращается из `UpdateAccessToken`
+- [x] заменить panic на ошибки в `buildHandlers`; добавить `OnTokenUpdate`; убрать неверный комментарий про порядок `/users/me` в примере
+- [x] run tests — must pass before next task
 
 ### Task 13: Подготовка релиза — зависимости, retract, пример
 **Files:**
