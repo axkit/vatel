@@ -96,6 +96,7 @@
 - новое: `WithOptionalBody()` (поле `Endpoint.OptionalBody`) для POST/PUT/PATCH — пустое тело или тело из пробелов допустимо, вход остаётся нулевым, `Validate()` не вызывается; на GET/DELETE — ошибка `BuildHandlers`. Без опции тело из одних пробелов теперь даёт 400 «empty request body» (раньше — 400 «not valid JSON»).
 - новое: интерфейс `Querier { QueryInput() any }`; `QueryParams[T]` реализует `QueryInput()` вместо `Input()` (код, вызывавший `Input()` у `QueryParams`, нужно поправить; `QueryParams` больше не `Inputer`). Query разбирается для любого метода, в том числе POST/PUT/PATCH, поэтому `QueryParams` + `Body` в одном контроллере дают и query, и тело (раньше двусмысленный `Input()` отключал разбор входа совсем). Старый `Inputer` без изменений: GET/DELETE — query, POST/PUT/PATCH — тело. `Validate()` вызывается после всего разбора: сначала у входа `Querier`, затем у входа `Inputer`, в том числе у query-входа `Inputer` на GET/DELETE; первая ошибка → 400. В журнале вход `Querier` пишется под ключом `reqQuery`, вход `Inputer` — под `reqInput`.
 - новое: builders `vatel.HEAD` и `vatel.OPTIONS` (раньше эти методы давали ошибку `BuildHandlers` «unknown HTTP method»). Вход `Inputer` на HEAD/OPTIONS разбирается из query, как на GET; `WithOptionalBody()` на них — ошибка `BuildHandlers`. Тело ответа на HEAD отбрасывает сервер fasthttp. CORS preflight — `mux.GlobalOPTIONS` (вызывается только для зарегистрированных путей, неизвестный путь — 404); явный `vatel.OPTIONS` на пути заменяет `GlobalOPTIONS`; `RequireAuth`/`RequirePerms` на OPTIONS ломает preflight.
+- jsonmask: `Fields` больше не паникует (nil, скаляры, map → пустые правила; новый `Fields.HasRules()`), поддерживает рекурсивные типы, корень-срез/массив (`*[]T`, `[]*T`), заходит в `*Struct`, `[]Struct`, `[]*Struct`. Поле с непустым тегом `mask` — лист: значение-структура (`time.Time`, вложенная структура, указатель, срез) маскируется или удаляется целиком. Тег на встроенной структуре без json-имени применяется к каждому её продвинутому полю. Незарегистрированное имя функции теперь даёт `"***"` (раньше значение оставалось открытым). Отсутствующее поле (`omitempty`) не добавляется. Карты и interface не обходятся.
 
 ## What Goes Where
 - **Implementation Steps**: код, тесты, документация в этом репозитории, коммиты на ветке `refactor`.
@@ -156,14 +157,14 @@
 - Modify: `jsonmask/jsonmask.go`
 - Modify: `jsonmask/jsonmask_test.go`
 
-- [ ] тесты `Fields` без panic: nil, `string`, `map`, рекурсивные `type Node struct{ Children []Node }` и `Next *Node`
-- [ ] тест: корень `*[]T` и `[]*T`, где у `T` поле `mask:"secret"` → `Mask` маскирует поле в каждом элементе массива
-- [ ] тесты обхода: теги внутри `*Struct`, `[]Struct`, `[]*Struct` маскируются
-- [ ] тесты листа: `At time.Time mask:"secret"` → `"***"`; `Creds Credentials mask:"-"` → удалено целиком
-- [ ] тест: отсутствующее (`omitempty`) поле не появляется после `Mask`
-- [ ] тест: незарегистрированное имя → `"***"`; зарегистрированная функция применяется; `mask:"-"` удаляет (регрессия)
-- [ ] реализовать; добавить функцию «есть ли хоть одно правило» для compile (`Fields.HasRules()` или `len` после фильтрации)
-- [ ] run tests — must pass before next task
+- [x] тесты `Fields` без panic: nil, `string`, `map`, рекурсивные `type Node struct{ Children []Node }` и `Next *Node`
+- [x] тест: корень `*[]T` и `[]*T`, где у `T` поле `mask:"secret"` → `Mask` маскирует поле в каждом элементе массива
+- [x] тесты обхода: теги внутри `*Struct`, `[]Struct`, `[]*Struct` маскируются
+- [x] тесты листа: `At time.Time mask:"secret"` → `"***"`; `Creds Credentials mask:"-"` → удалено целиком
+- [x] тест: отсутствующее (`omitempty`) поле не появляется после `Mask`
+- [x] тест: незарегистрированное имя → `"***"`; зарегистрированная функция применяется; `mask:"-"` удаляет (регрессия)
+- [x] реализовать; добавить функцию «есть ли хоть одно правило» для compile (`Fields.HasRules()` или `len` после фильтрации)
+- [x] run tests — must pass before next task
 
 ### Task 6: Маскирование input/output в журнале
 **Files:**
