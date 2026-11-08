@@ -43,8 +43,8 @@ func WithManualStatusCode() EndpointOption {
 // When the body is empty or contains only whitespace, decoding is skipped: the
 // input stays zero and Validator.Validate() is not called. A non-empty body is
 // decoded and validated as usual; invalid JSON is still rejected with 400.
-// Using it on a method without a request body (GET, DELETE) is a compile error
-// returned from BuildHandlers.
+// Using it on a method without a request body (GET, DELETE, HEAD, OPTIONS) is
+// a compile error returned from BuildHandlers.
 func WithOptionalBody() EndpointOption {
 	return func(e *Endpoint) { e.OptionalBody = true }
 }
@@ -77,6 +77,23 @@ func PATCH(path string, ctrl func() Handler, opts ...EndpointOption) Endpoint {
 // DELETE creates a DELETE endpoint with the given path, controller factory, and options.
 func DELETE(path string, ctrl func() Handler, opts ...EndpointOption) Endpoint {
 	return buildEndpoint("DELETE", path, ctrl, opts...)
+}
+
+// HEAD creates a HEAD endpoint with the given path, controller factory, and options.
+// Input is decoded from the URL query string, like GET. The fasthttp server
+// drops the response body of a HEAD request, so only the status code and
+// headers reach the client.
+func HEAD(path string, ctrl func() Handler, opts ...EndpointOption) Endpoint {
+	return buildEndpoint("HEAD", path, ctrl, opts...)
+}
+
+// OPTIONS creates an OPTIONS endpoint with the given path, controller factory, and options.
+// Input is decoded from the URL query string, like GET. An explicit OPTIONS
+// endpoint takes precedence over router.GlobalOPTIONS for its path. Do not put
+// RequireAuth/RequirePerms on an endpoint that serves a CORS preflight: browsers
+// send the preflight without the Authorization header.
+func OPTIONS(path string, ctrl func() Handler, opts ...EndpointOption) Endpoint {
+	return buildEndpoint("OPTIONS", path, ctrl, opts...)
 }
 
 // WS creates a WebSocket endpoint with the given path, controller factory, and options.

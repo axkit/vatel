@@ -95,6 +95,7 @@
 - тело у DELETE не поддерживается — query (`QueryParams`).
 - новое: `WithOptionalBody()` (поле `Endpoint.OptionalBody`) для POST/PUT/PATCH — пустое тело или тело из пробелов допустимо, вход остаётся нулевым, `Validate()` не вызывается; на GET/DELETE — ошибка `BuildHandlers`. Без опции тело из одних пробелов теперь даёт 400 «empty request body» (раньше — 400 «not valid JSON»).
 - новое: интерфейс `Querier { QueryInput() any }`; `QueryParams[T]` реализует `QueryInput()` вместо `Input()` (код, вызывавший `Input()` у `QueryParams`, нужно поправить; `QueryParams` больше не `Inputer`). Query разбирается для любого метода, в том числе POST/PUT/PATCH, поэтому `QueryParams` + `Body` в одном контроллере дают и query, и тело (раньше двусмысленный `Input()` отключал разбор входа совсем). Старый `Inputer` без изменений: GET/DELETE — query, POST/PUT/PATCH — тело. `Validate()` вызывается после всего разбора: сначала у входа `Querier`, затем у входа `Inputer`, в том числе у query-входа `Inputer` на GET/DELETE; первая ошибка → 400. В журнале вход `Querier` пишется под ключом `reqQuery`, вход `Inputer` — под `reqInput`.
+- новое: builders `vatel.HEAD` и `vatel.OPTIONS` (раньше эти методы давали ошибку `BuildHandlers` «unknown HTTP method»). Вход `Inputer` на HEAD/OPTIONS разбирается из query, как на GET; `WithOptionalBody()` на них — ошибка `BuildHandlers`. Тело ответа на HEAD отбрасывает сервер fasthttp. CORS preflight — `mux.GlobalOPTIONS` (вызывается только для зарегистрированных путей, неизвестный путь — 404); явный `vatel.OPTIONS` на пути заменяет `GlobalOPTIONS`; `RequireAuth`/`RequirePerms` на OPTIONS ломает preflight.
 
 ## What Goes Where
 - **Implementation Steps**: код, тесты, документация в этом репозитории, коммиты на ветке `refactor`.
@@ -142,13 +143,13 @@
 - Modify: `options.go`, `endpoint.go`
 - Modify: `carriers_test.go` (TestBuilderFunctions), `handler_test.go`, `endpoint_test.go`
 
-- [ ] тест через настоящий сервер в памяти: `vatel.HEAD` отвечает статусом и заголовками без тела
-- [ ] тест: `vatel.OPTIONS` компилируется и обслуживается; неизвестный метод (`TRACE`) — ошибка compile
-- [ ] табличный тест по всем методам (GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS): `Querier` → query разобран; старый `Inputer` → query для GET/DELETE/HEAD/OPTIONS и body для POST/PUT/PATCH
-- [ ] тест: `WithOptionalBody()` на DELETE, HEAD, OPTIONS → ошибка compile (на GET проверено в Task 2)
-- [ ] тест: `mux.GlobalOPTIONS` + эндпоинты vatel — OPTIONS на зарегистрированный путь → обработчик; на неизвестный путь → 404
-- [ ] добавить builders и ветку в `compile`
-- [ ] run tests — must pass before next task
+- [x] тест через настоящий сервер в памяти: `vatel.HEAD` отвечает статусом и заголовками без тела
+- [x] тест: `vatel.OPTIONS` компилируется и обслуживается; неизвестный метод (`TRACE`) — ошибка compile
+- [x] табличный тест по всем методам (GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS): `Querier` → query разобран; старый `Inputer` → query для GET/DELETE/HEAD/OPTIONS и body для POST/PUT/PATCH
+- [x] тест: `WithOptionalBody()` на DELETE, HEAD, OPTIONS → ошибка compile (на GET проверено в Task 2)
+- [x] тест: `mux.GlobalOPTIONS` + эндпоинты vatel — OPTIONS на зарегистрированный путь → обработчик; на неизвестный путь → 404
+- [x] добавить builders и ветку в `compile`
+- [x] run tests — must pass before next task
 
 ### Task 5: jsonmask — укрепление
 **Files:**

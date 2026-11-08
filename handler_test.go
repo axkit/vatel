@@ -4,11 +4,15 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/fasthttp/router"
 	"github.com/rs/zerolog"
 	"github.com/valyala/fasthttp"
+	"github.com/valyala/fasthttp/fasthttputil"
 )
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -895,10 +899,17 @@ func TestHandler_WithoutOptionalBody_BlankBodyRejected(t *testing.T) {
 	}
 }
 
-func TestCompile_OptionalBodyOnGET(t *testing.T) {
-	e := GET("/items", func() Handler { return &plainHandler{} }, WithOptionalBody())
-	if err := e.compile(noAuthVatel()); err == nil {
-		t.Error("expected compile error for WithOptionalBody on GET")
+func TestCompile_OptionalBodyOnMethodsWithoutBody(t *testing.T) {
+	ctrl := func() Handler { return &plainHandler{} }
+	for _, e := range []Endpoint{
+		GET("/items", ctrl, WithOptionalBody()),
+		DELETE("/items", ctrl, WithOptionalBody()),
+		HEAD("/items", ctrl, WithOptionalBody()),
+		OPTIONS("/items", ctrl, WithOptionalBody()),
+	} {
+		if err := e.compile(noAuthVatel()); err == nil {
+			t.Errorf("%s: expected compile error for WithOptionalBody", e.Method)
+		}
 	}
 }
 
@@ -1240,4 +1251,211 @@ func TestHandler_Log_QuerierUnderReqQuery_InputerUnderReqInput(t *testing.T) {
 	if in["title"] != "x" {
 		t.Errorf("reqInput.title = %v, want x", in["title"])
 	}
+}
+
+// ── HEAD and OPTIONS ──────────────────────────────────────────────────────────
+
+type itemResultHandler struct {
+	Output[struct {
+		Name string `json:"name"`
+	}]
+	called bool
+}
+
+func (h *itemResultHandler) Handle(Context) error {
+	h.called = true
+	h.Out.Name = "x"
+	return nil
+}
+
+// rawRoundTrip sends a raw HTTP/1.1 request through an in-memory fasthttp
+// server and returns the response head and the bytes that followed it.
+func rawRoundTrip(t *testing.T, h fasthttp.RequestHandler, method, uri string) (head, body string) {
+	t.Helper()
+	ln := fasthttputil.NewInmemoryListener()
+	srv := &fasthttp.Server{Handler: h}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = srv.Serve(ln)
+	}()
+	t.Cleanup(func() {
+		_ = ln.Close()
+		<-done
+	})
+
+	conn, err := ln.Dial()
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	req := method + " " + uri + " HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n"
+	if _, err := conn.Write([]byte(req)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	raw, err := io.ReadAll(conn)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	parts := strings.SplitN(string(raw), "\r\n\r\n", 2)
+	if len(parts) != 2 {
+		t.Fatalf("malformed response: %q", raw)
+	}
+	return parts[0], parts[1]
+}
+
+func TestHEAD_InMemoryServer_NoBody(t *testing.T) {
+	v := noAuthVatel()
+	headH := &itemResultHandler{}
+	v.Add(Endpoints{
+		GET("/items", func() Handler { return &itemResultHandler{} }),
+		HEAD("/items", func() Handler { return headH }),
+	})
+	mux := router.New()
+	if err := v.BuildHandlers(mux, discardLogger()); err != nil {
+		t.Fatalf("build: %v", err)
+	}
+
+	// GET on the same path proves the handler produces a body.
+	_, getBody := rawRoundTrip(t, mux.Handler, "GET", "/items")
+	if getBody != `{"name":"x"}` {
+		t.Fatalf("GET body = %q", getBody)
+	}
+
+	head, body := rawRoundTrip(t, mux.Handler, "HEAD", "/items")
+	if !strings.HasPrefix(head, "HTTP/1.1 200") {
+		t.Errorf("want 200, got head %q", head)
+	}
+	if !strings.Contains(head, "Content-Type: application/json") {
+		t.Errorf("Content-Type header missing: %q", head)
+	}
+	if body != "" {
+		t.Errorf("HEAD response must have no body, got %q", body)
+	}
+	if !headH.called {
+		t.Error("HEAD handler was not called")
+	}
+}
+
+func TestOPTIONS_CompilesAndServes(t *testing.T) {
+	h := &plainHandler{}
+	fctx := newGETCtx("/items")
+	fctx.Request.Header.SetMethod("OPTIONS")
+
+	run(noAuthVatel(), OPTIONS("/items", func() Handler { return h }), fctx)
+
+	if got := responseStatus(fctx); got != 200 {
+		t.Fatalf("want 200, got %d (body %s)", got, fctx.Response.Body())
+	}
+	if !h.called {
+		t.Error("OPTIONS handler was not called")
+	}
+}
+
+func TestHandler_InputRouting_AllMethods(t *testing.T) {
+	builders := map[string]func(string, func() Handler, ...EndpointOption) Endpoint{
+		"GET": GET, "POST": POST, "PUT": PUT, "PATCH": PATCH,
+		"DELETE": DELETE, "HEAD": HEAD, "OPTIONS": OPTIONS,
+	}
+	queryMethods := map[string]bool{"GET": true, "DELETE": true, "HEAD": true, "OPTIONS": true}
+
+	for method, build := range builders {
+		t.Run(method+"/Querier", func(t *testing.T) {
+			h := &queryOnlyHandler{}
+			fctx := newPOSTCtx("/items?page=3&sort=asc", nil)
+			fctx.Request.Header.SetMethod(method)
+
+			run(noAuthVatel(), build("/items", func() Handler { return h }), fctx)
+
+			if got := responseStatus(fctx); got != 200 {
+				t.Fatalf("want 200, got %d (body %s)", got, fctx.Response.Body())
+			}
+			if h.Query.Page != 3 || h.Query.Sort != "asc" {
+				t.Errorf("query not decoded: %+v", h.Query)
+			}
+		})
+		t.Run(method+"/Inputer", func(t *testing.T) {
+			h := &legacyInputHandler{}
+			fctx := newPOSTCtx("/items?page=9", []byte(`{"title":"t"}`))
+			fctx.Request.Header.SetMethod(method)
+
+			run(noAuthVatel(), build("/items", func() Handler { return h }), fctx)
+
+			if got := responseStatus(fctx); got != 200 {
+				t.Fatalf("want 200, got %d (body %s)", got, fctx.Response.Body())
+			}
+			if queryMethods[method] {
+				if h.in.Page != 9 || h.in.Title != "" {
+					t.Errorf("want query decoded and body ignored, got %+v", h.in)
+				}
+				return
+			}
+			if h.in.Title != "t" || h.in.Page != 0 {
+				t.Errorf("want body decoded and query ignored, got %+v", h.in)
+			}
+		})
+	}
+}
+
+func TestRouter_GlobalOPTIONS_WithVatelEndpoints(t *testing.T) {
+	explicit := &plainHandler{}
+	v := noAuthVatel()
+	v.Add(Endpoints{
+		GET("/items", func() Handler { return &plainHandler{} }),
+		GET("/explicit", func() Handler { return &plainHandler{} }),
+		OPTIONS("/explicit", func() Handler { return explicit }),
+	})
+	mux := router.New()
+	globalCalls := 0
+	mux.GlobalOPTIONS = func(ctx *fasthttp.RequestCtx) {
+		globalCalls++
+		ctx.Response.Header.Set("Access-Control-Allow-Origin", "*")
+		ctx.SetStatusCode(fasthttp.StatusNoContent)
+	}
+	if err := v.BuildHandlers(mux, discardLogger()); err != nil {
+		t.Fatalf("build: %v", err)
+	}
+
+	options := func(uri string) *fasthttp.RequestCtx {
+		fctx := newGETCtx(uri)
+		fctx.Request.Header.SetMethod("OPTIONS")
+		mux.Handler(fctx)
+		return fctx
+	}
+
+	t.Run("registered path uses GlobalOPTIONS", func(t *testing.T) {
+		fctx := options("/items")
+		if got := responseStatus(fctx); got != fasthttp.StatusNoContent {
+			t.Errorf("want 204, got %d", got)
+		}
+		if got := string(fctx.Response.Header.Peek("Access-Control-Allow-Origin")); got != "*" {
+			t.Errorf("CORS header = %q", got)
+		}
+		if globalCalls != 1 {
+			t.Errorf("GlobalOPTIONS calls = %d, want 1", globalCalls)
+		}
+	})
+	t.Run("unknown path is 404", func(t *testing.T) {
+		fctx := options("/unknown")
+		if got := responseStatus(fctx); got != fasthttp.StatusNotFound {
+			t.Errorf("want 404, got %d", got)
+		}
+		if globalCalls != 1 {
+			t.Errorf("GlobalOPTIONS must not be called for an unknown path, calls = %d", globalCalls)
+		}
+	})
+	t.Run("explicit vatel.OPTIONS replaces GlobalOPTIONS", func(t *testing.T) {
+		fctx := options("/explicit")
+		if got := responseStatus(fctx); got != 200 {
+			t.Errorf("want 200, got %d", got)
+		}
+		if !explicit.called {
+			t.Error("explicit OPTIONS handler was not called")
+		}
+		if globalCalls != 1 {
+			t.Errorf("GlobalOPTIONS must not be called, calls = %d", globalCalls)
+		}
+	})
 }

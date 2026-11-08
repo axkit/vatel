@@ -50,7 +50,7 @@ func (q *QueryParams[T]) QueryInput() interface{} { return &q.Query }
 
 // Body is an embeddable generic type that implements Inputer. Embed it and
 // access input data via the In field. For POST/PUT/PATCH the JSON request body
-// is decoded into In; for GET/DELETE the URL query string is decoded into the
+// is decoded into In; for GET/DELETE/HEAD/OPTIONS the URL query string is decoded into the
 // fields of In tagged `param:"name"` (prefer QueryParams for query input).
 // The name Body avoids the naming conflict that would arise from an embedded
 // type named Input having a promoted method also named Input().

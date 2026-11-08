@@ -92,7 +92,7 @@ type Endpoint struct {
 	inputFields           jsonmask.Fields
 	resultFields          jsonmask.Fields
 	paramFields           []fieldInfo // precomputed path param layout
-	queryFields           []fieldInfo // precomputed query layout of Inputer input (GET/DELETE)
+	queryFields           []fieldInfo // precomputed query layout of Inputer input (GET/DELETE/HEAD/OPTIONS)
 	querierFields         []fieldInfo // precomputed query layout of Querier input
 	ala                   Alarmer
 	mr                    MetricReporter
@@ -128,7 +128,7 @@ type WebsocketHandler interface {
 }
 
 // Inputer is implemented by controllers that expect decoded query or body input.
-// For GET/DELETE the framework decodes URL query parameters (fields tagged
+// For GET/DELETE/HEAD/OPTIONS the framework decodes URL query parameters (fields tagged
 // `param:"name"`); for POST/PUT/PATCH it decodes the JSON body. To read the
 // query string on POST/PUT/PATCH as well, implement Querier (embed QueryParams).
 // The returned pointer must be stable across the request lifetime (i.e. a field
@@ -586,7 +586,7 @@ func (e *Endpoint) compile(v *Vatel) error {
 
 	// Route input decoding based on HTTP method.
 	switch e.Method {
-	case "GET", "DELETE":
+	case "GET", "DELETE", "HEAD", "OPTIONS":
 		if e.OptionalBody {
 			return fmt.Errorf("endpoint %s %s: WithOptionalBody is not allowed for a method without a request body", e.Method, origPath)
 		}

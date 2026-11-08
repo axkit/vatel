@@ -217,6 +217,8 @@ func TestBuilderFunctions(t *testing.T) {
 		{"PUT", PUT("/c", ctrl), "PUT", "/c"},
 		{"PATCH", PATCH("/d", ctrl), "PATCH", "/d"},
 		{"DELETE", DELETE("/e", ctrl), "DELETE", "/e"},
+		{"HEAD", HEAD("/f", ctrl), "HEAD", "/f"},
+		{"OPTIONS", OPTIONS("/g", ctrl), "OPTIONS", "/g"},
 	}
 
 	for _, tc := range tests {
