@@ -269,10 +269,33 @@
 - [x] запустить пример на свободном порту и проверить curl: healthcheck 200; плохой токен на публичном эндпоинте 200; без токена на защищённом 401; создание заказа с правами 201; удаление 204; OPTIONS на зарегистрированный путь — CORS-заголовки (порт 18080, наблюдалось: 200, 200, 401, 201, 204; OPTIONS /orders → 204 с `Allow`/`Access-Control-Allow-*`; OPTIONS на неизвестный путь → 404; 401 тоже несёт `Access-Control-Allow-Origin`)
 
 ### Task 14: Verify acceptance criteria
-- [ ] Гостли №2, №4, №6, №7, №10, №11 закрыты или имеют описанный способ; №5 — осознанно нет
-- [ ] все пункты «Хвосты» и «Контекст запроса» из Solution Overview сделаны
-- [ ] `go test -race ./...`, `go vet ./...`, `gofmt -l .` (пусто)
-- [ ] покрытие не ниже базового: `vatel` 54.5%, `auth` 85.5%, `jsonmask` 92.5%
+- [x] Гостли №2, №4, №6, №7, №10, №11 закрыты или имеют описанный способ; №5 — осознанно нет
+- [x] все пункты «Хвосты» и «Контекст запроса» из Solution Overview сделаны
+- [x] `go test -race ./...`, `go vet ./...`, `gofmt -l .` (пусто)
+- [x] покрытие не ниже базового: `vatel` 54.5%, `auth` 85.5%, `jsonmask` 92.5% (стало: `vatel` 73.4%, `auth` 92.3%, `jsonmask` 96.1%)
+- ➕ добавлены тесты на пункты Гостли без прямого теста (№1, №3, №8, №9): `TestHandler_UndecodableBody_400`, `TestHandler_OnAuthorization_RunsBeforeBodyDecode`, `TestMiddleware_SeesEndpointMeta`; код менять не пришлось
+
+**Проверка по пунктам Гостли:**
+- №1 тело не JSON → 400: `decodeBody` оборачивает любую ошибку `json.Unmarshal` (синтаксис, тип, лишние данные, свой `UnmarshalJSON`, `time.Time`) в `ErrInvalidRequestBody` — `TestHandler_UndecodableBody_400`, `TestHandler_PostBody_InvalidJSON`, `TestDecodeBody_InvalidJSON`.
+- №2 поля ошибки до клиента: журнал не мутирует ошибку (errors v1.1.0), безопасные поля — `WithClientErrorFields` — `TestHandler_WithClientErrorFields`, `TestHandler_ErrorFields_HiddenFromClient`.
+- №3 экранирование: errors v1.1.0, ответ — валидный JSON при кавычках и `\` в значении поля и в тексте обёрнутой ошибки (verbose) — `TestHandler_WithClientErrorFields`, `TestHandler_UndecodableBody_400`.
+- №4 необязательное тело: `WithOptionalBody()` — `TestHandler_OptionalBody`, `TestHandler_OptionalBody_Validator`, `TestCompile_OptionalBodyOnMethodsWithoutBody`.
+- №5 тело DELETE: осознанно нет; query через `QueryParams` на DELETE — `TestHandler_QueryParams_GETAndDELETE`; в MIGRATION.md (раздел выше).
+- №6 OPTIONS: `vatel.OPTIONS`, `vatel.HEAD`, CORS через `mux.GlobalOPTIONS` — `TestOPTIONS_CompilesAndServes`, `TestHEAD_InMemoryServer_NoBody`, `TestRouter_GlobalOPTIONS_WithVatelEndpoints`, `example.TestCORSPreflight`.
+- №7 плохой токен на публичном эндпоинте: `TestBadTokenOnPublicEndpoint` (auth), `TestHandler_Auth_PublicEndpoint_TokenOptional`.
+- №8 точка после проверки токена до разбора тела: позиция `OnAuthorization` — `TestHandler_OnAuthorization_RunsBeforeBodyDecode`.
+- №9 описание эндпоинта в middleware: `EndpointMeta` (метод, шаблон пути с префиксом, права) во всех позициях — `TestMiddleware_SeesEndpointMeta`, `TestRequirePermsSetsMetaPerms`, `TestHandler_OnErrorResponse_MetaOnAuthorizationReject`.
+- №10 тела в журнале: тег `mask`, masker по умолчанию — `TestHandler_Log_MasksTaggedFields`, `TestHandler_Log_MasksArrayElements`, `TestHandler_Log_MasksOptionalOutput`, `TestHandler_Log_MasksQueryInputs`, `TestHandler_Log_MarshalErrorOmitsResult`.
+- №11 параметры пути в журнале: `mask` на path/query-параметрах — `TestLog_PathParamsMasked`, `TestLog_PathParamDecodeError_Masked`, `TestLog_QueryParamsMasked`.
+
+**Проверка «Контекст запроса» и «Хвосты»:**
+- базовый контекст, отмена в `Shutdown` (повторный безопасен; `RequestCtx.Done()` не используется) — `TestContext_ShutdownCancelsHandlerContext`, `TestContext_ShutdownWithServer_CancelsAfterDeadline`; `WithTimeout`/`WithDefaultTimeout`, отмена в конце запроса — `TestContext_EndpointTimeout`, `TestContext_DefaultTimeout`, `TestContext_TimeoutCancelledAfterRequest`, `TestContext_NoTimeout_NoDeadline`; 504/503 — `TestContext_ErrorStatus`.
+- WS ошибка разбора `data` → 400 `VTL-0007` — `TestDecodeWSInput_Invalid`, `TestDecodeWSInput_Valid`.
+- auth: права отсортированно в `Endpoint.Perms` — `TestRequirePermsSetsMetaPerms`; `Disabled` во время запроса — `TestDisabledAfterOptionsCreated`; nil `Authorizer` → 500 — `TestNilAuthorizer`; комментарий `vatel.Perms` уточнён (options.go); `Perms` на WS без `WithWsAuthFunc` — `TestWsCompile_PermsWithoutAuthFunc_Errors`.
+- `LogSilent` (HTTP и WS), метаданные в `OnErrorResponse` — `TestHandler_LogSilent`, `TestWsWriteErrorResponse_LogSilent`, `TestHandler_NotSilent_4xxLogged`, `TestHandler_OnErrorResponse_MetaOnAuthorizationReject`.
+- удалены `NoInputLog`, `NoResultLog`, `LanguageLabel`, `WithLanguageLabel`, `atomic.` — grep по `*.go` пуст.
+- `BuildHandlers` без panic, «previous build failed», комментарий в `BuildHandlers` — `TestBuildHandlers_WSErrors`, `TestBuildHandlers_AfterFailedBuild`, `TestBuildHandlers_Twice`.
+- `OnTokenUpdate` — `TestOnTokenUpdate`.
 
 ### Task 15: [Final] Update documentation
 - [ ] README.md: быстрый старт на новом API, carriers (`Validate()` на именованном типе), middleware, `auth`, `WithClientErrorFields`, `WithOptionalBody`, маскирование `mask` (параметры → `"***"`), контекст и таймауты (что таймаут не прерывает обработчик сам), CORS через `mux.GlobalOPTIONS` (только зарегистрированные пути; не ставить `Require*` на OPTIONS)

@@ -2084,3 +2084,130 @@ func TestHandler_NotSilent_4xxLogged(t *testing.T) {
 		t.Errorf("4xx must be logged without LogSilent, got %s", buf.String())
 	}
 }
+
+// ── acceptance: Gostly issues ────────────────────────────────────────────────
+
+// failingUnmarshal is a field type whose own UnmarshalJSON rejects the value;
+// the error text has a quote and a backslash to check JSON escaping.
+type failingUnmarshal struct{}
+
+func (*failingUnmarshal) UnmarshalJSON([]byte) error {
+	return stderrors.New(`bad value "x\y"`)
+}
+
+type undecodableBodyHandler struct {
+	Body[struct {
+		UserID int              `json:"userId"`
+		At     time.Time        `json:"at"`
+		Custom failingUnmarshal `json:"custom"`
+	}]
+	called bool
+}
+
+func (h *undecodableBodyHandler) Handle(Context) error { h.called = true; return nil }
+
+// Gostly №1: every body that does not decode into the input — syntax, type,
+// trailing data or an error of a field's own UnmarshalJSON — gives 400
+// VTL-0007, not 500. The error JSON stays valid (Gostly №3), also verbose.
+func TestHandler_UndecodableBody_400(t *testing.T) {
+	bodies := map[string]string{
+		"truncated":           `{`,
+		"array":               `[]`,
+		"wrong type":          `{"userId":"x"}`,
+		"trailing data":       `{} {}`,
+		"bad time.Time":       `{"at":"2026-13-45"}`,
+		"own UnmarshalJSON":   `{"custom":1}`,
+		"quote and backslash": `{"userId":"a\"b\\c"}`,
+	}
+	for name, body := range bodies {
+		for _, verbose := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/verbose=%v", name, verbose), func(t *testing.T) {
+				h := &undecodableBodyHandler{}
+				fctx := newPOSTCtx("/items", []byte(body))
+
+				run(noAuthVatel(WithVerboseError(verbose)), POST("/items", func() Handler { return h }), fctx)
+
+				if got := responseStatus(fctx); got != 400 {
+					t.Fatalf("want 400, got %d: %s", got, fctx.Response.Body())
+				}
+				if h.called {
+					t.Error("handler must not run")
+				}
+				var resp map[string]any
+				if err := json.Unmarshal(fctx.Response.Body(), &resp); err != nil {
+					t.Fatalf("error response is not valid JSON: %v (%s)", err, fctx.Response.Body())
+				}
+				if !strings.Contains(string(fctx.Response.Body()), "VTL-0007") {
+					t.Errorf("want code VTL-0007, got %s", fctx.Response.Body())
+				}
+			})
+		}
+	}
+}
+
+// Gostly №8: OnAuthorization runs after the token check and before the body
+// is decoded, so middleware can reject a request with an undecodable body
+// first.
+func TestHandler_OnAuthorization_RunsBeforeBodyDecode(t *testing.T) {
+	for _, reject := range []bool{true, false} {
+		t.Run(fmt.Sprintf("reject=%v", reject), func(t *testing.T) {
+			v := noAuthVatel()
+			called := false
+			v.AddMiddleware(OnAuthorization, func(Context, EndpointMeta) error {
+				called = true
+				if reject {
+					return ErrForbidden.New()
+				}
+				return nil
+			})
+			h := &bodyHandler{}
+			fctx := newPOSTCtx("/items", []byte(`{`))
+
+			run(v, POST("/items", func() Handler { return h }), fctx)
+
+			if !called {
+				t.Fatal("OnAuthorization middleware not called")
+			}
+			want := 400
+			if reject {
+				want = 403
+			}
+			if got := responseStatus(fctx); got != want {
+				t.Errorf("want %d, got %d", want, got)
+			}
+		})
+	}
+}
+
+// Gostly №9: every middleware gets the endpoint metadata — method, path
+// template (with the URL prefix, not the request path) and perms.
+func TestMiddleware_SeesEndpointMeta(t *testing.T) {
+	v := noAuthVatel(WithUrlPrefix("/api"))
+	var got []EndpointMeta
+	for _, pos := range []MiddlewarePos{OnRequest, OnAuthentication, OnAuthorization, OnHandle, OnSuccessResponse} {
+		v.AddMiddleware(pos, func(_ Context, m EndpointMeta) error {
+			got = append(got, m)
+			return nil
+		})
+	}
+	v.Add(Endpoints{GET("/items/{id}", func() Handler { return &pathHandler{} }, Perms("items:read"))})
+	mux := router.New()
+	if err := v.BuildHandlers(mux, discardLogger()); err != nil {
+		t.Fatalf("BuildHandlers: %v", err)
+	}
+
+	fctx := newGETCtx("/api/items/5")
+	mux.Handler(fctx)
+
+	if responseStatus(fctx) != 200 {
+		t.Fatalf("want 200, got %d: %s", responseStatus(fctx), fctx.Response.Body())
+	}
+	if len(got) != 5 {
+		t.Fatalf("want 5 middleware calls, got %d", len(got))
+	}
+	for i, m := range got {
+		if m.Method != "GET" || m.Path != "/api/items/{id}" || len(m.Perms) != 1 || m.Perms[0] != "items:read" {
+			t.Errorf("call %d: meta = %+v, want GET /api/items/{id} [items:read]", i, m)
+		}
+	}
+}
