@@ -100,6 +100,7 @@
 - журнал: поля с тегом `mask` маскируются всегда — без `WithJsonMasker` используется `jsonmask.New()` (незарегистрированное имя функции → `"***"`). Маскируются `requestBody`, `reqInput`, `reqQuery`, `respBody`, `result`, в том числе в элементах массивов (`Body[[]T]`, `Output[[]T]`) и в `OptionalOutput[T]`; ответ клиенту не маскируется. Ключи `maskedRequestBody`/`maskedRespBody` убраны — замаскированное тело пишется под прежними `requestBody`/`respBody`. `result` пишется как сериализованный ответ (тот же JSON, что получил клиент, после маскирования), а не через `Interface`. При ошибке маскирования в журнал идёт только ошибка (`requestBodyMaskingFailed`, `reqInputMaskingFailed`, `respMaskingFailed`), без незамаскированного значения (раньше тело запроса писалось открытым). При ошибке `json.Marshal` ответа объект ответа в журнал не пишется (раньше — `result`). Тип без тегов `mask` логируется как прежде.
 - журнал: path- и query-параметры с тегом `mask` маскируются — `mask:"-"` не пишется, любой другой непустой `mask` → `"***"` (функции jsonmask к параметрам не применяются); тег `mask` на вложенной структуре query-входа действует на её поля без своего тега. Значения в структуре входа не меняются. Path-параметры пишутся только из разбора `Paramer` (ключ больше не дублируется в журнале; параметр пути, которого нет в структуре `Paramer`, больше не пишется), user values с именами `{name}` из шаблона пути в журнал не попадают; при `LogEnter|LogExit` path-параметры — только в строке входа (раньше дублировались в строке выхода через user values).
 - новое: контекст запроса. `ctx.Context()` — дочерний от базового контекста `Vatel` (раньше `context.Background()`); `Shutdown` отменяет его — после ожидания запросов в полёте (до дедлайна `ctx` из `Shutdown`), а без сервера из `ListenAndServe` сразу; повторный `Shutdown` безопасен. Отмены по разрыву соединения клиентом нет (fasthttp его не видит). Таймаут: `vatel.WithTimeout(d)` (поле `Endpoint.Timeout`) на эндпоинт и `vatel.WithDefaultTimeout(d)` на `Vatel`; контекст с таймаутом отменяется и в конце обработки запроса. Таймаут не прерывает обработчик сам — только код, слушающий контекст. Ошибка без своего статуса (не `*errors.Error` или `*errors.Error` со статусом 0), в цепочке которой `context.DeadlineExceeded`, → 504, `context.Canceled` → 503; явный статус ошибки главнее. `*errors.Error` без статуса (например, `errors.Wrap(err, "msg")` от обычной ошибки) теперь даёт 500, а не 200. `NewContext(fctx)` по-прежнему с `context.Background()`.
+- WS: ошибка разбора поля `data` сообщения во вход `Inputer` → `ErrInvalidRequestBody` (400, код `VTL-0007`, сообщение «ws message data is not valid JSON»); раньше — необёрнутая ошибка `json.Unmarshal` и статус 500 (в журнале, метриках и `Alarm`).
 
 ## What Goes Where
 - **Implementation Steps**: код, тесты, документация в этом репозитории, коммиты на ветке `refactor`.
@@ -210,9 +211,9 @@
 - Modify: `ws_vatel.go`
 - Create: `ws_vatel_test.go`
 
-- [ ] тест: `decodeWSInput` с невалидным `data` → ошибка со статусом 400 и кодом `VTL-0007`; с валидным → разобрано
-- [ ] вынести разбор в `decodeWSInput(data, dest) error`, обернуть в `ErrInvalidRequestBody`
-- [ ] run tests — must pass before next task
+- [x] тест: `decodeWSInput` с невалидным `data` → ошибка со статусом 400 и кодом `VTL-0007`; с валидным → разобрано
+- [x] вынести разбор в `decodeWSInput(data, dest) error`, обернуть в `ErrInvalidRequestBody`
+- [x] run tests — must pass before next task
 
 ### Task 10: auth — Perms в метаданных, Disabled, nil Authorizer
 **Files:**

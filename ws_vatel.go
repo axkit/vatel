@@ -301,7 +301,7 @@ func (wv *WebsocketVatel) onMessage(c *websocket.Conn, isBinary bool, data []byt
 
 	// ── Input decoding ───────────────────────────────────────────────────────
 	if input, ok := h.(Inputer); ok {
-		if err := json.Unmarshal(msg.Data, input.Input()); err != nil {
+		if err := decodeWSInput(msg.Data, input.Input()); err != nil {
 			wsWriteErrorResponse(e, c, verbose, &zc, ctx.Created(), err)
 			return
 		}
@@ -345,6 +345,15 @@ func (wv *WebsocketVatel) onMessage(c *websocket.Conn, isBinary bool, data []byt
 	if e.mr != nil {
 		e.mr.ReportMetric(e.Method, e.Path, 200, dur.Seconds(), 0)
 	}
+}
+
+// decodeWSInput unmarshals the "data" field of a WebSocket message into dest.
+// A malformed or missing payload is a client error: ErrInvalidRequestBody (400).
+func decodeWSInput(data []byte, dest interface{}) error {
+	if err := json.Unmarshal(data, dest); err != nil {
+		return ErrInvalidRequestBody.Wrap(err).Msg("ws message data is not valid JSON")
+	}
+	return nil
 }
 
 // wsWriteErrorResponse logs an error and sends it to the WebSocket client.
