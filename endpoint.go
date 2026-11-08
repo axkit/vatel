@@ -27,10 +27,10 @@ const (
 	LogSilent     LogOption = 1 << iota // suppress all logging for this endpoint
 	LogEnter                            // log when a request arrives
 	LogExit                             // log when a request completes
-	LogReqBody                          // log the raw request body
-	LogReqInput                         // log the decoded input struct
-	LogRespBody                         // log the raw response body (masked if configured)
-	LogRespOutput                       // log the response struct before marshalling
+	LogReqBody                          // log the raw request body (masked by `mask` tags)
+	LogReqInput                         // log the decoded input struct (masked by `mask` tags)
+	LogRespBody                         // log the raw response body (masked by `mask` tags)
+	LogRespOutput                       // log the response struct (masked by `mask` tags)
 )
 
 var logOptionString = map[string]LogOption{
@@ -89,11 +89,13 @@ type Endpoint struct {
 	middlewares           middlewareSet
 	localMdw              middlewareSet // per-endpoint middleware, set via AddMiddleware
 	jm                    JsonMasker
-	inputFields           jsonmask.Fields
-	resultFields          jsonmask.Fields
-	paramFields           []fieldInfo // precomputed path param layout
-	queryFields           []fieldInfo // precomputed query layout of Inputer input (GET/DELETE/HEAD/OPTIONS)
-	querierFields         []fieldInfo // precomputed query layout of Querier input
+	inputFields           jsonmask.Fields // masking rules of Inputer input
+	queryMaskFields       jsonmask.Fields // masking rules of Querier input
+	resultFields          jsonmask.Fields // masking rules of Resulter result
+	resultFieldsDynamic   bool            // result type unknown at compile: rules are built per response
+	paramFields           []fieldInfo     // precomputed path param layout
+	queryFields           []fieldInfo     // precomputed query layout of Inputer input (GET/DELETE/HEAD/OPTIONS)
+	querierFields         []fieldInfo     // precomputed query layout of Querier input
 	ala                   Alarmer
 	mr                    MetricReporter
 	wsLogger              *zerolog.Logger
@@ -342,7 +344,7 @@ func (e *Endpoint) buildHandler(fctx *fasthttp.RequestCtx, lo LogOption, zc zero
 			return zc, nil, err
 		}
 		if lo&LogReqInput == LogReqInput {
-			zc = zc.Interface("reqQuery", query)
+			zc = e.logValue(zc, "reqQuery", query, e.queryMaskFields)
 		}
 	}
 
@@ -352,7 +354,7 @@ func (e *Endpoint) buildHandler(fctx *fasthttp.RequestCtx, lo LogOption, zc zero
 			return zc, nil, err
 		}
 		if lo&LogReqInput == LogReqInput {
-			zc = zc.Interface("reqInput", in)
+			zc = e.logValue(zc, "reqInput", in, e.inputFields)
 		}
 	}
 
@@ -371,7 +373,7 @@ func (e *Endpoint) buildHandler(fctx *fasthttp.RequestCtx, lo LogOption, zc zero
 		if decoded {
 			in = bodyIn
 			if lo&LogReqInput == LogReqInput {
-				zc = zc.Interface("reqInput", in)
+				zc = e.logValue(zc, "reqInput", in, e.inputFields)
 			}
 		}
 	}
@@ -393,22 +395,38 @@ func (e *Endpoint) buildHandler(fctx *fasthttp.RequestCtx, lo LogOption, zc zero
 	return zc, h, nil
 }
 
-// logRequestBody adds the compacted (and masked, if configured) request body
-// to zc.
+// logRequestBody adds the compacted request body, masked by the `mask` tags
+// of the input type, to zc.
 func (e *Endpoint) logRequestBody(zc zerolog.Context, body []byte) zerolog.Context {
 	compact := bytes.NewBuffer(nil)
 	if jerr := json.Compact(compact, body); jerr != nil {
 		return zc.Str("requestBodyLoggingFailed", jerr.Error())
 	}
-	buf := compact.Bytes()
-	key := "requestBody"
-	if e.jm != nil && len(e.inputFields) > 0 {
-		if masked, merr := e.jm.Mask(buf, e.inputFields); merr == nil {
-			buf = masked
-			key = "maskedRequestBody"
-		} else {
-			zc = zc.Str("maskingRequestAttrsFailed", merr.Error())
+	return e.logJSON(zc, "requestBody", compact.Bytes(), e.inputFields)
+}
+
+// logValue adds v to zc under key. A type without `mask` tags is logged as
+// is; otherwise v is marshalled and masked.
+func (e *Endpoint) logValue(zc zerolog.Context, key string, v interface{}, fields jsonmask.Fields) zerolog.Context {
+	if !fields.HasRules() {
+		return zc.Interface(key, v)
+	}
+	buf, err := json.Marshal(v)
+	if err != nil {
+		return zc.Str(key+"LoggingFailed", err.Error())
+	}
+	return e.logJSON(zc, key, buf, fields)
+}
+
+// logJSON adds the JSON document buf, masked with fields, to zc under key.
+// When masking fails only the error is logged, never the unmasked document.
+func (e *Endpoint) logJSON(zc zerolog.Context, key string, buf []byte, fields jsonmask.Fields) zerolog.Context {
+	if fields.HasRules() {
+		masked, err := e.jm.Mask(buf, fields)
+		if err != nil {
+			return zc.Str(key+"MaskingFailed", err.Error())
 		}
+		buf = masked
 	}
 	return zc.RawJSON(key, buf)
 }
@@ -437,27 +455,34 @@ func isNilResult(v interface{}) bool {
 }
 
 // writeJSON is the shared marshal-mask-log-write implementation used by both
-// HTTP and WebSocket response paths.
+// HTTP and WebSocket response paths. The marshalled response is masked once
+// and logged under "result" and/or "respBody"; the client receives it
+// unmasked. A marshalling error is returned without logging the response.
 func (e *Endpoint) writeJSON(w io.Writer, lo LogOption, res interface{}, zc *zerolog.Context) error {
 	buf, err := json.Marshal(res)
 	if err != nil {
-		*zc = zc.Interface("result", res)
 		return err
 	}
 
-	if lo&LogRespOutput == LogRespOutput {
-		*zc = zc.Interface("result", res)
-	}
-
-	if lo&LogRespBody == LogRespBody {
-		if e.jm != nil && len(e.resultFields) > 0 {
-			masked, merr := e.jm.Mask(buf, e.resultFields)
-			if merr != nil {
-				masked = []byte(`{"maskingError":"` + merr.Error() + `"}`)
+	if lo&(LogRespOutput|LogRespBody) != 0 {
+		fields := e.resultFields
+		if e.resultFieldsDynamic && e.jm != nil {
+			fields = e.jm.Fields(res, "mask")
+		}
+		logged := buf
+		if fields.HasRules() {
+			if logged, err = e.jm.Mask(buf, fields); err != nil {
+				*zc = zc.Str("respMaskingFailed", err.Error())
+				logged = nil
 			}
-			*zc = zc.RawJSON("maskedRespBody", masked)
-		} else {
-			*zc = zc.RawJSON("respBody", buf)
+		}
+		if logged != nil {
+			if lo&LogRespOutput == LogRespOutput {
+				*zc = zc.RawJSON("result", logged)
+			}
+			if lo&LogRespBody == LogRespBody {
+				*zc = zc.RawJSON("respBody", logged)
+			}
 		}
 	}
 
@@ -565,23 +590,18 @@ func (e *Endpoint) compile(v *Vatel) error {
 		e.paramFields = buildParamFields(reflect.TypeOf(c.(Paramer).Param()).Elem())
 	}
 
-	// Precompute JSON masking field maps.
-	ri, hasRespBody := c.(Resulter)
+	_, hasRespBody := c.(Resulter)
 	e.hasRespBody = hasRespBody
-	if hasRespBody && e.jm != nil {
-		e.resultFields = e.jm.Fields(ri.Result(), "mask")
-	}
+	e.compileMask(c)
 
 	ii, isInputer := c.(Inputer)
-	if isInputer && e.jm != nil {
-		e.inputFields = e.jm.Fields(ii.Input(), "mask")
-	}
 
 	// Querier input is decoded from the URL query string for every method.
 	qi, isQuerier := c.(Querier)
 	e.isQuerier = isQuerier
 	if isQuerier {
 		e.querierFields = buildQueryFields(reflect.TypeOf(qi.QueryInput()).Elem())
+		e.queryMaskFields = e.jm.Fields(qi.QueryInput(), "mask")
 	}
 
 	// Route input decoding based on HTTP method.
@@ -603,6 +623,35 @@ func (e *Endpoint) compile(v *Vatel) error {
 	return nil
 }
 
+// resultPrototyper is implemented by OptionalOutput, whose Result() is nil
+// until the handler sets it: it returns a typed nil pointer to the result
+// type, so masking rules can be built at compile time.
+type resultPrototyper interface {
+	resultPrototype() interface{}
+}
+
+// compileMask precomputes masking rules of the Inputer input and the Resulter
+// result of controller c. A result type unknown at compile time (Result()
+// returns an untyped nil) gets its rules built per response.
+func (e *Endpoint) compileMask(c interface{}) {
+	if ri, ok := c.(Resulter); ok {
+		res := ri.Result()
+		if res == nil {
+			if p, ok := c.(resultPrototyper); ok {
+				res = p.resultPrototype()
+			}
+		}
+		e.resultFieldsDynamic = res == nil
+		e.resultFields = e.jm.Fields(res, "mask")
+	}
+	if ii, ok := c.(Inputer); ok {
+		e.inputFields = e.jm.Fields(ii.Input(), "mask")
+	}
+}
+
+// defaultMasker masks log output of endpoints when WithJsonMasker is not set.
+var defaultMasker = jsonmask.New()
+
 // compileCommon copies shared Vatel config into the endpoint.
 // Auth fields (auth, perms) are left to compileWS for WS endpoints, or to
 // per-endpoint middleware (vatel/auth) for HTTP endpoints.
@@ -613,6 +662,9 @@ func compileCommon(v *Vatel, e *Endpoint) error {
 	e.logRequestID = v.cfg.logRequestID
 	e.clientErrorFields = v.cfg.clientErrorFields
 	e.jm = v.cfg.jm
+	if e.jm == nil {
+		e.jm = defaultMasker
+	}
 	e.ala = v.cfg.ala
 	e.mr = v.cfg.mr
 

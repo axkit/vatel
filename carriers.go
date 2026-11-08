@@ -118,6 +118,10 @@ func (o *OptionalOutput[T]) Result() interface{} {
 	return o.Out
 }
 
+// resultPrototype returns a typed nil pointer to the result type, used to
+// build masking rules at compile time while Out is still nil.
+func (o *OptionalOutput[T]) resultPrototype() interface{} { return (*T)(nil) }
+
 // Upload is an embeddable type that provides multipart file upload handling
 // for struct-based controllers. Unlike PathParams/Body, binding is not
 // automatic — call BindFile(ctx) at the start of Handle().

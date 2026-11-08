@@ -129,6 +129,10 @@ func WithDefaultLogOption(lo LogOption) func(*Option) {
 	return func(o *Option) { o.defaultLogOption = lo }
 }
 
+// WithJsonMasker sets the masker applied to logged request and response
+// bodies, inputs and results of types with `mask` struct tags. Without it a
+// default jsonmask.New() is used, so tagged fields are always masked in the
+// log ("***" for a function name not registered with AddFunc).
 func WithJsonMasker(jm JsonMasker) func(*Option) {
 	return func(o *Option) { o.jm = jm }
 }

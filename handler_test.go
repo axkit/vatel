@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/axkit/vatel/jsonmask"
 	"github.com/fasthttp/router"
 	"github.com/rs/zerolog"
 	"github.com/valyala/fasthttp"
@@ -1458,4 +1459,310 @@ func TestRouter_GlobalOPTIONS_WithVatelEndpoints(t *testing.T) {
 			t.Errorf("GlobalOPTIONS must not be called, calls = %d", globalCalls)
 		}
 	})
+}
+
+// ── masking of logged input and output ────────────────────────────────────────
+
+type secretItem struct {
+	Name     string `json:"name"`
+	Password string `json:"password" mask:"secret"`
+}
+
+type maskNode struct {
+	Name     string     `json:"name"`
+	Secret   string     `json:"secret" mask:"secret"`
+	Children []maskNode `json:"children"`
+	Next     *maskNode  `json:"next"`
+}
+
+type sliceBodyHandler struct{ Body[[]secretItem] }
+
+func (h *sliceBodyHandler) Handle(Context) error { return nil }
+
+type sliceOutputHandler struct{ Output[[]secretItem] }
+
+func (h *sliceOutputHandler) Handle(Context) error {
+	h.Out = []secretItem{{Name: "a", Password: "p1"}, {Name: "b", Password: "p2"}}
+	return nil
+}
+
+type stringOutputHandler struct{ Output[string] }
+
+func (h *stringOutputHandler) Handle(Context) error { h.Out = "x"; return nil }
+
+type optionalSecretHandler struct{ OptionalOutput[secretItem] }
+
+func (h *optionalSecretHandler) Handle(Context) error {
+	h.Out = &secretItem{Name: "a", Password: "p1"}
+	return nil
+}
+
+type recursiveOutputHandler struct{ Output[maskNode] }
+
+func (h *recursiveOutputHandler) Handle(Context) error {
+	h.Out = maskNode{Name: "root", Secret: "s0", Children: []maskNode{{Name: "c", Secret: "s1"}}, Next: &maskNode{Name: "n", Secret: "s2"}}
+	return nil
+}
+
+type secretBodyHandler struct {
+	Body[secretItem]
+	Output[secretItem]
+}
+
+func (h *secretBodyHandler) Handle(Context) error {
+	h.Out = h.In
+	return nil
+}
+
+type secretQueryHandler struct {
+	QueryParams[struct {
+		Name  string `param:"name"`
+		Token string `param:"token" mask:"secret"`
+	}]
+}
+
+func (h *secretQueryHandler) Handle(Context) error { return nil }
+
+type secretGetInputHandler struct {
+	Body[struct {
+		Token string `param:"token" mask:"secret"`
+	}]
+}
+
+func (h *secretGetInputHandler) Handle(Context) error { return nil }
+
+type plainItem struct {
+	Name     string `json:"name"`
+	Password string `json:"password"`
+}
+
+type plainBodyHandler struct {
+	Body[plainItem]
+	Output[plainItem]
+}
+
+func (h *plainBodyHandler) Handle(Context) error {
+	h.Out = h.In
+	return nil
+}
+
+type chanOutputHandler struct {
+	Output[struct {
+		Name string   `json:"name"`
+		C    chan int `json:"c"`
+	}]
+}
+
+func (h *chanOutputHandler) Handle(Context) error {
+	h.Out.Name = "leak"
+	h.Out.C = make(chan int)
+	return nil
+}
+
+func TestCompile_DefaultMasker_NoPanic(t *testing.T) {
+	tests := []struct {
+		name string
+		e    Endpoint
+	}{
+		{"Output[[]T]", GET("/a", func() Handler { return &sliceOutputHandler{} })},
+		{"Output[string]", GET("/a", func() Handler { return &stringOutputHandler{} })},
+		{"OptionalOutput[T]", GET("/a", func() Handler { return &optionalSecretHandler{} })},
+		{"Body[[]T]", POST("/a", func() Handler { return &sliceBodyHandler{} })},
+		{"recursive", GET("/a", func() Handler { return &recursiveOutputHandler{} })},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			e := tt.e
+			if err := e.compile(noAuthVatel()); err != nil {
+				t.Fatalf("compile: %v", err)
+			}
+			if e.jm == nil {
+				t.Error("default masker is not set")
+			}
+		})
+	}
+}
+
+// maskedValues returns the values of key in every element of the JSON array
+// found in the log line under logKey.
+func maskedValues(t *testing.T, m map[string]interface{}, logKey, key string) []interface{} {
+	t.Helper()
+	arr, ok := m[logKey].([]interface{})
+	if !ok {
+		t.Fatalf("%s is not an array in log: %v", logKey, m)
+	}
+	var res []interface{}
+	for _, el := range arr {
+		res = append(res, el.(map[string]interface{})[key])
+	}
+	return res
+}
+
+func TestHandler_Log_MasksArrayElements(t *testing.T) {
+	t.Run("Body[[]T]", func(t *testing.T) {
+		var buf bytes.Buffer
+		fctx := newPOSTCtx("/items", []byte(`[{"name":"a","password":"p1"},{"name":"b","password":"p2"}]`))
+		runLogged(t, noAuthVatel(), POST("/items", func() Handler { return &sliceBodyHandler{} },
+			WithLogOption(LogExit|LogReqBody|LogReqInput)), fctx, &buf)
+
+		m := lastLogLine(t, &buf)
+		for _, key := range []string{"requestBody", "reqInput"} {
+			for i, v := range maskedValues(t, m, key, "password") {
+				if v != jsonmask.DefaultMask {
+					t.Errorf("%s[%d].password = %v, want %q", key, i, v, jsonmask.DefaultMask)
+				}
+			}
+		}
+	})
+	t.Run("Output[[]T]", func(t *testing.T) {
+		var buf bytes.Buffer
+		fctx := newGETCtx("/items")
+		runLogged(t, noAuthVatel(), GET("/items", func() Handler { return &sliceOutputHandler{} },
+			WithLogOption(LogExit|LogRespBody|LogRespOutput)), fctx, &buf)
+
+		m := lastLogLine(t, &buf)
+		for _, key := range []string{"respBody", "result"} {
+			vals := maskedValues(t, m, key, "password")
+			if len(vals) != 2 {
+				t.Fatalf("%s: want 2 elements, got %d", key, len(vals))
+			}
+			for i, v := range vals {
+				if v != jsonmask.DefaultMask {
+					t.Errorf("%s[%d].password = %v, want %q", key, i, v, jsonmask.DefaultMask)
+				}
+			}
+		}
+		if !strings.Contains(string(fctx.Response.Body()), `"password":"p1"`) {
+			t.Errorf("response body must not be masked: %s", fctx.Response.Body())
+		}
+	})
+}
+
+func TestHandler_Log_MasksTaggedFields(t *testing.T) {
+	maskers := []struct {
+		name string
+		opts []func(*Option)
+	}{
+		{"default masker", nil},
+		{"WithJsonMasker", []func(*Option){WithJsonMasker(jsonmask.New())}},
+	}
+	flags := []struct {
+		lo  LogOption
+		key string
+	}{
+		{LogReqBody, "requestBody"},
+		{LogReqInput, "reqInput"},
+		{LogRespBody, "respBody"},
+		{LogRespOutput, "result"},
+	}
+	for _, mk := range maskers {
+		for _, f := range flags {
+			t.Run(mk.name+"/"+f.key, func(t *testing.T) {
+				var buf bytes.Buffer
+				fctx := newPOSTCtx("/items", []byte(`{"name":"a","password":"p1"}`))
+				runLogged(t, noAuthVatel(mk.opts...), POST("/items", func() Handler { return &secretBodyHandler{} },
+					WithLogOption(LogExit|f.lo)), fctx, &buf)
+
+				m := lastLogLine(t, &buf)
+				obj, ok := m[f.key].(map[string]interface{})
+				if !ok {
+					t.Fatalf("%s missing in log: %s", f.key, buf.String())
+				}
+				if obj["password"] != jsonmask.DefaultMask || obj["name"] != "a" {
+					t.Errorf("%s = %v, want password masked and name kept", f.key, obj)
+				}
+				if strings.Contains(buf.String(), "p1") {
+					t.Errorf("secret leaked to log: %s", buf.String())
+				}
+				for _, old := range []string{"maskedRequestBody", "maskedRespBody"} {
+					if _, ok := m[old]; ok {
+						t.Errorf("unexpected log key %s", old)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestHandler_Log_MasksOptionalOutput(t *testing.T) {
+	var buf bytes.Buffer
+	fctx := newGETCtx("/items")
+	runLogged(t, noAuthVatel(), GET("/items", func() Handler { return &optionalSecretHandler{} },
+		WithLogOption(LogExit|LogRespBody|LogRespOutput)), fctx, &buf)
+
+	if strings.Contains(buf.String(), "p1") {
+		t.Errorf("secret leaked to log: %s", buf.String())
+	}
+	m := lastLogLine(t, &buf)
+	if obj, _ := m["respBody"].(map[string]interface{}); obj["password"] != jsonmask.DefaultMask {
+		t.Errorf("respBody = %v, want password masked", m["respBody"])
+	}
+}
+
+func TestHandler_Log_MasksQueryInputs(t *testing.T) {
+	t.Run("Querier", func(t *testing.T) {
+		var buf bytes.Buffer
+		fctx := newGETCtx("/items?name=a&token=t1")
+		runLogged(t, noAuthVatel(), GET("/items", func() Handler { return &secretQueryHandler{} },
+			WithLogOption(LogExit|LogReqInput)), fctx, &buf)
+
+		m := lastLogLine(t, &buf)
+		q, _ := m["reqQuery"].(map[string]interface{})
+		if q["Token"] != jsonmask.DefaultMask || q["Name"] != "a" {
+			t.Errorf("reqQuery = %v, want Token masked and Name kept", m["reqQuery"])
+		}
+	})
+	t.Run("Inputer on GET", func(t *testing.T) {
+		var buf bytes.Buffer
+		fctx := newGETCtx("/items?token=t1")
+		runLogged(t, noAuthVatel(), GET("/items", func() Handler { return &secretGetInputHandler{} },
+			WithLogOption(LogExit|LogReqInput)), fctx, &buf)
+
+		m := lastLogLine(t, &buf)
+		in, _ := m["reqInput"].(map[string]interface{})
+		if in["Token"] != jsonmask.DefaultMask {
+			t.Errorf("reqInput = %v, want Token masked", m["reqInput"])
+		}
+	})
+}
+
+func TestHandler_Log_NoMaskTags_Unchanged(t *testing.T) {
+	var buf bytes.Buffer
+	fctx := newPOSTCtx("/items", []byte(`{"name":"a", "password":"p1"}`))
+	runLogged(t, noAuthVatel(), POST("/items", func() Handler { return &plainBodyHandler{} },
+		WithLogOption(LogExit|LogReqBody|LogReqInput|LogRespBody|LogRespOutput)), fctx, &buf)
+
+	m := lastLogLine(t, &buf)
+	for _, key := range []string{"requestBody", "reqInput", "respBody", "result"} {
+		obj, ok := m[key].(map[string]interface{})
+		if !ok {
+			t.Fatalf("%s missing in log: %s", key, buf.String())
+		}
+		if obj["name"] != "a" || obj["password"] != "p1" {
+			t.Errorf("%s = %v, want original values", key, obj)
+		}
+	}
+}
+
+func TestHandler_Log_MarshalErrorOmitsResult(t *testing.T) {
+	var buf bytes.Buffer
+	fctx := newGETCtx("/items")
+	runLogged(t, noAuthVatel(), GET("/items", func() Handler { return &chanOutputHandler{} },
+		WithLogOption(LogExit|LogRespBody|LogRespOutput)), fctx, &buf)
+
+	if got := responseStatus(fctx); got != 500 {
+		t.Errorf("want 500, got %d", got)
+	}
+	m := lastLogLine(t, &buf)
+	if _, ok := m["err"]; !ok {
+		t.Errorf("error missing in log: %s", buf.String())
+	}
+	for _, key := range []string{"result", "respBody"} {
+		if _, ok := m[key]; ok {
+			t.Errorf("unexpected %s in log: %s", key, buf.String())
+		}
+	}
+	if strings.Contains(buf.String(), "leak") {
+		t.Errorf("response object leaked to log: %s", buf.String())
+	}
 }

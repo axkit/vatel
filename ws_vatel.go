@@ -169,16 +169,11 @@ func (wv *WebsocketVatel) compileWS(v *Vatel, e *Endpoint, l *zerolog.Logger) er
 		return fmt.Errorf("endpoint WS %s: missing WebsocketController", e.Path)
 	}
 
-	ri, hasRespBody := c.(Resulter)
+	_, hasRespBody := c.(Resulter)
 	e.hasRespBody = hasRespBody
-	if hasRespBody && e.jm != nil {
-		e.resultFields = e.jm.Fields(ri.Result(), "mask")
-	}
+	e.compileMask(c)
 
-	ii, isInputer := c.(Inputer)
-	if isInputer && e.jm != nil {
-		e.inputFields = e.jm.Fields(ii.Input(), "mask")
-	}
+	_, isInputer := c.(Inputer)
 	e.isRequestBodyExpected = isInputer
 
 	return nil

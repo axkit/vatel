@@ -97,6 +97,7 @@
 - новое: интерфейс `Querier { QueryInput() any }`; `QueryParams[T]` реализует `QueryInput()` вместо `Input()` (код, вызывавший `Input()` у `QueryParams`, нужно поправить; `QueryParams` больше не `Inputer`). Query разбирается для любого метода, в том числе POST/PUT/PATCH, поэтому `QueryParams` + `Body` в одном контроллере дают и query, и тело (раньше двусмысленный `Input()` отключал разбор входа совсем). Старый `Inputer` без изменений: GET/DELETE — query, POST/PUT/PATCH — тело. `Validate()` вызывается после всего разбора: сначала у входа `Querier`, затем у входа `Inputer`, в том числе у query-входа `Inputer` на GET/DELETE; первая ошибка → 400. В журнале вход `Querier` пишется под ключом `reqQuery`, вход `Inputer` — под `reqInput`.
 - новое: builders `vatel.HEAD` и `vatel.OPTIONS` (раньше эти методы давали ошибку `BuildHandlers` «unknown HTTP method»). Вход `Inputer` на HEAD/OPTIONS разбирается из query, как на GET; `WithOptionalBody()` на них — ошибка `BuildHandlers`. Тело ответа на HEAD отбрасывает сервер fasthttp. CORS preflight — `mux.GlobalOPTIONS` (вызывается только для зарегистрированных путей, неизвестный путь — 404); явный `vatel.OPTIONS` на пути заменяет `GlobalOPTIONS`; `RequireAuth`/`RequirePerms` на OPTIONS ломает preflight.
 - jsonmask: `Fields` больше не паникует (nil, скаляры, map → пустые правила; новый `Fields.HasRules()`), поддерживает рекурсивные типы, корень-срез/массив (`*[]T`, `[]*T`), заходит в `*Struct`, `[]Struct`, `[]*Struct`. Поле с непустым тегом `mask` — лист: значение-структура (`time.Time`, вложенная структура, указатель, срез) маскируется или удаляется целиком. Тег на встроенной структуре без json-имени применяется к каждому её продвинутому полю. Незарегистрированное имя функции теперь даёт `"***"` (раньше значение оставалось открытым). Отсутствующее поле (`omitempty`) не добавляется. Карты и interface не обходятся.
+- журнал: поля с тегом `mask` маскируются всегда — без `WithJsonMasker` используется `jsonmask.New()` (незарегистрированное имя функции → `"***"`). Маскируются `requestBody`, `reqInput`, `reqQuery`, `respBody`, `result`, в том числе в элементах массивов (`Body[[]T]`, `Output[[]T]`) и в `OptionalOutput[T]`; ответ клиенту не маскируется. Ключи `maskedRequestBody`/`maskedRespBody` убраны — замаскированное тело пишется под прежними `requestBody`/`respBody`. `result` пишется как сериализованный ответ (тот же JSON, что получил клиент, после маскирования), а не через `Interface`. При ошибке маскирования в журнал идёт только ошибка (`requestBodyMaskingFailed`, `reqInputMaskingFailed`, `respMaskingFailed`), без незамаскированного значения (раньше тело запроса писалось открытым). При ошибке `json.Marshal` ответа объект ответа в журнал не пишется (раньше — `result`). Тип без тегов `mask` логируется как прежде.
 
 ## What Goes Where
 - **Implementation Steps**: код, тесты, документация в этом репозитории, коммиты на ветке `refactor`.
@@ -168,16 +169,16 @@
 
 ### Task 6: Маскирование input/output в журнале
 **Files:**
-- Modify: `endpoint.go`, `vatel.go`
+- Modify: `endpoint.go`, `vatel.go`, `ws_vatel.go`, `carriers.go` (тип результата `OptionalOutput` для правил на compile)
 - Modify: `handler_test.go`
 
-- [ ] тест: compile без `WithJsonMasker` для `Output[[]T]`, `Output[string]`, `OptionalOutput[T]`, `Body[[]T]`, рекурсивного типа — без panic
-- [ ] тест журнала: `Body[[]T]` и `Output[[]T]` с полем `mask:"secret"` в `T` → значения в каждом элементе `"***"`
-- [ ] тесты (журнал в буфер): `LogReqBody`, `LogReqInput`, `LogRespBody`, `LogRespOutput` с полем `mask:"secret"` → `"***"`, ключи журнала прежние; без `WithJsonMasker` тоже маскируется
-- [ ] тест: тип без тегов `mask` — журнал прежний (ключи и значения)
-- [ ] тест: ошибка `json.Marshal` ответа (например, `chan` в результате) — в журнале нет объекта ответа
-- [ ] реализовать masker по умолчанию, флаги `*HasMask`, маскирование `reqInput`/`reqQuery`/`result` (переиспользовать `buf`), путь ошибки marshal
-- [ ] run tests — must pass before next task
+- [x] тест: compile без `WithJsonMasker` для `Output[[]T]`, `Output[string]`, `OptionalOutput[T]`, `Body[[]T]`, рекурсивного типа — без panic
+- [x] тест журнала: `Body[[]T]` и `Output[[]T]` с полем `mask:"secret"` в `T` → значения в каждом элементе `"***"`
+- [x] тесты (журнал в буфер): `LogReqBody`, `LogReqInput`, `LogRespBody`, `LogRespOutput` с полем `mask:"secret"` → `"***"`, ключи журнала прежние; без `WithJsonMasker` тоже маскируется
+- [x] тест: тип без тегов `mask` — журнал прежний (ключи и значения)
+- [x] тест: ошибка `json.Marshal` ответа (например, `chan` в результате) — в журнале нет объекта ответа
+- [x] реализовать masker по умолчанию, флаги `*HasMask`, маскирование `reqInput`/`reqQuery`/`result` (переиспользовать `buf`), путь ошибки marshal
+- [x] run tests — must pass before next task
 
 ### Task 7: Маскирование path и query параметров
 **Files:**
