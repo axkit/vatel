@@ -129,7 +129,8 @@ func (b *builder) object(t reflect.Type) *object {
 
 // collect adds rules of the fields of struct type t to o. Fields of embedded
 // structs without a json name are promoted, as encoding/json does; inherited
-// is the mask tag of such an embedded field, applied to each promoted field.
+// is the mask tag of such an embedded field, applied to each promoted field
+// without a tag of its own.
 func (b *builder) collect(t reflect.Type, o *object, inherited string, embedded map[reflect.Type]bool) {
 	for i := 0; i < t.NumField(); i++ {
 		tf := t.Field(i)
@@ -141,7 +142,7 @@ func (b *builder) collect(t reflect.Type, o *object, inherited string, embedded 
 		}
 
 		tag := tf.Tag.Get(b.tag)
-		if inherited != "" {
+		if tag == "" {
 			tag = inherited
 		}
 

@@ -258,6 +258,18 @@ func TestMask_Leaf(t *testing.T) {
 		Credentials `mask:"-"`
 	}
 	assertJSON(t, maskValue(t, jm, embeddedTagged{1, Credentials{"bob", "p"}}), `{"id":1}`)
+
+	// A promoted field's own tag wins over the tag of the embedded struct:
+	// the secret is removed, not passed to the masking function.
+	type ownTag struct {
+		Secret string `json:"secret" mask:"-"`
+		Login  string `json:"login"`
+	}
+	type embeddedOwnTag struct {
+		ID     int `json:"id"`
+		ownTag `mask:"email"`
+	}
+	assertJSON(t, maskValue(t, jm, embeddedOwnTag{1, ownTag{"S", "bob"}}), `{"id":1,"login":"e***"}`)
 }
 
 func TestMask_AbsentFieldNotAdded(t *testing.T) {
