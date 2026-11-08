@@ -82,6 +82,7 @@ type Endpoint struct {
 	clientErrorFields     []string
 	responseContentType   []byte
 	isPathParametrized    bool
+	isQuerier             bool // controller implements Querier
 	isURLQueryExpected    bool
 	isRequestBodyExpected bool
 	hasRespBody           bool
@@ -91,7 +92,8 @@ type Endpoint struct {
 	inputFields           jsonmask.Fields
 	resultFields          jsonmask.Fields
 	paramFields           []fieldInfo // precomputed path param layout
-	queryFields           []fieldInfo // precomputed query/body input layout
+	queryFields           []fieldInfo // precomputed query layout of Inputer input (GET/DELETE)
+	querierFields         []fieldInfo // precomputed query layout of Querier input
 	ala                   Alarmer
 	mr                    MetricReporter
 	wsLogger              *zerolog.Logger
@@ -126,11 +128,23 @@ type WebsocketHandler interface {
 }
 
 // Inputer is implemented by controllers that expect decoded query or body input.
-// For GET/DELETE the framework decodes URL query parameters; for POST/PUT/PATCH
-// it decodes the JSON body. The returned pointer must be stable across the
-// request lifetime (i.e. a field of the controller struct, not a local variable).
+// For GET/DELETE the framework decodes URL query parameters (fields tagged
+// `param:"name"`); for POST/PUT/PATCH it decodes the JSON body. To read the
+// query string on POST/PUT/PATCH as well, implement Querier (embed QueryParams).
+// The returned pointer must be stable across the request lifetime (i.e. a field
+// of the controller struct, not a local variable).
 type Inputer interface {
 	Input() interface{}
+}
+
+// Querier is implemented by controllers that bind URL query string variables
+// (fields tagged `param:"name"`) independently of the request body. The query
+// string is decoded for every HTTP method, so a POST controller can implement
+// both Querier and Inputer to receive query variables and a JSON body. Embed
+// QueryParams to implement it. The returned pointer must be stable across the
+// request lifetime.
+type Querier interface {
+	QueryInput() interface{}
 }
 
 // Resulter is implemented by controllers that produce a JSON response body.
@@ -306,8 +320,9 @@ func (e *Endpoint) logExit(ctx Context, lo LogOption, zc *zerolog.Context, dur t
 	zl.Debug().Str("dur", dur.String()).Msg(msg)
 }
 
-// buildHandler instantiates the controller, decodes path params, and decodes
-// query/body input using precomputed field maps.
+// buildHandler instantiates the controller, decodes path params, Querier query
+// input and Inputer query/body input using precomputed field maps, then runs
+// Validator on the Querier input and the Inputer input, in that order.
 func (e *Endpoint) buildHandler(fctx *fasthttp.RequestCtx, lo LogOption, zc zerolog.Context) (zerolog.Context, Handler, error) {
 	h := e.Controller()
 	var err error
@@ -319,8 +334,20 @@ func (e *Endpoint) buildHandler(fctx *fasthttp.RequestCtx, lo LogOption, zc zero
 		}
 	}
 
+	var query, in interface{}
+
+	if e.isQuerier {
+		query = h.(Querier).QueryInput()
+		if zc, err = decodeURLQuery(fctx, query, e.querierFields, zc); err != nil {
+			return zc, nil, err
+		}
+		if lo&LogReqInput == LogReqInput {
+			zc = zc.Interface("reqQuery", query)
+		}
+	}
+
 	if e.isURLQueryExpected {
-		in := h.(Inputer).Input()
+		in = h.(Inputer).Input()
 		if zc, err = decodeURLQuery(fctx, in, e.queryFields, zc); err != nil {
 			return zc, nil, err
 		}
@@ -331,9 +358,9 @@ func (e *Endpoint) buildHandler(fctx *fasthttp.RequestCtx, lo LogOption, zc zero
 
 	if e.isRequestBodyExpected {
 		body := fctx.Request.Body()
-		in := h.(Inputer).Input()
+		bodyIn := h.(Inputer).Input()
 
-		decoded, err := decodeBody(body, in, e.OptionalBody)
+		decoded, err := decodeBody(body, bodyIn, e.OptionalBody)
 		// A skipped optional body has nothing to log.
 		if lo&LogReqBody == LogReqBody && (decoded || err != nil) {
 			zc = e.logRequestBody(zc, body)
@@ -342,12 +369,24 @@ func (e *Endpoint) buildHandler(fctx *fasthttp.RequestCtx, lo LogOption, zc zero
 			return zc, nil, err
 		}
 		if decoded {
+			in = bodyIn
 			if lo&LogReqInput == LogReqInput {
 				zc = zc.Interface("reqInput", in)
 			}
-			if err := validate(in); err != nil {
-				return zc, nil, err
-			}
+		}
+	}
+
+	// Validation runs after all input is decoded: Querier input first, then
+	// Inputer input. A skipped optional body leaves in nil, so it is not
+	// validated.
+	if query != nil {
+		if err := validate(query); err != nil {
+			return zc, nil, err
+		}
+	}
+	if in != nil {
+		if err := validate(in); err != nil {
+			return zc, nil, err
 		}
 	}
 
@@ -536,6 +575,13 @@ func (e *Endpoint) compile(v *Vatel) error {
 	ii, isInputer := c.(Inputer)
 	if isInputer && e.jm != nil {
 		e.inputFields = e.jm.Fields(ii.Input(), "mask")
+	}
+
+	// Querier input is decoded from the URL query string for every method.
+	qi, isQuerier := c.(Querier)
+	e.isQuerier = isQuerier
+	if isQuerier {
+		e.querierFields = buildQueryFields(reflect.TypeOf(qi.QueryInput()).Elem())
 	}
 
 	// Route input decoding based on HTTP method.

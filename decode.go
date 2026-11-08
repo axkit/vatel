@@ -283,10 +283,12 @@ func validate(in interface{}) error {
 	return nil
 }
 
-// Validator is an optional interface for input structs. When Input() returns
-// a value implementing Validator, the framework calls Validate() automatically
-// after decoding and before invoking Handle(). Return a non-nil error to reject
-// the request with a 400 status.
+// Validator is an optional interface for input structs. When QueryInput() or
+// Input() returns a value implementing Validator, the framework calls Validate()
+// automatically after all input (path, query, body) is decoded and before
+// invoking Handle(): first on the Querier input, then on the Inputer input.
+// The first non-nil error rejects the request with a 400 status. Declare
+// Validate() on a named type: an anonymous struct cannot have methods.
 //
 // Validate() is not called when the endpoint uses WithOptionalBody and the
 // request body is empty: the input stays zero, so a Validate() that fills in

@@ -1,11 +1,13 @@
 package vatel
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"testing"
 
 	"github.com/fasthttp/router"
+	"github.com/rs/zerolog"
 	"github.com/valyala/fasthttp"
 )
 
@@ -951,5 +953,291 @@ func TestHandler_OptionalBody_Validator(t *testing.T) {
 				t.Errorf("handler called = %v", h.called)
 			}
 		})
+	}
+}
+
+// ── Querier: query separate from body ─────────────────────────────────────────
+
+type pageQuery struct {
+	Page int    `param:"page"`
+	Sort string `param:"sort"`
+}
+
+type titleBody struct {
+	Title string `json:"title"`
+}
+
+// queryAndBodyHandler embeds both QueryParams and Body.
+type queryAndBodyHandler struct {
+	QueryParams[pageQuery]
+	Body[titleBody]
+	called bool
+}
+
+func (h *queryAndBodyHandler) Handle(Context) error { h.called = true; return nil }
+
+// queryOnlyHandler embeds only QueryParams.
+type queryOnlyHandler struct {
+	QueryParams[pageQuery]
+	called bool
+}
+
+func (h *queryOnlyHandler) Handle(Context) error { h.called = true; return nil }
+
+func TestHandler_QueryParamsAndBody_POST(t *testing.T) {
+	h := &queryAndBodyHandler{}
+	fctx := newPOSTCtx("/items?page=2&sort=asc", []byte(`{"title":"x"}`))
+
+	run(noAuthVatel(), POST("/items", func() Handler { return h }), fctx)
+
+	if got := responseStatus(fctx); got != 200 {
+		t.Fatalf("want 200, got %d (body %s)", got, fctx.Response.Body())
+	}
+	if h.Query.Page != 2 || h.Query.Sort != "asc" {
+		t.Errorf("query not decoded: %+v", h.Query)
+	}
+	if h.In.Title != "x" {
+		t.Errorf("body not decoded: %+v", h.In)
+	}
+}
+
+func TestHandler_QueryParamsOnly_POSTNeedsNoBody(t *testing.T) {
+	h := &queryOnlyHandler{}
+	fctx := newPOSTCtx("/items?page=4", nil)
+
+	run(noAuthVatel(), POST("/items", func() Handler { return h }), fctx)
+
+	if got := responseStatus(fctx); got != 200 {
+		t.Fatalf("want 200, got %d (body %s)", got, fctx.Response.Body())
+	}
+	if h.Query.Page != 4 {
+		t.Errorf("query not decoded: %+v", h.Query)
+	}
+}
+
+func TestHandler_QueryParams_GETAndDELETE(t *testing.T) {
+	for _, method := range []string{"GET", "DELETE"} {
+		t.Run(method, func(t *testing.T) {
+			h := &queryOnlyHandler{}
+			fctx := newGETCtx("/items?page=5&sort=desc")
+			fctx.Request.Header.SetMethod(method)
+
+			ep := buildEndpoint(method, "/items", func() Handler { return h })
+			run(noAuthVatel(), ep, fctx)
+
+			if got := responseStatus(fctx); got != 200 {
+				t.Fatalf("want 200, got %d", got)
+			}
+			if h.Query.Page != 5 || h.Query.Sort != "desc" {
+				t.Errorf("query not decoded: %+v", h.Query)
+			}
+		})
+	}
+}
+
+// legacyInputHandler is a v0.14-style controller: a single Input() whose struct
+// has both query (param) and body (json) tags.
+type legacyInputHandler struct {
+	in struct {
+		Page  int    `param:"page" json:"-"`
+		Title string `json:"title"`
+	}
+	called bool
+}
+
+func (h *legacyInputHandler) Input() interface{}   { return &h.in }
+func (h *legacyInputHandler) Handle(Context) error { h.called = true; return nil }
+
+func TestHandler_LegacyInputer_GETQuery_POSTBody(t *testing.T) {
+	t.Run("GET decodes query", func(t *testing.T) {
+		h := &legacyInputHandler{}
+		fctx := newGETCtx("/items?page=9")
+		run(noAuthVatel(), GET("/items", func() Handler { return h }), fctx)
+		if got := responseStatus(fctx); got != 200 {
+			t.Fatalf("want 200, got %d", got)
+		}
+		if h.in.Page != 9 {
+			t.Errorf("Page: want 9, got %d", h.in.Page)
+		}
+	})
+	t.Run("POST decodes body, not query", func(t *testing.T) {
+		h := &legacyInputHandler{}
+		fctx := newPOSTCtx("/items?page=9", []byte(`{"title":"t"}`))
+		run(noAuthVatel(), POST("/items", func() Handler { return h }), fctx)
+		if got := responseStatus(fctx); got != 200 {
+			t.Fatalf("want 200, got %d", got)
+		}
+		if h.in.Title != "t" {
+			t.Errorf("Title: want t, got %q", h.in.Title)
+		}
+		if h.in.Page != 0 {
+			t.Errorf("Page must not be decoded from query on POST, got %d", h.in.Page)
+		}
+	})
+}
+
+// validatedQuery rejects a non-positive Page and counts Validate calls.
+type validatedQuery struct {
+	Page  int `param:"page"`
+	calls int
+}
+
+func (q *validatedQuery) Validate() error {
+	q.calls++
+	if q.Page <= 0 {
+		return ErrValidationFailed.New().Msg("page must be positive")
+	}
+	return nil
+}
+
+type validatedQuerierHandler struct {
+	QueryParams[validatedQuery]
+	called bool
+}
+
+func (h *validatedQuerierHandler) Handle(Context) error { h.called = true; return nil }
+
+type validatedLegacyQueryHandler struct {
+	in     validatedQuery
+	called bool
+}
+
+func (h *validatedLegacyQueryHandler) Input() interface{}   { return &h.in }
+func (h *validatedLegacyQueryHandler) Handle(Context) error { h.called = true; return nil }
+
+type validatedQueryAndBodyHandler struct {
+	QueryParams[validatedQuery]
+	Body[countingInput]
+	called bool
+}
+
+func (h *validatedQueryAndBodyHandler) Handle(Context) error { h.called = true; return nil }
+
+func TestHandler_Validator_QuerierOnly(t *testing.T) {
+	for _, tt := range []struct {
+		uri        string
+		wantStatus int
+	}{
+		{"/items?page=1", 200},
+		{"/items?page=0", 400},
+	} {
+		h := &validatedQuerierHandler{}
+		fctx := newGETCtx(tt.uri)
+		run(noAuthVatel(), GET("/items", func() Handler { return h }), fctx)
+		if got := responseStatus(fctx); got != tt.wantStatus {
+			t.Errorf("%s: want %d, got %d", tt.uri, tt.wantStatus, got)
+		}
+		if h.Query.calls != 1 {
+			t.Errorf("%s: Validate calls = %d, want 1", tt.uri, h.Query.calls)
+		}
+		if h.called != (tt.wantStatus == 200) {
+			t.Errorf("%s: handler called = %v", tt.uri, h.called)
+		}
+	}
+}
+
+func TestHandler_Validator_LegacyInputerQuery(t *testing.T) {
+	for _, tt := range []struct {
+		uri        string
+		wantStatus int
+	}{
+		{"/items?page=1", 200},
+		{"/items?page=0", 400},
+	} {
+		h := &validatedLegacyQueryHandler{}
+		fctx := newGETCtx(tt.uri)
+		run(noAuthVatel(), GET("/items", func() Handler { return h }), fctx)
+		if got := responseStatus(fctx); got != tt.wantStatus {
+			t.Errorf("%s: want %d, got %d", tt.uri, tt.wantStatus, got)
+		}
+		if h.in.calls != 1 {
+			t.Errorf("%s: Validate calls = %d, want 1", tt.uri, h.in.calls)
+		}
+		if h.called != (tt.wantStatus == 200) {
+			t.Errorf("%s: handler called = %v", tt.uri, h.called)
+		}
+	}
+}
+
+func TestHandler_Validator_QueryBeforeBody(t *testing.T) {
+	tests := []struct {
+		name           string
+		uri            string
+		body           string
+		wantStatus     int
+		wantQueryCalls int
+		wantBodyCalls  int
+	}{
+		{"both valid", "/items?page=1", `{"name":"a"}`, 200, 1, 1},
+		{"query invalid skips body validation", "/items?page=0", `{"name":"a"}`, 400, 1, 0},
+		{"body invalid", "/items?page=1", `{"name":""}`, 400, 1, 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := &validatedQueryAndBodyHandler{}
+			fctx := newPOSTCtx(tt.uri, []byte(tt.body))
+			run(noAuthVatel(), POST("/items", func() Handler { return h }), fctx)
+			if got := responseStatus(fctx); got != tt.wantStatus {
+				t.Fatalf("want %d, got %d", tt.wantStatus, got)
+			}
+			if h.Query.calls != tt.wantQueryCalls {
+				t.Errorf("query Validate calls = %d, want %d", h.Query.calls, tt.wantQueryCalls)
+			}
+			if h.In.calls != tt.wantBodyCalls {
+				t.Errorf("body Validate calls = %d, want %d", h.In.calls, tt.wantBodyCalls)
+			}
+			if h.In.Name != "a" && tt.body == `{"name":"a"}` {
+				t.Errorf("body must be decoded even when query validation fails, got %+v", h.In)
+			}
+			if h.called != (tt.wantStatus == 200) {
+				t.Errorf("handler called = %v", h.called)
+			}
+		})
+	}
+}
+
+// runLogged compiles e and invokes its handler with a logger writing to buf.
+func runLogged(t *testing.T, v *Vatel, e Endpoint, fctx *fasthttp.RequestCtx, buf *bytes.Buffer) {
+	t.Helper()
+	if err := e.compile(v); err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	l := zerolog.New(buf)
+	e.handler(&l)(fctx)
+}
+
+// lastLogLine decodes the last JSON log line from buf.
+func lastLogLine(t *testing.T, buf *bytes.Buffer) map[string]interface{} {
+	t.Helper()
+	lines := bytes.Split(bytes.TrimSpace(buf.Bytes()), []byte("\n"))
+	var m map[string]interface{}
+	if err := json.Unmarshal(lines[len(lines)-1], &m); err != nil {
+		t.Fatalf("log line is not JSON: %v (%s)", err, buf.String())
+	}
+	return m
+}
+
+func TestHandler_Log_QuerierUnderReqQuery_InputerUnderReqInput(t *testing.T) {
+	var buf bytes.Buffer
+	h := &queryAndBodyHandler{}
+	fctx := newPOSTCtx("/items?page=2", []byte(`{"title":"x"}`))
+
+	runLogged(t, noAuthVatel(), POST("/items", func() Handler { return h },
+		WithLogOption(LogExit|LogReqInput)), fctx, &buf)
+
+	m := lastLogLine(t, &buf)
+	q, ok := m["reqQuery"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("reqQuery missing in log: %s", buf.String())
+	}
+	if q["Page"] != float64(2) {
+		t.Errorf("reqQuery.Page = %v, want 2", q["Page"])
+	}
+	in, ok := m["reqInput"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("reqInput missing in log: %s", buf.String())
+	}
+	if in["title"] != "x" {
+		t.Errorf("reqInput.title = %v, want x", in["title"])
 	}
 }

@@ -94,6 +94,7 @@
 - удалены `NoInputLog`, `NoResultLog`, `LanguageLabel` (были публичными и в v0.14);
 - тело у DELETE не поддерживается — query (`QueryParams`).
 - новое: `WithOptionalBody()` (поле `Endpoint.OptionalBody`) для POST/PUT/PATCH — пустое тело или тело из пробелов допустимо, вход остаётся нулевым, `Validate()` не вызывается; на GET/DELETE — ошибка `BuildHandlers`. Без опции тело из одних пробелов теперь даёт 400 «empty request body» (раньше — 400 «not valid JSON»).
+- новое: интерфейс `Querier { QueryInput() any }`; `QueryParams[T]` реализует `QueryInput()` вместо `Input()` (код, вызывавший `Input()` у `QueryParams`, нужно поправить; `QueryParams` больше не `Inputer`). Query разбирается для любого метода, в том числе POST/PUT/PATCH, поэтому `QueryParams` + `Body` в одном контроллере дают и query, и тело (раньше двусмысленный `Input()` отключал разбор входа совсем). Старый `Inputer` без изменений: GET/DELETE — query, POST/PUT/PATCH — тело. `Validate()` вызывается после всего разбора: сначала у входа `Querier`, затем у входа `Inputer`, в том числе у query-входа `Inputer` на GET/DELETE; первая ошибка → 400. В журнале вход `Querier` пишется под ключом `reqQuery`, вход `Inputer` — под `reqInput`.
 
 ## What Goes Where
 - **Implementation Steps**: код, тесты, документация в этом репозитории, коммиты на ветке `refactor`.
@@ -129,12 +130,12 @@
 - Modify: `endpoint.go`, `carriers.go`, `decode.go`
 - Modify: `carriers_test.go`, `handler_test.go`, `endpoint_test.go`
 
-- [ ] тесты: `QueryParams` + `Body` на POST — разобраны и query, и тело; `QueryParams` на GET и DELETE — query
-- [ ] тест: старый стиль `Input()` на GET → query, на POST → body (регрессия v0.14)
-- [ ] тесты Validator: только Querier; только Inputer-query (старый стиль); оба — ошибка query-валидации даёт 400 и тело не валидируется
-- [ ] тест журнала: Querier пишется под `reqQuery`, Inputer — под `reqInput`
-- [ ] ввести `Querier`, перевести `QueryParams[T]` на `QueryInput()`, разбор и валидация в `buildHandler`; обновить doc-комментарии `QueryParams`, `Body`, `Inputer`
-- [ ] run tests — must pass before next task
+- [x] тесты: `QueryParams` + `Body` на POST — разобраны и query, и тело; `QueryParams` на GET и DELETE — query
+- [x] тест: старый стиль `Input()` на GET → query, на POST → body (регрессия v0.14)
+- [x] тесты Validator: только Querier; только Inputer-query (старый стиль); оба — ошибка query-валидации даёт 400 и тело не валидируется
+- [x] тест журнала: Querier пишется под `reqQuery`, Inputer — под `reqInput`
+- [x] ввести `Querier`, перевести `QueryParams[T]` на `QueryInput()`, разбор и валидация в `buildHandler`; обновить doc-комментарии `QueryParams`, `Body`, `Inputer`
+- [x] run tests — must pass before next task
 
 ### Task 4: Методы OPTIONS и HEAD
 **Files:**

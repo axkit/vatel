@@ -75,6 +75,32 @@ func TestBody_ReturnsSamePointer(t *testing.T) {
 	}
 }
 
+// ── QueryParams[T] ───────────────────────────────────────────────────────────
+
+func TestQueryParams_ImplementsQuerierNotInputer(t *testing.T) {
+	type Q struct {
+		Page int `param:"page"`
+	}
+	q := &QueryParams[Q]{}
+	q.Query.Page = 3
+
+	var qi interface{} = q
+	querier, ok := qi.(Querier)
+	if !ok {
+		t.Fatal("QueryParams must implement Querier")
+	}
+	got, ok := querier.QueryInput().(*Q)
+	if !ok || got.Page != 3 {
+		t.Fatalf("QueryInput() = %#v, want *Q with Page=3", querier.QueryInput())
+	}
+	if querier.QueryInput() != querier.QueryInput() {
+		t.Error("QueryInput() must return the same pointer")
+	}
+	if _, ok := qi.(Inputer); ok {
+		t.Error("QueryParams must not implement Inputer")
+	}
+}
+
 // ── Output[T] ────────────────────────────────────────────────────────────────
 
 func TestOutput_AlwaysReturnsPointer(t *testing.T) {

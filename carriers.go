@@ -24,7 +24,9 @@ func (p *PathParams[T]) Param() interface{} { return &p.Params }
 
 // QueryParams is an embeddable generic type that provides URL query string
 // variable binding for struct-based controllers. Embed it and access query
-// variables via the Query field.
+// variables via the Query field. It implements Querier, so the query string is
+// decoded for every HTTP method, including POST/PUT/PATCH, and can be combined
+// with Body to receive both query variables and a JSON body.
 //
 //	type ListOrders struct {
 //	    api *API
@@ -35,26 +37,34 @@ func (p *PathParams[T]) Param() interface{} { return &p.Params }
 //	    }]
 //	}
 //	// c.Params.CustomerID, c.Query.Status, c.Query.Page
+//
+// If T implements Validator, Validate() is called after decoding, before the
+// validation of Body input. Declare Validate() on a named type: an anonymous
+// struct cannot have methods.
 type QueryParams[T any] struct {
 	Query T
 }
 
-// Input implements the Inputer interface for URL query string binding.
-func (q *QueryParams[T]) Input() interface{} { return &q.Query }
+// QueryInput implements the Querier interface for URL query string binding.
+func (q *QueryParams[T]) QueryInput() interface{} { return &q.Query }
 
-// Body is an embeddable generic type that provides query/body binding
-// for struct-based controllers. Embed it and access input data via the In field.
+// Body is an embeddable generic type that implements Inputer. Embed it and
+// access input data via the In field. For POST/PUT/PATCH the JSON request body
+// is decoded into In; for GET/DELETE the URL query string is decoded into the
+// fields of In tagged `param:"name"` (prefer QueryParams for query input).
 // The name Body avoids the naming conflict that would arise from an embedded
 // type named Input having a promoted method also named Input().
 //
-//	type ListOrders struct {
+//	type CreateOrder struct {
 //	    api *API
 //	    vatel.Body[struct {
-//	        Status string `param:"status"`
-//	        Page   int    `param:"page"`
+//	        Product  string `json:"product"`
+//	        Quantity int    `json:"quantity"`
 //	    }]
 //	}
-//	// c.In.Status, c.In.Page
+//	// c.In.Product, c.In.Quantity
+//
+// If T implements Validator, Validate() is called after decoding.
 type Body[T any] struct {
 	In T
 }
