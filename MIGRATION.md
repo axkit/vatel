@@ -463,9 +463,14 @@ Per-endpoint middleware: `e.AddMiddleware(pos, f...)` inside an `EndpointOption`
   (401); the connection keeps its previous payload. A payload stored with
   `UpdateAccessToken` for an ID before its connection opened that has expired by then is
   dropped when the connection opens (`UpgradeWithID`): the connection has no payload, its
-  next token is the first (`prev == nil`) and `WithWsAuthTimeout` applies. An expired
-  payload never authorizes a message. Payload types that already have an
-  `ExpiresAt() time.Time` method get this behaviour.
+  next token is the first (`prev == nil`) and `WithWsAuthTimeout` applies. Once the
+  payload of a live connection has expired, even before its timer fires, the connection
+  is closed with 4001 "token expired" by whatever notices it first: a message on it
+  (including `updateAccessToken`; it is not served), `UpdateAccessToken` (returns
+  `ErrWsTokenConflict`, `OnTokenUpdate` is not called, nothing is stored) or `VisitConns`
+  (the connection is left out). A token sent after the expiry never keeps the connection
+  open. Payload types that already have an `ExpiresAt() time.Time` method get this
+  behaviour.
 - New: `WithWsAuthTimeout(d)` closes a connection without an accepted token `d` after it
   opened with 4001; default 0 (no limit), no effect without `WithTokenDecoder`.
 - After a panic in the `OnOpen` callback, the messages the client sent before the 1011

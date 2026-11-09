@@ -945,7 +945,12 @@ wv.OnTokenUpdate(func(_ uint64, prev, next vatel.AuthPayload) error {
   connection keeps its previous payload. A payload stored with `UpdateAccessToken` for an
   ID before its connection opened (`UpgradeWithID`) that has expired by then is dropped:
   the connection opens without a payload (its next token is the first, `prev == nil`, and
-  the authentication timeout applies). An expired payload never authorizes a message.
+  the authentication timeout applies). Once the payload of a connection has expired, the
+  connection is over even if its timer has not fired yet: a message on it (including
+  `updateAccessToken`) is not served and closes it with 4001 "token expired", a direct
+  `UpdateAccessToken` for it returns `ErrWsTokenConflict` without calling `OnTokenUpdate`,
+  and `VisitConns` leaves it out. A late token never extends an expired connection nor
+  changes its security context: refresh the token before it expires.
 - **Authentication timeout.** `vatel.WithWsAuthTimeout(d)` closes a connection with 4001
   if no token was accepted within `d` after it opened (a rejected token does not count).
   Default 0: no limit. It has no effect without `WithTokenDecoder`.

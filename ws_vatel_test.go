@@ -652,14 +652,3 @@ func TestWsConns_AddDropsExpiredPayload(t *testing.T) {
 	}
 	cs.remove(c)
 }
-
-// A payload that has expired does not authorize a message, even before the
-// expiry timer closed the connection.
-func TestWsConns_ServingExpiredPayload(t *testing.T) {
-	cs := newWsConns()
-	c := &websocket.Conn{}
-	cs.conns[c.ID()] = &wsConn{conn: c, tp: &mockPayload{}, exp: time.Now().Add(-time.Millisecond), ver: 1, authed: true}
-	if tp, ok := cs.serving(c); !ok || tp != nil {
-		t.Errorf("serving = %v, %v; want no payload, served", tp, ok)
-	}
-}

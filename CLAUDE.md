@@ -220,10 +220,14 @@ WS security context (one connection = one user + organization; vatel only gives 
 `OnTokenUpdate(func(cid, prev, next AuthPayload) error)` runs without the lock; `UpdateAccessToken` reads
 `(entry, payload, ver)` with `wsConns.lookup`, calls it, then `storePayload` stores only if the entry pointer and
 `wsConn.ver` are unchanged and the entry is not `closing`, else `ErrWsTokenConflict` (409, VTL-0010, no retry;
-a closing entry is rejected before the callback too). An already expired payload (`Expirer`) → `ErrUnauthorized`,
+a closing entry is rejected before the callback too). An already expired new payload (`Expirer`) → `ErrUnauthorized`,
 nothing closed. A payload pre-stored for an ID that has expired when `wsConns.add` opens the connection is
-dropped (`tp` nil, `authed` false, `ver++`): no payload, auth timeout applies; `serving` never returns an
-expired payload. A `*WsCloseError` in a message error chain (handler,
+dropped (`tp` nil, `authed` false, `ver++`): no payload, auth timeout applies (the only way a connection
+gets `prev == nil` besides being new). A live entry whose payload has expired is closed by whoever sees it
+first, not only its timer: `wsConn.expire` (marks `closing`, `closeAsync` with 4001 "token expired") runs in
+`serving` (message not served), `lookup` (`UpdateAccessToken` → `ErrWsTokenConflict` before decoding, no
+callback), `storePayload` (expired while the callback ran) and `live` (`VisitConns` skips it). So a late token
+never re-arms the timer of an expired connection nor replaces its payload. A `*WsCloseError` in a message error chain (handler,
 `updateAccessToken`/`OnTokenUpdate`, `WithWsAuthFunc`): `wv.writeError` writes the reply first, then `closeLive`
 (the close frame is queued after it; closing earlier would drop the reply). Reply status from `Err`'s
 `*errors.Error` only (not the whole chain: `wsReplyError` returns `xe.Wrap(err)`), else from the code

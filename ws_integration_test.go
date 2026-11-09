@@ -1262,3 +1262,108 @@ func TestWS_PreStoredExpiredPayload(t *testing.T) {
 	}
 	h.sendOn(c, `{"path":"secret","data":{"name":"still open"}}`)
 }
+
+// expireWithLateTimer stores the token tok, which expires after ttl, for the
+// connection cid opened on c, stops its expiry timer, as if it fired late,
+// and waits until the payload has expired.
+func (h *wsHarness) expireWithLateTimer(c *websocket.Client, cid uint64, ttl time.Duration) AuthPayload {
+	h.t.Helper()
+	if got := h.sendOn(c, tokenMsg("1/10/"+ttl.String())); !strings.Contains(got, `"result":"Ok"`) {
+		h.t.Fatalf("token reply = %s", got)
+	}
+	h.wv.conns.mu.Lock()
+	wc := h.wv.conns.conns[cid]
+	wc.stopTimer()
+	tp, exp := wc.tp, wc.exp
+	h.wv.conns.mu.Unlock()
+	time.Sleep(time.Until(exp.Add(50 * time.Millisecond)))
+	return tp
+}
+
+// A token update on a connection whose payload has expired, before its
+// expiry timer fired, is not served: the connection is closed with 4001
+// "token expired", OnTokenUpdate is not called and the payload is not
+// replaced, so the connection neither survives its expiry nor switches its
+// security context.
+func TestWS_TokenUpdateAfterExpiryBeforeTimer(t *testing.T) {
+	h := newWSHarness(t, WithTokenDecoder(ctxDecoder{}))
+	var calls atomic.Int32
+	h.wv.OnTokenUpdate(func(cid uint64, prev, next AuthPayload) error {
+		calls.Add(1)
+		return sameSecurityContext(cid, prev, next)
+	})
+	tests := []struct{ name, tok string }{
+		{"other organization", "1/20"},
+		{"same context", "1/10"},
+	}
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cid := uint64(600 + i)
+			c, _ := h.dialPath("/wsid/" + strconv.FormatUint(cid, 10))
+			tp := h.expireWithLateTimer(c, cid, 100*time.Millisecond)
+			before := calls.Load()
+			if _, err := c.Write([]byte(tokenMsg(tt.tok))); err != nil {
+				t.Fatal(err)
+			}
+			msgs, code, reason := readClose(t, c)
+			if len(msgs) != 0 || code != WsStatusAuthRequired || reason != "token expired" {
+				t.Errorf("frames %q, close %d %q; want no reply, 4001 \"token expired\"", msgs, code, reason)
+			}
+			if n := calls.Load() - before; n != 0 {
+				t.Errorf("OnTokenUpdate calls after expiry = %d, want 0", n)
+			}
+			if got, _ := h.wv.conns.payload(cid); got != nil && got != tp {
+				t.Errorf("payload replaced after expiry: %v", got)
+			}
+		})
+	}
+
+	// A direct UpdateAccessToken call gets ErrWsTokenConflict and closes the
+	// connection the same way.
+	c, _ := h.dialPath("/wsid/610")
+	tp := h.expireWithLateTimer(c, 610, 100*time.Millisecond)
+	before := calls.Load()
+	if err := h.wv.UpdateAccessToken(610, "1/20"); !stderrors.Is(err, ErrWsTokenConflict) {
+		t.Errorf("UpdateAccessToken after expiry = %v, want ErrWsTokenConflict", err)
+	}
+	if n := calls.Load() - before; n != 0 {
+		t.Errorf("OnTokenUpdate calls after expiry = %d, want 0", n)
+	}
+	if got, _ := h.wv.conns.payload(610); got != nil && got != tp {
+		t.Errorf("payload replaced after expiry: %v", got)
+	}
+	if _, code, reason := readClose(t, c); code != WsStatusAuthRequired || reason != "token expired" {
+		t.Errorf("close %d %q, want 4001 \"token expired\"", code, reason)
+	}
+}
+
+// A message on a connection whose payload has expired, before its expiry
+// timer fired, is not served: the connection is closed with 4001 "token
+// expired". VisitConns leaves such a connection out and closes it as well.
+func TestWS_MessageAfterExpiryBeforeTimer(t *testing.T) {
+	h := newWSHarness(t, WithTokenDecoder(ctxDecoder{}))
+	c, _ := h.dialPath("/wsid/620")
+	h.expireWithLateTimer(c, 620, 100*time.Millisecond)
+	if _, err := c.Write([]byte(`{"path":"secret","data":{"name":"after expiry"}}`)); err != nil {
+		t.Fatal(err)
+	}
+	msgs, code, reason := readClose(t, c)
+	if len(msgs) != 0 || code != WsStatusAuthRequired || reason != "token expired" {
+		t.Errorf("frames %q, close %d %q; want no reply, 4001 \"token expired\"", msgs, code, reason)
+	}
+	if st, _ := h.metrics.get("secret"); len(st) != 0 {
+		t.Errorf("a message after the expiry was served: %v", st)
+	}
+
+	c2, _ := h.dialPath("/wsid/621")
+	h.expireWithLateTimer(c2, 621, 100*time.Millisecond)
+	h.wv.VisitConns(func(cid uint64, _ AuthPayload) bool {
+		if cid == 621 {
+			t.Error("connection with an expired payload visited")
+		}
+		return true
+	})
+	if _, code, reason := readClose(t, c2); code != WsStatusAuthRequired || reason != "token expired" {
+		t.Errorf("close %d %q, want 4001 \"token expired\"", code, reason)
+	}
+}

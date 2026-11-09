@@ -100,14 +100,32 @@ func (wc *wsConn) expired(now time.Time) bool {
 	return !wc.exp.IsZero() && !now.Before(wc.exp)
 }
 
+// wsReasonTokenExpired is the close reason of a connection whose payload
+// expired.
+const wsReasonTokenExpired = "token expired"
+
+// expire closes the live connection of wc, unless it is already closing, with
+// WsStatusAuthRequired if its payload has expired at now, as its expiry timer
+// does: whichever notices the expiry first (the timer, a message, a token
+// update, VisitConns) closes it, so an expired connection is never served nor
+// gets a new payload. It reports whether wc is closing. The mutex of its
+// table must be held.
+func (wc *wsConn) expire(now time.Time) bool {
+	if wc.conn != nil && !wc.closing && wc.expired(now) {
+		wc.closeAsync(WsStatusAuthRequired, wsReasonTokenExpired)
+	}
+	return wc.closing
+}
+
 // lookup returns the entry of the connection cid (nil if there is none), its
 // payload and the version of the payload, for storePayload, and whether the
-// connection is closing.
+// connection is closing. A live connection whose payload has expired is
+// closed (see expire) and reported as closing.
 func (cs *wsConns) lookup(cid uint64) (wc *wsConn, tp AuthPayload, ver uint64, closing bool) {
-	cs.mu.RLock()
-	defer cs.mu.RUnlock()
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
 	if wc = cs.conns[cid]; wc != nil {
-		return wc, wc.tp, wc.ver, wc.closing
+		return wc, wc.tp, wc.ver, wc.expire(time.Now())
 	}
 	return nil, nil, 0, false
 }
@@ -115,13 +133,14 @@ func (cs *wsConns) lookup(cid uint64) (wc *wsConn, tp AuthPayload, ver uint64, c
 // storePayload stores the token payload tp, which expires at exp (zero:
 // never), for the connection cid, unless its entry is no longer seen, its
 // payload is no longer of version ver (see lookup), or it is closing: another
-// payload was stored meanwhile, or the connection closed or is closing. It
-// reports whether tp was stored.
+// payload was stored meanwhile, or the connection closed or is closing. A
+// live connection whose payload has expired meanwhile is closed (see expire)
+// and gets no payload. It reports whether tp was stored.
 func (cs *wsConns) storePayload(cid uint64, seen *wsConn, ver uint64, tp AuthPayload, exp time.Time) bool {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 	wc := cs.conns[cid]
-	if wc != seen || (wc != nil && (wc.ver != ver || wc.closing)) {
+	if wc != seen || (wc != nil && (wc.expire(time.Now()) || wc.ver != ver)) {
 		return false
 	}
 	if wc == nil {
@@ -150,20 +169,17 @@ func (cs *wsConns) armTimer(cid uint64, wc *wsConn) {
 	case !wc.authed && cs.authTimeout > 0:
 		d, reason = cs.authTimeout, "authentication timeout"
 	case wc.authed && !wc.exp.IsZero():
-		d, reason = time.Until(wc.exp), "token expired"
+		d, reason = time.Until(wc.exp), wsReasonTokenExpired
 	default:
 		return
 	}
 	ver := wc.ver
 	wc.timer = time.AfterFunc(d, func() {
 		cs.mu.Lock()
-		if cs.conns[cid] != wc || wc.ver != ver || !wc.startClose() {
-			cs.mu.Unlock()
-			return
+		defer cs.mu.Unlock()
+		if cs.conns[cid] == wc && wc.ver == ver {
+			wc.closeAsync(WsStatusAuthRequired, reason)
 		}
-		c, nc := wc.conn, wc.nc
-		cs.mu.Unlock()
-		closeConn(c, nc, WsStatusAuthRequired, reason)
 	})
 }
 
@@ -188,6 +204,19 @@ func (wc *wsConn) startClose() bool {
 	return true
 }
 
+// closeAsync marks the live connection of wc as closing (see startClose) and
+// closes it with status and reason (closeConn) in a new goroutine, as queueing
+// the close frame blocks while its outbound queue is full. It reports false
+// when wc has no connection or it is already closing. The mutex of its table
+// must be held.
+func (wc *wsConn) closeAsync(status websocket.StatusCode, reason string) bool {
+	if !wc.startClose() {
+		return false
+	}
+	go closeConn(wc.conn, wc.nc, status, reason)
+	return true
+}
+
 // startClose marks the live connection cid as closing (see wsConn.startClose)
 // and returns it with its network connection. With c set, the connection
 // must be c. It reports false if there is no such connection, or it is
@@ -203,19 +232,29 @@ func (cs *wsConns) startClose(cid uint64, c *websocket.Conn) (*websocket.Conn, n
 }
 
 // serving reports whether the messages of c are served: c is registered and
-// not being closed by the server. It returns the token payload of c, if any;
-// none once the payload has expired (its timer is about to close c).
+// not being closed by the server. It returns the token payload of c, if any.
+// Once the payload has expired c is not served: it is closed (see expire),
+// even if its expiry timer has not fired yet.
 func (cs *wsConns) serving(c *websocket.Conn) (AuthPayload, bool) {
 	cs.mu.RLock()
-	defer cs.mu.RUnlock()
 	wc, ok := cs.conns[c.ID()]
 	if !ok || wc.conn != c || wc.closing {
+		cs.mu.RUnlock()
 		return nil, false
 	}
-	if wc.expired(time.Now()) {
-		return nil, true
+	if !wc.expired(time.Now()) {
+		tp := wc.tp
+		cs.mu.RUnlock()
+		return tp, true
 	}
-	return wc.tp, true
+	cs.mu.RUnlock()
+	// An expired payload stays expired: storePayload does not replace it.
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	if wc, ok := cs.conns[c.ID()]; ok && wc.conn == c {
+		wc.expire(time.Now())
+	}
+	return nil, false
 }
 
 // wsConnInfo is a live connection as VisitConns passes it.
@@ -224,13 +263,15 @@ type wsConnInfo struct {
 	tp  AuthPayload
 }
 
-// live returns the live connections that are not closing, by ID.
+// live returns the live connections that are not closing, by ID. A
+// connection whose payload has expired is closed (see expire) and left out.
 func (cs *wsConns) live() []wsConnInfo {
-	cs.mu.RLock()
-	defer cs.mu.RUnlock()
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	now := time.Now()
 	res := make([]wsConnInfo, 0, len(cs.conns))
 	for cid, wc := range cs.conns {
-		if wc.conn != nil && !wc.closing {
+		if wc.conn != nil && !wc.expire(now) {
 			res = append(res, wsConnInfo{cid, wc.tp})
 		}
 	}
@@ -414,7 +455,10 @@ func wsReplyError(err error) (error, *WsCloseError) {
 // Expirer is implemented by a token payload (AuthPayload) that expires. The
 // WebSocket connection whose payload has a non-zero ExpiresAt is closed with
 // WsStatusAuthRequired at that time, unless the client sends a new token
-// (updateAccessToken) before; an already expired payload is rejected by
+// (updateAccessToken) before: once the payload has expired, the connection is
+// not served and takes no new token, even before its expiry timer fires
+// (a message or a token update on it closes it with WsStatusAuthRequired at
+// once). An already expired new payload is rejected by
 // UpdateAccessToken with ErrUnauthorized, and a payload stored for an ID
 // before its connection opened (UpgradeWithID) that has expired by then is
 // dropped: the connection opens without a payload. An expired payload never
@@ -994,12 +1038,15 @@ func (e *Endpoint) wsRecoverPanic(w io.Writer, lo LogOption, verbose bool, zc ze
 
 // UpdateAccessToken decodes a new access token for the connection cid and
 // calls the OnTokenUpdate callback, if any, with the payload stored so far;
-// unless the callback returns an error, it stores the new payload for cid. A
-// token that cannot be decoded, or whose payload (Expirer) has expired, is
-// rejected with ErrUnauthorized; if the connection is closing (the callback
-// is not called), or another payload was stored for cid while the callback
-// ran, or the connection closed or started closing, it returns
-// ErrWsTokenConflict.
+// unless the callback returns an error, it stores the new payload for cid. If
+// the connection is closing, or its payload has expired (the connection is
+// then closed with WsStatusAuthRequired, "token expired", even if its expiry
+// timer has not fired yet), it returns ErrWsTokenConflict at once: the token
+// is not decoded and the callback is not called. A token that cannot be
+// decoded, or whose payload (Expirer) has expired, is rejected with
+// ErrUnauthorized; if another payload was stored for cid while the callback
+// ran, or the connection closed, started closing or its payload expired, it
+// returns ErrWsTokenConflict.
 // A rejected token is not stored: the connection keeps its payload. Storing a
 // payload arms the expiry of the connection (Expirer) and ends its
 // WithWsAuthTimeout. A payload stored for a cid without a live connection
@@ -1013,6 +1060,12 @@ func (e *Endpoint) wsRecoverPanic(w io.Writer, lo LogOption, verbose bool, zc ze
 func (wv *WebsocketVatel) UpdateAccessToken(cid uint64, token string) error {
 	if wv.cfg.td == nil {
 		return nil
+	}
+	// An expired connection keeps its security context until it closes: its
+	// payload is never replaced, nor prev passed to the callback as nil.
+	wc, prev, ver, closing := wv.conns.lookup(cid)
+	if closing {
+		return ErrWsTokenConflict.New()
 	}
 	at, err := wv.cfg.td.Decode([]byte(token))
 	if err != nil {
@@ -1029,10 +1082,6 @@ func (wv *WebsocketVatel) UpdateAccessToken(cid uint64, token string) error {
 		if !exp.IsZero() && !time.Now().Before(exp) {
 			return ErrUnauthorized.New().Msg("token expired")
 		}
-	}
-	wc, prev, ver, closing := wv.conns.lookup(cid)
-	if closing {
-		return ErrWsTokenConflict.New()
 	}
 	if wv.callbackOnTokenUpdate != nil {
 		if err := wv.callbackOnTokenUpdate(cid, prev, next); err != nil {
