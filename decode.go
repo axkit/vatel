@@ -301,23 +301,33 @@ func jsonDecodeError(err error, masked bool, msg string) error {
 }
 
 // validate calls Validate() if in implements Validator. A validation error is
-// returned with HTTP status 400.
+// returned as ErrValidationFailed (400, VTL-0006) wrapping it; the fields of
+// an *errors.Error in its chain are kept, and so is its code, if it has one.
 func validate(in interface{}) error {
 	v, ok := in.(Validator)
 	if !ok {
 		return nil
 	}
-	if err := v.Validate(); err != nil {
-		return errors.Wrap(err, "validation failed").StatusCode(400)
+	err := v.Validate()
+	if err == nil {
+		return nil
 	}
-	return nil
+	ve := ErrValidationFailed.Wrap(err)
+	if xe := vatelError(err); xe != nil {
+		if code := errors.Serialize(xe).Code; code != "" {
+			ve = ve.Code(code)
+		}
+	}
+	return ve
 }
 
 // Validator is an optional interface for input structs. When QueryInput() or
 // Input() returns a value implementing Validator, the framework calls Validate()
 // automatically after all input (path, query, body) is decoded and before
 // invoking Handle(): first on the Querier input, then on the Inputer input.
-// The first non-nil error rejects the request with a 400 status. Declare
+// The first non-nil error rejects the request with ErrValidationFailed (400,
+// VTL-0006) wrapping it; the code of a returned *errors.Error, if it has one,
+// replaces VTL-0006. Declare
 // Validate() on a named type: an anonymous struct cannot have methods.
 //
 // Validate() is not called when the endpoint uses WithOptionalBody and the

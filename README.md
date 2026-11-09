@@ -315,6 +315,9 @@ vatel.POST("/import", func() vatel.Handler {
 })
 ```
 
+`BindFile` returns 400 `VTL-0007` (`ErrInvalidRequestBody`) with field `field` (the `Key`)
+when the request is not a multipart form or has no such file field.
+
 ### Context
 
 `vatel.Context` gives the handler access to the request and the response without exposing
@@ -370,9 +373,11 @@ func (f *SearchFilter) Validate() error {
 }
 ```
 
-The client sees the message "validation failed" with status 400: any status of the
-returned error (409, 422, ...) is replaced by 400; its code and fields are kept. A plain
-`errors.New("...")` text from `Validate()` reaches the client only with verbose errors; to
+The client sees `ErrValidationFailed`: the message "validation failed", status 400 and
+code `VTL-0006`. Any status of the returned error (409, 422, ...) is replaced by 400; the
+code of a returned `*errors.Error`, if it has one, replaces `VTL-0006`, and its fields
+are kept. A plain `errors.New("...")` text from `Validate()` reaches the client only with
+verbose errors; to
 show a reason, set an error field and list it in `WithClientErrorFields` (see
 [Errors](#errors)). `Validate()` is called on `Querier` and `Inputer` input only, not on a
 `PathParams` struct.
@@ -536,6 +541,7 @@ Predefined errors:
 | `ErrInternalError` | VTL-0005 | 500 |
 | `ErrValidationFailed` | VTL-0006 | 400 |
 | `ErrInvalidRequestBody` | VTL-0007 | 400 |
+| `ErrUnknownPath` | VTL-0008 | 404 (WebSocket message with an unknown path) |
 
 ## Logging
 
@@ -770,13 +776,19 @@ mux.GET("/ws", wv.Upgrade) // the HTTP route that upgrades to WebSocket
   with `Perms` require it. HTTP middleware does not run for WS messages.
 - Invalid `data` gives a 400 `VTL-0007` error message. Errors are sent, logged and
   reported to metrics and the `Alarmer` like HTTP errors.
+- A message that is not valid JSON or has no `path` gives 400 `VTL-0007`, an unknown
+  `path` gives 404 `VTL-0008` (`ErrUnknownPath`). These errors are sent and logged like
+  other errors (on the `WithLogger` logger, or the `BuildHandlers` one, with
+  `"method":"WS"`), but not reported to metrics: no endpoint is known.
+- The metric size of a successful message is the size of the reply.
 - WS handlers have no Go context: `WithTimeout`, `WithDefaultTimeout` and the `Shutdown`
   cancellation do not apply. `LogReqBody`/`LogReqInput` are ignored. `WithRequestID` logs
   `connectionId` instead of `reqId`.
 - `vatel.WithLogger(l)` sets the logger of WS endpoints (lines get `"layer":"ws"`);
   without it they log to the logger passed to `BuildHandlers`.
 - `OnOpen` and `OnClose` register connection callbacks. `v.Shutdown` closes all WebSocket
-  connections with a "going away" status first.
+  connections with a "going away" status first; a connection opened after that is closed
+  at once, without the callbacks.
 
 ## Other options
 

@@ -140,7 +140,10 @@ error from the first `*errors.Error`/`*errors.ErrorTemplate` in the chain (`stde
 a status maps to 504 (`context.DeadlineExceeded`), 503 (`context.Canceled`) or 500. A chain without
 `*errors.Error` sends a generic error (`ErrInternalError` for 500) unless verbose: plain error text never
 reaches the client. The client gets msg/severity/code/status only; fields listed in `WithClientErrorFields` are written at the JSON root; `WithVerboseError` or a debug
-token adds stack, fields and wrapped errors. Validation errors are wrapped as 400.
+token adds stack, fields and wrapped errors. `Validate()` errors are wrapped in `ErrValidationFailed` (400,
+VTL-0006; an own code of the returned error is kept). WS envelope errors (bad JSON, no path: VTL-0007; unknown
+path: `ErrUnknownPath`, VTL-0008) go through `Vatel.errorResponse` and are logged by `writeEnvelopeError`
+(no metric).
 
 ### Logging
 

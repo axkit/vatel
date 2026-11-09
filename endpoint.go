@@ -169,6 +169,9 @@ var (
 	ErrInternalError             = errors.Template("internal error").Code("VTL-0005").StatusCode(500).Severity(errors.Critical)
 	ErrValidationFailed          = errors.Template("validation failed").Code("VTL-0006").StatusCode(400).Severity(errors.Tiny)
 	ErrInvalidRequestBody        = errors.Template("invalid request body").Code("VTL-0007").StatusCode(400).Severity(errors.Tiny)
+	// ErrUnknownPath is sent to a WebSocket client for a message whose path
+	// names no WS endpoint.
+	ErrUnknownPath = errors.Template("unknown path").Code("VTL-0008").StatusCode(404).Severity(errors.Tiny)
 )
 
 // parseLogLevelHeader parses a comma-separated X-Set-Log-Level header value
@@ -520,7 +523,8 @@ func (e *Endpoint) logJSON(zc zerolog.Context, key string, buf []byte, fields js
 // optionally logging and masking sensitive fields.
 func (e *Endpoint) writeResponse(ctx Context, lo LogOption, res interface{}, zc *zerolog.Context) error {
 	ctx.SetContentType(e.responseContentType)
-	return e.writeJSON(ctx.BodyWriter(), lo, res, zc)
+	_, err := e.writeJSON(ctx.BodyWriter(), lo, res, zc)
+	return err
 }
 
 // isNilResult reports whether a value returned from Resulter.Result() is nil,
@@ -536,12 +540,12 @@ func isNilResult(v interface{}) bool {
 // writeJSON is the shared marshal-mask-log-write implementation used by both
 // HTTP and WebSocket response paths. The marshalled response is masked and
 // logged under "respBody" (LogRespBody) or "result" (LogRespOutput only); the
-// client receives it unmasked. A marshalling error is returned without
-// logging the response.
-func (e *Endpoint) writeJSON(w io.Writer, lo LogOption, res interface{}, zc *zerolog.Context) error {
+// client receives it unmasked. It returns the size of the response. A
+// marshalling error is returned without logging the response.
+func (e *Endpoint) writeJSON(w io.Writer, lo LogOption, res interface{}, zc *zerolog.Context) (int, error) {
 	buf, err := json.Marshal(res)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	if lo&(LogRespOutput|LogRespBody) != 0 {
@@ -553,7 +557,7 @@ func (e *Endpoint) writeJSON(w io.Writer, lo LogOption, res interface{}, zc *zer
 	}
 
 	_, err = w.Write(buf)
-	return err
+	return len(buf), err
 }
 
 // resultRules returns the masking rules of the result res. Rules of a result
@@ -619,6 +623,12 @@ func (e *Endpoint) writeErrorResponse(ctx Context, lo LogOption, verbose bool, z
 }
 
 // errorResponse returns the status code of err and the error JSON sent to the
+// client (see Vatel.errorResponse).
+func (e *Endpoint) errorResponse(err error, verbose bool) (statusCode int, body []byte, xe *errors.Error) {
+	return e.v.errorResponse(err, verbose)
+}
+
+// errorResponse returns the status code of err and the error JSON sent to the
 // client.
 //
 // The status and the client error come from the first *errors.Error (or
@@ -629,7 +639,7 @@ func (e *Endpoint) writeErrorResponse(ctx Context, lo LogOption, verbose bool, z
 // An error chain without *errors.Error carries internal text (driver errors,
 // file paths). Unless verbose is set, the client gets a generic error of the
 // status instead ("internal error", VTL-0005, for 500); err itself is logged.
-func (e *Endpoint) errorResponse(err error, verbose bool) (statusCode int, body []byte, xe *errors.Error) {
+func (v *Vatel) errorResponse(err error, verbose bool) (statusCode int, body []byte, xe *errors.Error) {
 	xe = vatelError(err)
 	var client error = err
 	if xe != nil {
@@ -647,7 +657,7 @@ func (e *Endpoint) errorResponse(err error, verbose bool) (statusCode int, body 
 	if verbose {
 		ff = errors.AddStack | errors.AddFields | errors.AddWrappedErrors
 	}
-	return statusCode, errors.ToJSON(client, errors.WithAttributes(ff), errors.WithRootLevelFields(e.v.cfg.clientErrorFields)), xe
+	return statusCode, errors.ToJSON(client, errors.WithAttributes(ff), errors.WithRootLevelFields(v.cfg.clientErrorFields)), xe
 }
 
 // vatelError returns the first *errors.Error in the chain of err, or a new

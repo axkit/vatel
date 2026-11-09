@@ -236,6 +236,7 @@ func (v *Vatel) BuildHandlers(mux *router.Router, l *zerolog.Logger) error {
 func (v *Vatel) registerEndpoints(mux *router.Router, l *zerolog.Logger) error {
 
 	if v.cfg.wv != nil {
+		v.cfg.wv.bind(v, l)
 		v.ep = append(v.ep, v.cfg.wv.Endpoints()...)
 	}
 

@@ -17,8 +17,9 @@ import (
 // connection, to close it on shutdown, and its token payload, which persists
 // authentication state across messages on the same connection.
 type wsConns struct {
-	mu    sync.RWMutex
-	conns map[uint64]*wsConn
+	mu     sync.RWMutex
+	conns  map[uint64]*wsConn
+	closed bool // closeAll was called: no new connection is accepted
 }
 
 type wsConn struct {
@@ -30,14 +31,20 @@ func newWsConns() wsConns {
 	return wsConns{conns: make(map[uint64]*wsConn)}
 }
 
-func (cs *wsConns) add(c *websocket.Conn) {
+// add registers the connection c. After closeAll it returns false and does
+// not register it.
+func (cs *wsConns) add(c *websocket.Conn) bool {
 	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	if cs.closed {
+		return false
+	}
 	if wc, ok := cs.conns[c.ID()]; ok {
 		wc.conn = c
 	} else {
 		cs.conns[c.ID()] = &wsConn{conn: c}
 	}
-	cs.mu.Unlock()
+	return true
 }
 
 // setPayload stores the token payload of the connection cid.
@@ -61,29 +68,41 @@ func (cs *wsConns) payload(cid uint64) (AuthPayload, bool) {
 	return nil, false
 }
 
-func (cs *wsConns) remove(cid uint64) {
+// remove deletes the connection cid and reports whether it was registered.
+func (cs *wsConns) remove(cid uint64) bool {
 	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	wc, ok := cs.conns[cid]
 	delete(cs.conns, cid)
-	cs.mu.Unlock()
+	return ok && wc.conn != nil
 }
 
+// closeAll closes all registered connections with a "going away" status and
+// makes add reject new ones.
 func (cs *wsConns) closeAll() {
-	cs.mu.RLock()
+	cs.mu.Lock()
+	cs.closed = true
 	conns := make([]*websocket.Conn, 0, len(cs.conns))
 	for _, wc := range cs.conns {
 		if wc.conn != nil {
 			conns = append(conns, wc.conn)
 		}
 	}
-	cs.mu.RUnlock()
+	cs.mu.Unlock()
 	for _, c := range conns {
-		c.CloseDetail(websocket.StatusGoAway, "server shutdown")
+		closeGoingAway(c)
 	}
+}
+
+// closeGoingAway closes c with a "going away" status: the server shuts down.
+func closeGoingAway(c *websocket.Conn) {
+	c.CloseDetail(websocket.StatusGoAway, "server shutdown")
 }
 
 // WebsocketVatel manages WebSocket endpoint registration and message routing.
 type WebsocketVatel struct {
-	isPublicAccessAllowed bool
+	v                     *Vatel          // set by BuildHandlers
+	log                   *zerolog.Logger // logs message envelope errors; set by BuildHandlers
 	ws                    websocket.Server
 	path                  map[string]*Endpoint
 	cfg                   WsOption
@@ -149,6 +168,17 @@ func (wv *WebsocketVatel) Endpoints() []Endpoint {
 	}
 }
 
+// bind links wv to the Vatel v that serves it. Errors of a message envelope
+// (no endpoint is known yet) are logged to the WithLogger logger, or to l.
+func (wv *WebsocketVatel) bind(v *Vatel, l *zerolog.Logger) {
+	wv.v = v
+	wl := l.With().Str("method", methodWS).Logger()
+	if wv.cfg.log != nil {
+		wl = wv.cfg.log.With().Str("method", methodWS).Logger()
+	}
+	wv.log = &wl
+}
+
 // RegisterEndpoint is called by Vatel.buildHandlers for every endpoint with method "WS".
 func (wv *WebsocketVatel) RegisterEndpoint(v *Vatel, e *Endpoint, l *zerolog.Logger) error {
 	if _, ok := wv.path[e.Path]; ok {
@@ -207,22 +237,30 @@ func (wv *WebsocketVatel) OnTokenUpdate(f func(cid uint64, tp AuthPayload) error
 	wv.callbackOnTokenUpdate = f
 }
 
+// onOpen registers the connection c. A connection opened after Shutdown is
+// closed at once, without the OnOpen and OnClose callbacks.
 func (wv *WebsocketVatel) onOpen(c *websocket.Conn) {
-	wv.conns.add(c)
+	if !wv.conns.add(c) {
+		closeGoingAway(c)
+		return
+	}
 	if wv.callbackOnOpen != nil {
 		wv.callbackOnOpen(c)
 	}
 }
 
 func (wv *WebsocketVatel) onClose(c *websocket.Conn, err error) {
-	wv.conns.remove(c.ID())
+	if !wv.conns.remove(c.ID()) {
+		return
+	}
 	if wv.callbackOnClose != nil {
 		wv.callbackOnClose(c, err)
 	}
 }
 
-// Shutdown closes all active WebSocket connections with a "going away" status.
-// Call this before shutting down the HTTP server to allow clients to reconnect.
+// Shutdown closes all active WebSocket connections with a "going away" status,
+// so clients can reconnect to another instance; a connection opened later is
+// closed at once. Vatel.Shutdown calls it.
 func (wv *WebsocketVatel) Shutdown() {
 	wv.conns.closeAll()
 }
@@ -264,18 +302,20 @@ func (wv *WebsocketVatel) onMessage(c *websocket.Conn, isBinary bool, data []byt
 
 	var msg WebsocketRequest
 	if err := json.Unmarshal(data, &msg); err != nil {
-		c.Write(ToClientJSON(ErrInvalidRequestBody.Wrap(err).StatusCode(400).Msg("bad request"))) //nolint:errcheck
+		// The message may carry data of a masked type: the error must not
+		// quote it.
+		wv.writeEnvelopeError(c, "", jsonDecodeError(err, true, "ws message is not valid JSON"))
 		return
 	}
 
 	if msg.Path == "" {
-		c.Write(ToClientJSON(errors.Template("bad request").New().StatusCode(400).Set("reason", "empty path"))) //nolint:errcheck
+		wv.writeEnvelopeError(c, "", ErrInvalidRequestBody.New().Msg("ws message has no path"))
 		return
 	}
 
 	e, ok := wv.path[msg.Path]
 	if !ok {
-		c.Write(ToClientJSON(errors.Template("unknown path").New().StatusCode(404))) //nolint:errcheck
+		wv.writeEnvelopeError(c, msg.Path, ErrUnknownPath.New())
 		return
 	}
 
@@ -333,13 +373,16 @@ func (wv *WebsocketVatel) onMessage(c *websocket.Conn, isBinary bool, data []byt
 	}
 
 	// ── Response serialization ───────────────────────────────────────────────
+	size := 0
 	if e.hasRespBody {
 		res := h.(Resulter).Result()
 		if !isNilResult(res) {
-			if err := e.writeJSON(c, lo, res, &zc); err != nil {
+			n, err := e.writeJSON(c, lo, res, &zc)
+			if err != nil {
 				e.wsWriteErrorResponse(c, lo, verbose, &zc, ctx.Created(), err)
 				return
 			}
+			size = n
 		}
 	}
 
@@ -348,7 +391,26 @@ func (wv *WebsocketVatel) onMessage(c *websocket.Conn, isBinary bool, data []byt
 	if lo&LogExit == LogExit {
 		logExit(zc, lo, ctx.VisitValues, nil, dur)
 	}
-	e.reportMetric(200, dur, 0)
+	e.reportMetric(fasthttp.StatusOK, dur, size)
+}
+
+// writeEnvelopeError logs an error of the message envelope (invalid JSON, no
+// path, an unknown path) and sends it to the client c. No endpoint is known,
+// so no metric is reported; path is the requested path, if any.
+func (wv *WebsocketVatel) writeEnvelopeError(c *websocket.Conn, path string, err error) {
+	if wv.v == nil {
+		// Not served by a Vatel (BuildHandlers was not called).
+		c.Write(ToClientJSON(err)) //nolint:errcheck
+		return
+	}
+	_, body, _ := wv.v.errorResponse(err, wv.v.cfg.verboseError)
+	zc := wv.log.With().Str("path", path).Str("client", c.RemoteAddr().String())
+	if wv.v.cfg.logRequestID {
+		zc = zc.Uint64("connectionId", c.ID())
+	}
+	zl := zc.RawJSON("err", errors.ToJSON(err, errors.WithAttributes(errors.ServerOutputFormat))).Logger()
+	zl.Error().Msg("ws request failed")
+	c.Write(body) //nolint:errcheck
 }
 
 // decodeWSInput unmarshals the "data" field of a WebSocket message into dest.

@@ -200,6 +200,12 @@ Per-endpoint middleware: `e.AddMiddleware(pos, f...)` inside an `EndpointOption`
 - Path parameters support the same field types as query parameters (pointers,
   `date.Date`, nested structs); a `float32` path parameter is parsed with 32-bit
   precision.
+- A `Validate()` error gives `ErrValidationFailed` (400, code `VTL-0006`, severity tiny)
+  wrapping it; the code of a returned `*errors.Error`, if it has one, replaces `VTL-0006`
+  and its fields are kept. Before, a plain error from `Validate()` gave 400 without a code.
+- `Upload.BindFile` returns `ErrInvalidRequestBody` (400, `VTL-0007`) with field `field`
+  for a request that is not a multipart form or has no such file field; before, the raw
+  fasthttp error, i.e. a generic 500 and an `Alarm`.
 
 ### Input decoding
 
@@ -320,6 +326,15 @@ Per-endpoint middleware: `e.AddMiddleware(pos, f...)` inside an `EndpointOption`
   counts as 500 in the log, metrics and `Alarm`, as in HTTP (`context.DeadlineExceeded` →
   504, `context.Canceled` → 503); before, an `*errors.Error` without a status was reported
   to metrics with status 0 and did not trigger `Alarm`.
+- Errors of the message envelope are coded and logged: a message that is not valid JSON
+  gives `ErrInvalidRequestBody` (400, `VTL-0007`, "ws message is not valid JSON"; before:
+  400 "bad request" without a code), a message without `path` gives `ErrInvalidRequestBody`
+  ("ws message has no path"; before: 400 "bad request" without a code), an unknown `path`
+  gives the new `ErrUnknownPath` (404, `VTL-0008`; before: 404 "unknown path" without a
+  code). They are logged with `"method":"WS"` and the requested `path` (before: not
+  logged); no metric is reported.
+- A WebSocket connection opened after `Shutdown` (of `Vatel` or `WebsocketVatel`) is
+  closed at once with a "going away" status, without the `OnOpen`/`OnClose` callbacks.
 - New: `WebsocketVatel.OnTokenUpdate(f func(cid uint64, tp AuthPayload) error)` is called
   from `UpdateAccessToken` after the token is decoded and before the payload is stored. An
   error from `f` rejects the token: the payload is not stored (the connection keeps its
@@ -330,6 +345,8 @@ Per-endpoint middleware: `e.AddMiddleware(pos, f...)` inside an `EndpointOption`
 ### Metrics
 
 - The size reported for a HEAD response is 0: the server drops its body.
+- The size reported for a successful WebSocket message is the size of the reply (before:
+  0).
 
 ### Module
 

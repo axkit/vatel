@@ -141,11 +141,12 @@ type Upload struct {
 }
 
 // BindFile reads the uploaded file from the request and stores it in Header.
-// Returns an error if the field is missing or the form cannot be parsed.
+// A missing field or a form that cannot be parsed is a client error:
+// ErrInvalidRequestBody (400, VTL-0007) with field "field" set to Key.
 func (u *Upload) BindFile(ctx Context) error {
 	fh, err := ctx.FormFile(u.Key)
 	if err != nil {
-		return err
+		return ErrInvalidRequestBody.Wrap(err).Set("field", u.Key)
 	}
 	u.Header = fh
 	return nil

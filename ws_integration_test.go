@@ -6,6 +6,7 @@ import (
 	stderrors "errors"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -38,16 +39,26 @@ func (b *syncBuffer) String() string {
 type syncMetrics struct {
 	mu      sync.Mutex
 	status  map[string][]int
+	size    map[string][]int
 	alarmed []error
 }
 
-func (m *syncMetrics) ReportMetric(_, path string, statusCode int, _ float64, _ int) {
+func (m *syncMetrics) ReportMetric(_, path string, statusCode int, _ float64, size int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.status == nil {
 		m.status = make(map[string][]int)
+		m.size = make(map[string][]int)
 	}
 	m.status[path] = append(m.status[path], statusCode)
+	m.size[path] = append(m.size[path], size)
+}
+
+// sizes returns the response sizes reported for path.
+func (m *syncMetrics) sizes(path string) []int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]int(nil), m.size[path]...)
 }
 
 func (m *syncMetrics) Alarm(err error) {
@@ -91,6 +102,10 @@ type wsHarness struct {
 	client  *websocket.Client
 	log     *syncBuffer
 	metrics *syncMetrics
+	wv      *WebsocketVatel
+	ln      *fasthttputil.InmemoryListener
+	opened  atomic.Int32 // OnOpen calls
+	closed  atomic.Int32 // OnClose calls
 
 	mu        sync.Mutex
 	authPaths []string
@@ -113,6 +128,9 @@ func newWSHarness(t *testing.T) *wsHarness {
 			return nil
 		}),
 	)
+	wv.OnOpen(func(*websocket.Conn) { h.opened.Add(1) })
+	wv.OnClose(func(*websocket.Conn, error) { h.closed.Add(1) })
+	h.wv = wv
 	v := NewVatel(WithWebsocketSupport(wv), WithMetricReporter(h.metrics), WithAlarmer(h.metrics))
 	v.Add(Endpoints{
 		WS("secret", func() WebsocketHandler { return &wsSecretHandler{} }, WithLogOption(LogExit|LogRespBody)),
@@ -129,6 +147,7 @@ func newWSHarness(t *testing.T) *wsHarness {
 		t.Fatalf("BuildHandlers: %v", err)
 	}
 	ln := fasthttputil.NewInmemoryListener()
+	h.ln = ln
 	served := make(chan error, 1)
 	go func() { served <- v.serve(ln, mux) }()
 	waitServing(t, v)
@@ -139,17 +158,23 @@ func newWSHarness(t *testing.T) *wsHarness {
 		<-served
 	})
 
-	conn, err := ln.Dial()
+	h.client = h.dial()
+	return h
+}
+
+// dial opens a new WebSocket connection to the harness server.
+func (h *wsHarness) dial() *websocket.Client {
+	h.t.Helper()
+	conn, err := h.ln.Dial()
 	if err != nil {
-		t.Fatalf("dial: %v", err)
+		h.t.Fatalf("dial: %v", err)
 	}
 	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 	c, err := websocket.MakeClient(conn, "http://test/ws")
 	if err != nil {
-		t.Fatalf("websocket client: %v", err)
+		h.t.Fatalf("websocket client: %v", err)
 	}
-	h.client = c
-	return h
+	return c
 }
 
 // send writes a message and returns the reply.
@@ -208,6 +233,9 @@ func TestWS_Integration(t *testing.T) {
 	if st, _ := h.waitMetric("secret", 1); st[0] != 200 {
 		t.Errorf("metric status = %v, want 200", st)
 	}
+	if sz := h.metrics.sizes("secret"); sz[0] != len(`{"name":"a","password":"p1"}`) {
+		t.Errorf("metric size = %v, want the size of the reply", sz)
+	}
 
 	// Invalid data: 400 VTL-0007 frame.
 	if got := h.send(`{"path":"secret","data":{"name":1}}`); !strings.Contains(got, "VTL-0007") {
@@ -263,5 +291,71 @@ func TestWS_Integration(t *testing.T) {
 	st, alarms := h.waitMetric("fail", 1)
 	if st[0] != 500 || alarms != 1 {
 		t.Errorf("fail: metric status %v, alarms %d; want 500 and 1", st, alarms)
+	}
+}
+
+// Errors of the message envelope (invalid JSON, no path, an unknown path) are
+// coded, sent through the shared error path and logged; no metric is
+// reported for them.
+func TestWS_EnvelopeErrors(t *testing.T) {
+	h := newWSHarness(t)
+
+	tests := []struct {
+		name, msg, wantCode, wantLog string
+	}{
+		{"invalid JSON", `{"path":`, `"code":"VTL-0007","statusCode":400`, `"msg":"ws message is not valid JSON"`},
+		{"no path", `{"data":{}}`, `"code":"VTL-0007","statusCode":400`, `"msg":"ws message has no path"`},
+		{"unknown path", `{"path":"nope"}`, `"code":"VTL-0008","statusCode":404`, `"path":"nope"`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := h.send(tt.msg); !strings.Contains(got, tt.wantCode) {
+				t.Errorf("reply = %s, want %s", got, tt.wantCode)
+			}
+			out := h.waitLog(tt.wantLog)
+			if !strings.Contains(out, `"method":"WS"`) || !strings.Contains(out, "ws request failed") {
+				t.Errorf("envelope error not logged as a ws request failure: %s", out)
+			}
+		})
+	}
+	if st, _ := h.metrics.get("nope"); len(st) != 0 {
+		t.Errorf("metric reported for an unknown path: %v", st)
+	}
+}
+
+// A connection opened after WebsocketVatel.Shutdown (e.g. a client that
+// reconnects before the listener is closed) is closed at once, without the
+// OnOpen and OnClose callbacks.
+func TestWS_ConnectionAfterShutdownClosed(t *testing.T) {
+	h := newWSHarness(t)
+	if got := h.send(`{"path":"secret","data":{"name":"a"}}`); !strings.Contains(got, `"name":"a"`) {
+		t.Fatalf("reply = %s", got)
+	}
+	h.wv.Shutdown()
+
+	c := h.dial()
+	fr := websocket.AcquireFrame()
+	defer websocket.ReleaseFrame(fr)
+	for {
+		if _, err := c.ReadFrame(fr); err != nil {
+			break // connection closed
+		}
+		if fr.IsClose() {
+			break
+		}
+	}
+	if _, err := c.Write([]byte(`{"path":"secret","data":{"name":"late"}}`)); err == nil {
+		if _, err := c.ReadFrame(fr); err == nil && strings.Contains(string(fr.Payload()), "late") {
+			t.Error("a connection opened after Shutdown was served")
+		}
+	}
+	if got := h.opened.Load(); got != 1 {
+		t.Errorf("OnOpen calls = %d, want 1 (the rejected connection is not reported)", got)
+	}
+	h.wv.conns.mu.RLock()
+	n := len(h.wv.conns.conns)
+	h.wv.conns.mu.RUnlock()
+	if n > 1 {
+		t.Errorf("connections registered after Shutdown: %d", n)
 	}
 }

@@ -6,8 +6,11 @@ import (
 	"errors"
 	"io"
 	"mime/multipart"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/valyala/fasthttp"
 )
 
 // ── PathParams[T] ─────────────────────────────────────────────────────────────
@@ -467,6 +470,52 @@ func TestUpload_BindFile_Error(t *testing.T) {
 	}
 	if u.Header != nil {
 		t.Error("want Header to remain nil on error")
+	}
+}
+
+type uploadHandler struct{ Upload }
+
+func (h *uploadHandler) Handle(ctx Context) error { return h.BindFile(ctx) }
+
+// A request without the file field is a client error: 400 VTL-0007 with the
+// field name, no alarm.
+func TestUpload_BindFile_MissingField_400(t *testing.T) {
+	var form bytes.Buffer
+	mw := multipart.NewWriter(&form)
+	_ = mw.WriteField("other", "x")
+	mw.Close()
+
+	for name, setup := range map[string]func(*fasthttp.RequestCtx){
+		"multipart without the field": func(fctx *fasthttp.RequestCtx) {
+			fctx.Request.Header.SetContentType(mw.FormDataContentType())
+			fctx.Request.SetBody(form.Bytes())
+		},
+		"not a multipart form": func(fctx *fasthttp.RequestCtx) {
+			fctx.Request.Header.SetContentType("application/json")
+			fctx.Request.SetBody([]byte(`{}`))
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			fctx := &fasthttp.RequestCtx{}
+			fctx.Request.Header.SetMethod("POST")
+			fctx.Request.SetRequestURI("/import")
+			setup(fctx)
+			ala := &mockAlarmer{}
+			v := NewVatel(WithAlarmer(ala), WithVerboseError(true))
+
+			run(v, POST("/import", func() Handler { return &uploadHandler{Upload{Key: "file"}} }), fctx)
+
+			if got := responseStatus(fctx); got != fasthttp.StatusBadRequest {
+				t.Fatalf("status = %d, want 400; body %s", got, fctx.Response.Body())
+			}
+			body := string(fctx.Response.Body())
+			if !strings.Contains(body, "VTL-0007") || !strings.Contains(body, `"field":"file"`) {
+				t.Errorf("body = %s, want VTL-0007 with field file", body)
+			}
+			if ala.alarmed {
+				t.Error("a missing upload field must not raise an alarm")
+			}
+		})
 	}
 }
 

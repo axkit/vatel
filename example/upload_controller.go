@@ -2,11 +2,16 @@ package main
 
 import (
 	"bufio"
-	"fmt"
 
+	"github.com/axkit/errors"
 	"github.com/axkit/vatel"
 	"github.com/axkit/vatel/auth"
+	"github.com/valyala/fasthttp"
 )
+
+// errFileUnreadable is returned when the uploaded file cannot be read, e.g. a
+// line is longer than the scanner buffer.
+var errFileUnreadable = errors.Template("uploaded file cannot be read").StatusCode(fasthttp.StatusUnprocessableEntity)
 
 // ImportResult is the response body for the import endpoint.
 type ImportResult struct {
@@ -27,13 +32,14 @@ type ImportController struct {
 }
 
 func (c *ImportController) Handle(ctx vatel.Context) error {
+	// A missing "file" field is a 400 vatel.ErrInvalidRequestBody.
 	if err := c.BindFile(ctx); err != nil {
-		return fmt.Errorf("file upload failed: %w", err)
+		return err
 	}
 
 	rows, err := c.countRows()
 	if err != nil {
-		return fmt.Errorf("failed to read file: %w", err)
+		return errFileUnreadable.Wrap(err)
 	}
 
 	c.Out = ImportResult{
@@ -70,7 +76,7 @@ func ImportEndpoints(cfg *auth.Config) vatel.Endpoints {
 				return &ImportController{Upload: vatel.Upload{Key: "file"}}
 			},
 			cfg.RequirePerms(map[string]uint{"import": Permissions["import"]}),
-			vatel.WithSuccessStatusCode(201),
+			vatel.WithSuccessStatusCode(fasthttp.StatusCreated),
 		),
 	}
 }

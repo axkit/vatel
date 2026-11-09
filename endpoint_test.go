@@ -1,7 +1,10 @@
 package vatel
 
 import (
+	stderrors "errors"
+	"fmt"
 	"io"
+	"strings"
 	"testing"
 
 	"github.com/axkit/date"
@@ -291,6 +294,64 @@ func TestDecodeBody_ValidatorFailure(t *testing.T) {
 	}
 	if sc := errors.Serialize(xe, errors.WithAttributes(errors.ServerOutputFormat)).StatusCode; sc != 400 {
 		t.Errorf("want status 400, got %d", sc)
+	}
+}
+
+// returnedErrInput returns err from Validate().
+type returnedErrInput struct{ err error }
+
+func (r *returnedErrInput) Validate() error { return r.err }
+
+// plainInvalidInput rejects every value with a plain error.
+type plainInvalidInput struct{}
+
+func (plainInvalidInput) Validate() error { return stderrors.New("always invalid") }
+
+type plainValidateErrHandler struct{ Body[plainInvalidInput] }
+
+func (h *plainValidateErrHandler) Handle(Context) error { return nil }
+
+// A Validate() error is ErrValidationFailed (400, VTL-0006); an own code of
+// the returned error replaces VTL-0006, its fields are kept, its status is
+// replaced by 400.
+func TestValidate_ErrorCodes(t *testing.T) {
+	appErr := errors.Template("order is locked").Code("APP-0042").StatusCode(409)
+	tests := []struct {
+		name      string
+		err       error
+		wantCode  string
+		wantField string
+	}{
+		{"plain error", stderrors.New("name is required"), "VTL-0006", ""},
+		{"errors.Wrap of a plain error", errors.Wrap(stderrors.New("x"), "bad name"), "VTL-0006", ""},
+		{"ErrValidationFailed with a field", ErrValidationFailed.New().Set("reason", "r"), "VTL-0006", "reason"},
+		{"own code", appErr.New().Set("orderId", 7), "APP-0042", "orderId"},
+		{"own code under fmt.Errorf", fmt.Errorf("check: %w", appErr.New()), "APP-0042", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validate(&returnedErrInput{err: tt.err})
+			if !errors.Is(err, ErrValidationFailed) {
+				t.Errorf("error %v is not ErrValidationFailed", err)
+			}
+			se := errors.Serialize(err, errors.WithAttributes(errors.AddFields))
+			if se.Code != tt.wantCode || se.StatusCode != 400 || se.Message != "validation failed" {
+				t.Errorf("got code %q status %d msg %q, want %q 400 \"validation failed\"", se.Code, se.StatusCode, se.Message, tt.wantCode)
+			}
+			if tt.wantField != "" {
+				if _, ok := se.Fields[tt.wantField]; !ok {
+					t.Errorf("field %q lost: %v", tt.wantField, se.Fields)
+				}
+			}
+		})
+	}
+
+	// Through the pipeline: a plain Validate() error gives the client 400
+	// VTL-0006.
+	fctx := newPOSTCtx("/items", []byte(`{}`))
+	run(NewVatel(), POST("/items", func() Handler { return &plainValidateErrHandler{} }), fctx)
+	if got := responseStatus(fctx); got != 400 || !strings.Contains(string(fctx.Response.Body()), `"code":"VTL-0006"`) {
+		t.Errorf("pipeline: status %d body %s, want 400 VTL-0006", got, fctx.Response.Body())
 	}
 }
 

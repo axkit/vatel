@@ -2,6 +2,9 @@ package vatel
 
 import "time"
 
+// methodWS is the pseudo-method of WebSocket endpoints (EndpointMeta.Method).
+const methodWS = "WS"
+
 // EndpointOption is a functional option for configuring an Endpoint.
 type EndpointOption func(*Endpoint)
 
