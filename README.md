@@ -47,6 +47,11 @@ TOKEN=$(go run ./example token)
 curl -H "Authorization: Bearer $TOKEN" localhost:18080/orders
 ```
 
+`go run ./example token 2` mints the token for organization 2 (default 1). The example also
+serves WebSocket on `/ws`: send `{"path":"updateAccessToken","data":{"mid":"<uuid>","at":"<token>"}}`
+within 10 seconds, then `{"path":"orders.watch","data":{"id":1}}` (see
+[Security context and closing connections](#security-context-and-closing-connections)).
+
 The minimal version:
 
 ```go
@@ -594,6 +599,8 @@ Predefined errors:
 | `ErrValidationFailed` | VTL-0006 | 400 |
 | `ErrInvalidRequestBody` | VTL-0007 | 400 |
 | `ErrUnknownPath` | VTL-0008 | 404 (WebSocket message with an unknown path) |
+| `ErrWsContextChanged` | VTL-0009 | 409 (WebSocket reply before closing with 4009, see [WebSocket](#security-context-and-closing-connections)) |
+| `ErrWsTokenConflict` | VTL-0010 | 409 (concurrent `UpdateAccessToken` for one connection) |
 
 ## Logging
 
@@ -814,7 +821,7 @@ wv := vatel.NewWebsocketVatel(
 		return nil // check perms against ctx.TokenPayload()
 	}),
 )
-wv.OnTokenUpdate(func(cid uint64, tp vatel.AuthPayload) error { return nil })
+wv.OnTokenUpdate(func(cid uint64, prev, next vatel.AuthPayload) error { return nil })
 
 v := vatel.NewVatel(vatel.WithWebsocketSupport(wv))
 v.Add(vatel.Endpoints{
@@ -827,12 +834,14 @@ mux.GET("/ws", wv.Upgrade) // the HTTP route that upgrades to WebSocket
 ```
 
 - The built-in endpoint `updateAccessToken` (`data`: `{"mid": "<uuid>", "at": "<token>"}`)
-  decodes the token with `WithTokenDecoder` and calls the `OnTokenUpdate` callback; unless
-  the callback returns an error, it stores the payload for the connection. An error from
-  the callback rejects the token (the connection keeps its previous payload) and is sent
-  to the client; a token that cannot be decoded gives 401 `VTL-0004`. Without
-  `WithTokenDecoder` it replies `"Ok"` and stores nothing. The stored payload is available
-  as `ctx.TokenPayload()` in later messages.
+  decodes the token with `WithTokenDecoder` and calls the `OnTokenUpdate` callback with the
+  payload stored so far (`prev`, nil for the first token) and the new one (`next`); unless
+  the callback returns an error, it stores `next` for the connection. An error from the
+  callback rejects the token (the connection keeps its previous payload) and is sent to
+  the client; a token that cannot be decoded, or whose payload has expired (`Expirer`),
+  gives 401 `VTL-0004`. Without `WithTokenDecoder` it replies `"Ok"` and stores nothing.
+  The stored payload is available as `ctx.TokenPayload()` in later messages. See
+  [Security context and closing connections](#security-context-and-closing-connections).
 - `WithWsAuthFunc` is called for every message with the endpoint's `Perms`; WS endpoints
   with `Perms` require it. HTTP middleware does not run for WS messages.
 - Invalid `data` gives a 400 `VTL-0007` error message. If the `Inputer` input implements
@@ -872,6 +881,88 @@ mux.GET("/ws", wv.Upgrade) // the HTTP route that upgrades to WebSocket
   with the ID of a live one is closed at once with status 1008 (policy violation),
   without the callbacks; its messages are not served and it does not share the token
   payload of the live connection.
+
+### Security context and closing connections
+
+vatel does not know what an organization (tenant, workspace, ...) is: it gives the
+mechanism, the application compares the contexts. The recommended model is **one
+connection = one security context** (user + organization). A token of another context is
+not accepted on a live connection; the client opens a new connection with it.
+
+```go
+wv.OnTokenUpdate(func(_ uint64, prev, next vatel.AuthPayload) error {
+	if prev == nil {
+		return nil // the first token of the connection sets its context
+	}
+	p, n := prev.(*Claims), next.(*Claims)
+	switch {
+	case p.UserID != n.UserID:
+		return vatel.NewWsCloseError(vatel.WsStatusForbidden, "user changed", nil)
+	case p.OrgID != n.OrgID:
+		return vatel.NewWsCloseError(vatel.WsStatusContextChanged, "organization changed", nil)
+	}
+	return nil // a refresh of the same context
+})
+```
+
+- `OnTokenUpdate(f func(cid uint64, prev, next AuthPayload) error)` runs without a lock.
+  If another payload is stored for the connection while it runs (a concurrent
+  `UpdateAccessToken` for the same `cid`), or the connection closes, `UpdateAccessToken`
+  returns `ErrWsTokenConflict` (409, `VTL-0010`) and stores nothing; it does not retry,
+  as the callback need not be idempotent.
+- **`WsCloseError`** (`vatel.NewWsCloseError(code, reason, err)`, fields `Code`, `Reason`,
+  `Err`). When the handler of any WS message — including `updateAccessToken` (through
+  `OnTokenUpdate`) and the `WithWsAuthFunc` function — returns an error with a
+  `*WsCloseError` in its chain (`errors.As`), the client first gets the usual error reply
+  to that message, then the connection is closed with `Code` and `Reason`; its further
+  messages are not served. The reply is built from `Err` when it has an `*errors.Error`
+  with a status; otherwise from the code: 4001 → 401 `ErrUnauthorized`, 4003 → 403
+  `ErrForbidden`, 4009 → 409 `ErrWsContextChanged` (`VTL-0009`), any other code → 400. It
+  is logged and reported to metrics, never passed to the `Alarmer`. A rejected token is
+  not stored. An application that calls `wv.UpdateAccessToken` itself gets the error and
+  closes the connection with `CloseConn`.
+- `Reason` is sent in the close frame, which holds at most 123 bytes of text: vatel cuts
+  it on a UTF-8 character boundary (a longer text makes browsers drop the connection with
+  1006 and lose the code). It must not carry sensitive details: put them in `Err` (the log)
+  or the error reply.
+- `wv.CloseConn(cid, code, reason) bool` closes a live connection, e.g. when its user was
+  removed from the organization, logged out, or the token was revoked; it returns false
+  if there is no such connection (or it is already closing). Its further messages are not
+  served; `OnClose` is called once it has closed.
+- `wv.VisitConns(func(cid uint64, tp vatel.AuthPayload) bool)` walks the live connections
+  with their payloads (nil before the first token), by ID, until the callback returns
+  false. It runs on a snapshot without a lock, so the callback may call `CloseConn`, e.g.
+  to close every connection of a user in an organization.
+- **Token expiry.** A payload that implements `vatel.Expirer` (`ExpiresAt() time.Time`) with
+  a non-zero time closes its connection with 4001 when it expires. Each accepted
+  `updateAccessToken` restarts the timer, so the client sends a fresh token before the
+  current one expires. A payload that has already expired is rejected with 401 and the
+  connection keeps its previous payload.
+- **Authentication timeout.** `vatel.WithWsAuthTimeout(d)` closes a connection with 4001
+  if no token was accepted within `d` after it opened (a rejected token does not count).
+  Default 0: no limit. It has no effect without `WithTokenDecoder`.
+- Timers stop when the connection closes and on `Shutdown`.
+
+Close codes (vatel uses the first three; applications may add their own in 4000–4999):
+
+| Code | Constant | Client reaction |
+|---|---|---|
+| 4001 | `vatel.WsStatusAuthRequired` | refresh the token, reconnect, send it |
+| 4003 | `vatel.WsStatusForbidden` | do not reconnect (access denied or another user) |
+| 4009 | `vatel.WsStatusContextChanged` | get a token of the needed context (organization), reconnect with it, subscribe again |
+| 1001 | (`Shutdown`, "going away") | reconnect, possibly to another instance |
+
+**Organizations.** The organization of a message is taken **only** from the token payload
+of the connection (`ctx.TokenPayload()`), never from the message data. A subscription
+handler checks that the organization of the resource matches the organization of the
+token (the example reports a resource of another organization as not found, so its
+existence is not disclosed). The context belongs to the connection, not to the user:
+browser tabs working in different organizations use different connections.
+
+**Client contract.** Send the token (`updateAccessToken`) right after connecting, and a
+fresh one before it expires. To switch the organization, close the WebSocket yourself
+(1000), open a new one with a token of the new organization and subscribe again. React to
+the close codes as in the table above. A complete server is in [example/ws.go](example/ws.go).
 
 ## Other options
 

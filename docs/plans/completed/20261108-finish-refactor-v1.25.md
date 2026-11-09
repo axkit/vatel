@@ -163,6 +163,15 @@
   - явно: `Validate() error` входного типа теперь вызывается автоматически (v0.14 его не вызывал) — существующий метод `Validate()` начнёт останавливать запрос с 400.
 - ➕ после завершения плана (пункт бэклога `ws-onopen-onclose-panics-not-recovered`, перенесено в MIGRATION.md):
   - panic в колбэках WebSocket `OnOpen`/`OnClose` перехватывается: журнал (`panic`, `stack`, `callback`) и `Alarmer`; после panic в `OnOpen` соединение закрывается со статусом 1011, `OnClose` для него всё равно вызывается.
+- ➕ после завершения плана (WS-авторизация «вариант A»: одно соединение = один контекст безопасности, перенесено в MIGRATION.md):
+  - `OnTokenUpdate(func(cid uint64, prev, next AuthPayload) error)` — новая сигнатура (было `func(cid, tp)`): `prev` — сохранённый ранее payload (nil для первого токена). Колбэк вызывается без блокировки; если за это время payload соединения сменился (конкурентный `UpdateAccessToken`) или соединение закрылось — `ErrWsTokenConflict` (409, `VTL-0010`), ничего не сохраняется, повтора нет.
+  - `WsCloseError{Code, Reason, Err}` / `NewWsCloseError(code, reason, err)`: ошибка обработчика WS-сообщения (в том числе `updateAccessToken` через `OnTokenUpdate` и `WithWsAuthFunc`) с `*WsCloseError` в цепочке — сначала обычный ответ-ошибка, затем закрытие с `Code`/`Reason`; дальнейшие сообщения не обслуживаются. Ответ из `Err`, если там `*errors.Error` со статусом, иначе по коду: 4001 → 401, 4003 → 403, 4009 → 409 (`ErrWsContextChanged`, `VTL-0009`), прочие → 400; `Alarmer` не вызывается (panic — по-прежнему 500 с `Alarmer`). Константы `WsStatusAuthRequired` (4001), `WsStatusForbidden` (4003), `WsStatusContextChanged` (4009).
+  - `CloseConn(cid, code, reason) bool`, `VisitConns(func(cid, tp) bool)` (снимок, из колбэка можно вызывать `CloseConn`).
+  - причина в close-кадре, отправляемом vatel, обрезается до 123 байт по границе UTF-8 (невалидный UTF-8 выбрасывается).
+  - `Expirer` (`ExpiresAt() time.Time`) у payload: соединение закрывается с 4001 в момент истечения, каждый принятый `updateAccessToken` переносит таймер; уже истёкший payload — `ErrUnauthorized` (401) без закрытия, прежний payload остаётся.
+  - `WithWsAuthTimeout(d)`: соединение без принятого токена закрывается с 4001 через `d` (по умолчанию 0 — выключено; без `WithTokenDecoder` не действует).
+  - после panic в `OnOpen` сообщения, пришедшие до закрытия 1011, не обслуживаются.
+  - пример: `Claims.OrgID`, `Claims.ExpiresAt`, `WebsocketVatel` на `/ws` с политикой «тот же пользователь и организация» и подпиской `orders.watch`, проверяющей организацию заказа по токену.
 
 ## What Goes Where
 - **Implementation Steps**: код, тесты, документация в этом репозитории, коммиты на ветке `refactor`.

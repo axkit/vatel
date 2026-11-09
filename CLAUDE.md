@@ -22,7 +22,7 @@ go test -v ./auth/...
 
 # Run the example server (port 8080 may be taken on the dev machine)
 ADDR=:18080 go run ./example
-# Mint a dev token for it (HS256, key from JWT_SECRET, public dev key if unset)
+# Mint a dev token for it (HS256, key from JWT_SECRET, public dev key if unset; `token 2` = organization 2)
 TOKEN=$(go run ./example token); curl -H "Authorization: Bearer $TOKEN" localhost:18080/orders
 
 # Tidy dependencies
@@ -43,17 +43,20 @@ from `go.mod`. User docs: `README.md`; v0.14 → v1.25 changes: `MIGRATION.md`. 
 - `vatel.go` — `Vatel` (registry, `Option`s, `BuildHandlers`, `ListenAndServe`, `Shutdown`), DI interfaces.
 - `options.go` — `EndpointOption`s and builders `GET/POST/PUT/PATCH/DELETE/HEAD/OPTIONS/WS`, `Endpoints`.
 - `endpoint.go` — `Endpoint`, handler interfaces, request pipeline (`handler`, `buildHandler`), logging,
-  error responses, `compile`, `LogOption` bits, sentinel errors (`VTL-0001`..`VTL-0008`).
+  error responses, `compile`, `LogOption` bits, sentinel errors (`VTL-0001`..`VTL-0010`).
 - `decode.go` — path/query/body decoding with precomputed `fieldInfo`, `validate`, `Validator`.
 - `carriers.go` — generic carriers `PathParams`, `QueryParams`, `Body`, `Output`, `OptionalOutput`, `Upload`, `Func`.
 - `middleware.go` — `MiddlewarePos`, `EndpointMeta`.
 - `context.go` — `Context` interface and `VatelContext` (wraps `fasthttp.RequestCtx`, not exposed).
-- `ws_vatel.go`, `ws_context.go`, `ws_access_token_update.go` — WebSocket endpoints.
+- `ws_vatel.go`, `ws_context.go`, `ws_access_token_update.go` — WebSocket endpoints (`wsConns` table, `WsCloseError`,
+  close codes, `Expirer`, `CloseConn`/`VisitConns`).
 - `auth/` — JWT-style authentication/authorization middleware.
 - `jsonmask/` — masking of JSON by `mask` struct tags.
 - `vatel_c_toc.go` — `GET /` table of contents, registered automatically by `NewVatel`.
 - `example/` — runnable app: auth (HS256 JWT verified with the standard library, `JWT_SECRET`), carriers,
-  CORS, upload, graceful shutdown; its in-memory `OrderStore` is mutex-guarded (handlers run concurrently).
+  CORS, upload, graceful shutdown, WebSocket on `/ws` (`ws.go`: one user + organization per connection,
+  `orders.watch` checks the order's org against the token); its in-memory `OrderStore` is mutex-guarded
+  (handlers run concurrently).
 
 ### Core types
 
@@ -196,7 +199,7 @@ visited by `VisitUserValues`, so they are not logged.
 
 ### WebSocket
 
-`NewWebsocketVatel(WithLogger, WithTokenDecoder, WithWsAuthFunc)` + `vatel.WithWebsocketSupport(wv)`
+`NewWebsocketVatel(WithLogger, WithTokenDecoder, WithWsAuthFunc, WithWsWriteTimeout, WithWsAuthTimeout)` + `vatel.WithWebsocketSupport(wv)`
 (`WithLogger` replaces the `BuildHandlers` logger for WS endpoints); the
 app routes an HTTP path to `wv.Upgrade`. Messages are `{"path": ..., "data": ...}`; `vatel.WS(path, ctrl)`
 endpoints use `Inputer` (+ `Validator`)/`Resulter` (no middleware, no Paramer/Querier). WS `Perms` require `WithWsAuthFunc`.
@@ -210,6 +213,21 @@ context. `e.wsWriteErrorResponse` uses the HTTP `errorResponse` (status mapping,
 can block on a full queue); `closeAll` closes each connection in its own goroutine. `Vatel.Shutdown` waits
 (within ctx) for `wsConns.drained`; `WebsocketVatel.Shutdown` does not wait. A `TokenDecoder` returning
 `(nil, nil)` is a bad token (here and in `auth`).
+
+WS security context (one connection = one user + organization; vatel only gives the mechanism):
+`OnTokenUpdate(func(cid, prev, next AuthPayload) error)` runs without the lock; `UpdateAccessToken` reads
+`(entry, payload, ver)` with `wsConns.lookup`, calls it, then `storePayload` stores only if the entry pointer and
+`wsConn.ver` are unchanged, else `ErrWsTokenConflict` (409, VTL-0010, no retry). An already expired payload
+(`Expirer`) → `ErrUnauthorized`, nothing closed. A `*WsCloseError` in a message error chain (handler,
+`updateAccessToken`/`OnTokenUpdate`, `WithWsAuthFunc`): `wv.writeError` writes the reply first, then `closeLive`
+(the close frame is queued after it; closing earlier would drop the reply). Reply status from `Err`'s
+`*errors.Error`, else from the code (`wsReplyError`: 4001→401, 4003→403, 4009→409 `ErrWsContextChanged`
+VTL-0009, other→400); never alarmed (a panic is: `wsWriteError(..., alarm=true)`). Every server close marks the
+entry `closing` (`wsConn.startClose`: not served, timer stopped) and goes through `closeConn`, which cuts the
+reason to 123 bytes on a rune boundary. `CloseConn` closes in a goroutine; `VisitConns` iterates a snapshot
+(`wsConns.live`), so its callback may call `CloseConn`. One `time.AfterFunc` per entry (`armTimer`): auth
+timeout while `ver == 0` (`WithWsAuthTimeout`, only with a `TokenDecoder`), else the payload expiry; it fires
+only if the entry and `ver` are unchanged; stopped by `startClose`/`remove`/`closeAll`.
 
 ### DI interfaces (`vatel.go`)
 

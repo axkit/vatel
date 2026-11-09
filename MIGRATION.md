@@ -123,12 +123,16 @@ Per-endpoint middleware: `e.AddMiddleware(pos, f...)` inside an `EndpointOption`
 | v0.14 | v1.25 |
 |---|---|
 | WS `Perms` checked with the `Vatel` authorizer and permission manager | `vatel.WithWsAuthFunc(func(ctx, path, perms) error)`; required for WS endpoints with `Perms` |
-| token update callback without a setter | `wv.OnTokenUpdate(func(cid uint64, tp vatel.AuthPayload) error)` |
+| token update callback without a setter | `wv.OnTokenUpdate(func(cid uint64, prev, next vatel.AuthPayload) error)` |
 | `NewWebsocketVatel`, `WithTokenDecoder`, `OnOpen`, `OnClose`, `Upgrade`, `UpgradeWithID` | unchanged |
 | `WithLogger` (stored, but not used) | now used: WS endpoints log to it (`"layer":"ws"`); without it, to the logger passed to `BuildHandlers` |
 | `AuthMessageData` | deprecated, unused |
 | — | new: `wv.Shutdown()` (called by `v.Shutdown`) |
 | — | new: `vatel.WithWsWriteTimeout(d)`, `vatel.DefaultWsWriteTimeout` (10 s) |
+| — | new: `vatel.WsCloseError`, `vatel.NewWsCloseError(code, reason, err)`, close codes `vatel.WsStatusAuthRequired` (4001), `vatel.WsStatusForbidden` (4003), `vatel.WsStatusContextChanged` (4009) |
+| — | new: `wv.CloseConn(cid, code, reason) bool`, `wv.VisitConns(func(cid uint64, tp vatel.AuthPayload) bool)` |
+| — | new: `vatel.Expirer` (`ExpiresAt() time.Time`) on the token payload, `vatel.WithWsAuthTimeout(d)` |
+| — | new errors: `vatel.ErrWsContextChanged` (409, `VTL-0009`), `vatel.ErrWsTokenConflict` (409, `VTL-0010`) |
 
 ## 2. Behaviour changes
 
@@ -424,12 +428,42 @@ Per-endpoint middleware: `e.AddMiddleware(pos, f...)` inside an `EndpointOption`
   not served (before: it replaced the live connection in the registry and inherited its
   token payload, and its close unregistered the live connection). A token payload stored
   with `UpdateAccessToken` for an ID before its connection opens is still used.
-- New: `WebsocketVatel.OnTokenUpdate(f func(cid uint64, tp AuthPayload) error)` is called
-  from `UpdateAccessToken` after the token is decoded and before the payload is stored. An
-  error from `f` rejects the token: the payload is not stored (the connection keeps its
-  previous one) and the error is returned from `UpdateAccessToken` (and sent to the client
-  of the `updateAccessToken` endpoint). A token that cannot be decoded gives
-  `ErrUnauthorized` (401).
+- New: `WebsocketVatel.OnTokenUpdate(f func(cid uint64, prev, next AuthPayload) error)` is
+  called from `UpdateAccessToken` after the token is decoded and before the payload is
+  stored, with the payload stored so far (`prev`, nil for the first token of the
+  connection) and the new one (`next`). An error from `f` rejects the token: the payload is
+  not stored (the connection keeps its previous one) and the error is returned from
+  `UpdateAccessToken` (and sent to the client of the `updateAccessToken` endpoint). A token
+  that cannot be decoded gives `ErrUnauthorized` (401). `f` runs without a lock: if another
+  payload is stored for the connection meanwhile (a concurrent `UpdateAccessToken` for the
+  same ID), or it closes, `UpdateAccessToken` returns the new `ErrWsTokenConflict` (409,
+  `VTL-0010`) and stores nothing (no retry).
+- New: an error with a `*WsCloseError` in its chain returned by a WS message handler,
+  `OnTokenUpdate` (through `updateAccessToken`) or the `WithWsAuthFunc` function sends the
+  error reply to the message, then closes the connection with its `Code` and `Reason`;
+  later messages of the connection are not served. The reply comes from its `Err` if that
+  has an `*errors.Error` with a status, otherwise from the code (4001 → 401
+  `ErrUnauthorized`, 4003 → 403 `ErrForbidden`, 4009 → 409 the new `ErrWsContextChanged`,
+  `VTL-0009`, other → 400); it is never passed to the `Alarmer`. A panic is still a 500
+  and alarmed, whatever its value. Close codes are exported as `WsStatusAuthRequired`
+  (4001: refresh the token and reconnect), `WsStatusForbidden` (4003: do not reconnect) and
+  `WsStatusContextChanged` (4009: get a token of the needed context and reconnect).
+- New: `WebsocketVatel.CloseConn(cid, code, reason) bool` closes a live connection (false
+  if there is none, or it is already closing); `WebsocketVatel.VisitConns(f)` walks the live
+  connections with their payloads on a snapshot, so `f` may call `CloseConn`.
+- The reason of a close frame sent by vatel (`CloseConn`, `WsCloseError`, `Shutdown`, ...)
+  is cut to 123 bytes on a UTF-8 character boundary (invalid UTF-8 is dropped): the close
+  frame payload is at most 125 bytes. It must not carry sensitive details.
+- New: a token payload implementing `Expirer` (`ExpiresAt() time.Time`, non-zero) closes
+  its connection with 4001 when it expires; each accepted `updateAccessToken` restarts
+  the timer. Before, a connection stayed authorized after its token expired. A payload
+  that has already expired is rejected by `UpdateAccessToken` with `ErrUnauthorized`
+  (401); the connection keeps its previous payload. Payload types that already have an
+  `ExpiresAt() time.Time` method get this behaviour.
+- New: `WithWsAuthTimeout(d)` closes a connection without an accepted token `d` after it
+  opened with 4001; default 0 (no limit), no effect without `WithTokenDecoder`.
+- After a panic in the `OnOpen` callback, the messages the client sent before the 1011
+  close are not served.
 
 ### Metrics
 
@@ -497,5 +531,11 @@ written against it may need these changes:
   field).
 - `ListenAndServe` after a failed `BuildHandlers` returns "previous build failed" (v1.24.2
   started the server with part of the routes).
+- The WebSocket token callback: v1.24.2 had no setter for it (an unexported
+  `func(cid uint64, tp TokenPayloader) error` whose error was ignored, and `UpdateAccessToken`
+  returned the decoder error without a status). Use
+  `wv.OnTokenUpdate(func(cid uint64, prev, next vatel.AuthPayload) error)`: `prev` is the
+  payload stored before (nil for the first token), an error rejects the token, a
+  `*WsCloseError` also closes the connection; see section 2.
 - Go 1.26, fasthttp v1.77.0 and fasthttp/router v1.5.4 are required (v1.24.2: Go 1.24,
   fasthttp v1.31.0, router v1.4.4).
