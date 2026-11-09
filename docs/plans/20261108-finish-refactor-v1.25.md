@@ -15,7 +15,7 @@
 - Авторизация: `auth/auth.go` (+ `auth/auth_test.go` через настоящий router).
 - Маскирование: `jsonmask/jsonmask.go` — `mask:"-"` удаляет поле, `mask:"<name>"` применяет функцию из `AddFunc`. Известные дефекты (ревью): panic на не-структурах и nil, переполнение стека на рекурсивных типах, не заходит в `*Struct`/`[]*Struct`, игнорирует тег на полях-структурах (`time.Time`), вставляет отсутствующие поля, незарегистрированное имя оставляет значение открытым.
 - fasthttp/router кладёт path-параметры в user values `fctx`; `logEnter`/`logExit`/`writeErrorResponse` пишут все user values в журнал через `VisitUserValues`.
-- fasthttp v1.31.0: тело ответа на HEAD отбрасывает только `Server.serveConn`; `RequestCtx.Done()` = `s.done`.
+- fasthttp v1.31.0 (версия на момент плана; с итерации 3 ревью фазы 1 — v1.77.0, см. «Для MIGRATION.md»): тело ответа на HEAD отбрасывает только `Server.serveConn`; `RequestCtx.Done()` = `s.done`.
 - router v1.4.4: `GlobalOPTIONS` вызывается только для зарегистрированных путей, неизвестный путь — 404.
 - Тесты: `handler_test.go`, `endpoint_test.go`, `carriers_test.go`, `custom_claims_test.go`, `testutil_test.go`, `auth/auth_test.go`. Базовое покрытие (2026-11-09, до Task 2): `vatel` 54.5%, `auth` 85.5%, `jsonmask` 92.5%.
 - Пример: `example/` (порт 8080 на машине разработчика занят `rnp-serve`).
@@ -73,7 +73,7 @@
 **Релиз.** bitset v1.0.4 вместо `replace`; `retract v1.24.2`; README, MIGRATION.md, CLAUDE.md.
 
 ## Technical Details
-- `Endpoint`: поля `OptionalBody bool`, `Timeout time.Duration`; внутренние `pathParamKeys []string`, `querierFields []fieldInfo`, `queryMaskFields jsonmask.Fields`, `isQuerier bool`.
+- `Endpoint`: поля `OptionalBody bool`, `Timeout time.Duration`; внутренние `pathParamKeys []string`, `querierFields []fieldInfo`, `querierMaskFields jsonmask.Fields`, `isQuerier bool`.
   - ➕ отклонение: полей `inputHasMask`, `resultHasMask`, `queryHasMask` нет — их заменяет `jsonmask.Fields.HasRules()` на предвычисленных правилах.
   - ➕ ревью фазы 1: копии настроек `Vatel` в `Endpoint` (`baseCtx`, `verboseError`, `logRequestID`, `clientErrorFields`, `staticLoggingLevel`, `ala`, `mr`) заменены указателем `e.v *Vatel`; `resultPrototyper` убран — правила результата неизвестного при компиляции типа строятся по типу и кэшируются (`resultFieldsByType`).
 - ➕ `Vatel`: `mu`, `srv`, `ln`, `served`, `closed`, `conns` (учёт соединений, `conntrack.go`; заменил счётчик `inflight`); `DefaultIdleTimeout`, `ErrServerClosed`, `WithServerConfig`; внутренний `serve(ln, mux)` для тестов на in-memory listener.
@@ -125,12 +125,19 @@
   - auth: nil `Decoder` и ошибка `RevokeCheck` → 500 `VTL-0005` на защищённых эндпоинтах; `Disabled` задаётся до начала обслуживания (гонка данных при изменении во время работы).
   - метрики: размер ответа HEAD — 0.
 - ➕ ревью фазы 1, итерация 2:
-  - `Shutdown` ждёт и запросы, которые ещё принимаются (заголовки или тело читаются): соединение считается занятым с первого прочитанного байта запроса до `StateIdle` fasthttp; простаивающие keep-alive соединения закрываются, новое соединение без единого байта получает 5 с (как в net/http); пользовательский `ConnState` из `WithServerConfig` вызывается после хука vatel.
+  - `Shutdown` ждёт и запросы, которые ещё принимаются (заголовки или тело читаются): соединение считается занятым с первого прочитанного байта запроса до `StateIdle` fasthttp; простаивающие keep-alive соединения закрываются, новое соединение без единого байта получает 5 с (как в net/http); пользовательский `ConnState` из `WithServerConfig` вызывается после хука vatel (заменено итерацией 3: собственный учёт соединений удалён, vatel не ставит хук `ConnState`).
   - ошибка разбора тела (и WS `data`) типа с тегами `mask` не оборачивает ошибку `encoding/json` (она может цитировать значение); в ошибке только поля `field`, `type`, `offset`.
   - `BuildHandlers`: `Param()`, `QueryInput()` и `Input()` на GET/DELETE/HEAD/OPTIONS, возвращающие не указатель на структуру, — ошибка вместо panic; вложенная структура уже обходимого типа (цикл) пропускается.
   - `vatel.Func` допускается на пути с `{params}` (читает их через `ctx.PathValue`); `*date.Date` в path/query-параметрах больше не вызывает panic.
 - ➕ ревью фазы 1, итерация 3:
   - модуль: минимальные версии — Go 1.26, `github.com/valyala/fasthttp` v1.77.0 (было v1.31.0), `github.com/fasthttp/router` v1.5.4 (было v1.4.4); зависимые проекты получают их через MVS при обновлении vatel. `Shutdown` построен на `ShutdownWithContext` fasthttp: новое соединение без запроса — около 5 с; запрос, переживший дедлайн и 1 с ожидания, не прерывается, его соединение закрывается после ответа; конкурентные `Shutdown` ждут каждый со своим `ctx`; `WithServerConfig` — любые поля, кроме `Handler` (в том числе `MaxConnsPerIP`, `ConnState`).
+- ➕ ревью фазы 2 (перенесено в MIGRATION.md):
+  - ошибка `Validate()` → `ErrValidationFailed` (400, `VTL-0006`), обёртывающая её; собственный код возвращённой `*errors.Error` заменяет `VTL-0006`, её поля сохраняются (раньше простая ошибка давала 400 без кода).
+  - `Upload.BindFile`: нет multipart-формы или поля с файлом → `ErrInvalidRequestBody` (400, `VTL-0007`) с полем `field` (раньше — сырая ошибка fasthttp, т. е. 500 и `Alarm`).
+  - WS: ошибки конверта сообщения кодированы и пишутся в журнал (`"method":"WS"`, запрошенный `path`), метрика не отправляется: не JSON → `VTL-0007` «ws message is not valid JSON», нет `path` → `VTL-0007` «ws message has no path», неизвестный `path` → новый `ErrUnknownPath` (404, `VTL-0008`); раньше — 400 «bad request» / 404 «unknown path» без кода и без журнала.
+  - WS: соединение, открытое после `Shutdown`, сразу закрывается со статусом «going away», без `OnOpen`/`OnClose`.
+  - метрики: размер успешного WS-сообщения — размер ответа (было 0).
+  - тексты ошибок сборки в одном виде «endpoint <METHOD> <path>: <причина>» (в том числе «endpoint WS <path>: already registered» вместо «WS endpoint <path>: already registered»).
 
 ## What Goes Where
 - **Implementation Steps**: код, тесты, документация в этом репозитории, коммиты на ветке `refactor`.
