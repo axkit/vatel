@@ -198,4 +198,6 @@ context. `e.wsWriteErrorResponse` uses the HTTP `errorResponse` (status mapping,
   tests use `v.serve` on a real TCP listener (`startServer`; `startServerOn` also runs a `fasthttputil`
   in-memory one) in `shutdown_test.go` — fasthttp wraps only TCP connections for `MaxConnsPerIP`; WS end-to-end tests use a
   websocket client over it (`ws_integration_test.go`). Auth is tested only through the real `auth` package.
+  Tests are grouped by area, not by origin: pipeline in `handler_test.go`, logging/masking in `logging_test.go`,
+  decoding/compile/BuildHandlers in `endpoint_test.go`, WS in `ws_vatel_test.go`.
 - Every behaviour change visible to users goes into `MIGRATION.md`.

@@ -46,11 +46,6 @@ func (c *uuidClaims) Roles() []string { return c.roles }
 
 // ── Shared token decoder helpers ──────────────────────────────────────────────
 
-type claimsTokener struct{ payload vatel.AuthPayload }
-
-func (t *claimsTokener) SystemPayload() map[string]any         { return nil }
-func (t *claimsTokener) ApplicationPayload() vatel.AuthPayload { return t.payload }
-
 const claimsToken = "test-token"
 
 // claimsDecoder stands in for a real JWT decoder: it returns payload for
@@ -63,7 +58,7 @@ func (d *claimsDecoder) Decode(at []byte) (vatel.Tokener, error) {
 	if !ok || string(tok) != claimsToken {
 		return nil, errors.New("invalid token")
 	}
-	return &claimsTokener{payload: d.payload}, nil
+	return &tokener{p: d.payload}, nil
 }
 
 // newClaimsServer serves h at path behind cfg.Middleware, adding opts to the

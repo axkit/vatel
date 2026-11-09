@@ -32,12 +32,14 @@ func (m *mockDecoder) Decode([]byte) (Tokener, error) { return m.token, m.err }
 type mockMetrics struct {
 	lastMethod string
 	lastStatus int
+	lastSize   int
 	callCount  int
 }
 
-func (m *mockMetrics) ReportMetric(method, path string, statusCode int, _ float64, _ int) {
+func (m *mockMetrics) ReportMetric(method, path string, statusCode int, _ float64, size int) {
 	m.lastMethod = method
 	m.lastStatus = statusCode
+	m.lastSize = size
 	m.callCount++
 }
 
@@ -128,16 +130,6 @@ func (h *tokenHandler) Handle(ctx Context) error {
 func discardLogger() *zerolog.Logger {
 	l := zerolog.New(io.Discard)
 	return &l
-}
-
-// compileAndRun compiles e against v, then invokes the resulting handler on fctx.
-// Returns the handler function for callers that need it.
-func compileAndRun(v *Vatel, e *Endpoint, fctx *fasthttp.RequestCtx) {
-	if err := e.compile(v); err != nil {
-		panic("compile: " + err.Error())
-	}
-	l := discardLogger()
-	e.handler(l)(fctx)
 }
 
 // newGETCtx returns a fasthttp RequestCtx pre-configured for a GET request.

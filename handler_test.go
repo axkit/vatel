@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/axkit/date"
 	"github.com/axkit/errors"
 	"github.com/axkit/vatel/jsonmask"
 	"github.com/fasthttp/router"
@@ -1962,7 +1963,7 @@ func TestHandler_NotSilent_4xxLogged(t *testing.T) {
 	}
 }
 
-// ── acceptance: Gostly issues ────────────────────────────────────────────────
+// ── body decode errors and middleware order ──────────────────────────────────
 
 // failingUnmarshal is a field type whose own UnmarshalJSON rejects the value;
 // the error text has a quote and a backslash to check JSON escaping.
@@ -2086,5 +2087,312 @@ func TestMiddleware_SeesEndpointMeta(t *testing.T) {
 		if m.Method != "GET" || m.Path != "/api/items/{id}" || len(m.Perms) != 1 || m.Perms[0] != "items:read" {
 			t.Errorf("call %d: meta = %+v, want GET /api/items/{id} [items:read]", i, m)
 		}
+	}
+}
+
+// ── OnSuccessResponse error ──────────────────────────────────────────────────
+
+func TestHandler_OnSuccessResponse_ErrorIgnored(t *testing.T) {
+	v := NewVatel()
+	var second, onError bool
+	v.AddMiddleware(OnSuccessResponse,
+		func(Context, EndpointMeta) error { return fmt.Errorf("boom") },
+		func(Context, EndpointMeta) error { second = true; return nil },
+	)
+	v.AddMiddleware(OnErrorResponse, func(Context, EndpointMeta) error { onError = true; return nil })
+	mr := &mockMetrics{}
+	ala := &mockAlarmer{}
+	v.cfg.mr, v.cfg.ala = mr, ala
+
+	var buf bytes.Buffer
+	fctx := newGETCtx("/items")
+	runLogged(t, v, GET("/items", func() Handler { return &resultHandler{} }, WithLogOption(LogExit)), fctx, &buf)
+
+	if got := responseStatus(fctx); got != 200 {
+		t.Errorf("status = %d, want 200", got)
+	}
+	if got := string(fctx.Response.Body()); got != `{"message":"hello"}` {
+		t.Errorf("body = %s, want the success body only", got)
+	}
+	if !second {
+		t.Error("later OnSuccessResponse middleware was skipped")
+	}
+	if onError {
+		t.Error("OnErrorResponse must not run")
+	}
+	if mr.callCount != 1 || mr.lastStatus != 200 {
+		t.Errorf("metrics = %d calls, last status %d; want 1 call with 200", mr.callCount, mr.lastStatus)
+	}
+	if ala.alarmed {
+		t.Error("Alarm must not fire")
+	}
+	if strings.Contains(buf.String(), "request failed") {
+		t.Errorf("error logged: %s", buf.String())
+	}
+}
+
+// ── error text disclosure ────────────────────────────────────────────────────
+
+func TestHandler_PlainErrorText_HiddenFromClient(t *testing.T) {
+	cases := []struct {
+		name       string
+		err        error
+		wantStatus int
+		wantCode   string
+	}{
+		{"plain error", stderrors.New("pq: password authentication failed for user SECRET"), 500, "VTL-0005"},
+		{"fmt wrapper of plain error", fmt.Errorf("db: %w", stderrors.New("SECRET dsn")), 500, "VTL-0005"},
+		{"context canceled", fmt.Errorf("query SECRET: %w", context.Canceled), 503, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			fctx := newGETCtx("/items")
+			runLogged(t, NewVatel(), GET("/items", func() Handler { return &plainHandler{retErr: tc.err} }), fctx, &buf)
+
+			if got := responseStatus(fctx); got != tc.wantStatus {
+				t.Errorf("status = %d, want %d", got, tc.wantStatus)
+			}
+			body := string(fctx.Response.Body())
+			if strings.Contains(body, "SECRET") {
+				t.Errorf("internal error text sent to client: %s", body)
+			}
+			if tc.wantCode != "" && !strings.Contains(body, tc.wantCode) {
+				t.Errorf("body = %s, want code %s", body, tc.wantCode)
+			}
+			if !strings.Contains(buf.String(), "SECRET") {
+				t.Errorf("the original error must stay in the log: %s", buf.String())
+			}
+		})
+	}
+}
+
+func TestHandler_PlainErrorText_VerboseShown(t *testing.T) {
+	fctx := newGETCtx("/items")
+	run(NewVatel(WithVerboseError(true)), GET("/items", func() Handler {
+		return &plainHandler{retErr: stderrors.New("detail for developers")}
+	}), fctx)
+
+	if !strings.Contains(string(fctx.Response.Body()), "detail for developers") {
+		t.Errorf("verbose response should carry the error text: %s", fctx.Response.Body())
+	}
+}
+
+func TestHandler_WrappedVatelError_KeepsStatus(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want int
+	}{
+		{"fmt wrapper of *errors.Error", fmt.Errorf("check: %w", ErrForbidden.New()), 403},
+		{"template returned as is", ErrUnauthorized, 401},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fctx := newGETCtx("/items")
+			run(NewVatel(), GET("/items", func() Handler { return &plainHandler{retErr: tc.err} }), fctx)
+
+			if got := responseStatus(fctx); got != tc.want {
+				t.Errorf("status = %d, want %d: %s", got, tc.want, fctx.Response.Body())
+			}
+			if strings.Contains(string(fctx.Response.Body()), "check:") {
+				t.Errorf("wrapper text sent to client: %s", fctx.Response.Body())
+			}
+		})
+	}
+}
+
+// ── pipeline branches ────────────────────────────────────────────────────────
+
+func TestHandler_QueryParams_InvalidValue(t *testing.T) {
+	called := false
+	fctx := newGETCtx("/q?page=abc")
+	run(NewVatel(), GET("/q", func() Handler { return &countingQueryHandler{called: &called} }), fctx)
+	if got := responseStatus(fctx); got != 400 || called {
+		t.Errorf("status = %d, handler called = %v; want 400 and not called", got, called)
+	}
+}
+
+func TestHandler_ErrorWithoutStatus_500(t *testing.T) {
+	fctx := newGETCtx("/items")
+	run(NewVatel(), GET("/items", func() Handler {
+		return &plainHandler{retErr: errors.Wrap(fmt.Errorf("x"), "y")}
+	}), fctx)
+	if got := responseStatus(fctx); got != 500 {
+		t.Errorf("status = %d, want 500", got)
+	}
+}
+
+func TestHandler_OnHandleError(t *testing.T) {
+	v := NewVatel()
+	v.AddMiddleware(OnHandle, func(Context, EndpointMeta) error { return ErrForbidden.New() })
+	h := &plainHandler{}
+	fctx := newGETCtx("/items")
+	run(v, GET("/items", func() Handler { return h }), fctx)
+	if got := responseStatus(fctx); got != 403 || h.called {
+		t.Errorf("status = %d, handler called = %v; want 403 and not called", got, h.called)
+	}
+}
+
+func TestHandler_OnErrorResponse_MetaAtEveryPosition(t *testing.T) {
+	fail := func(Context, EndpointMeta) error { return ErrForbidden.New() }
+	cases := []struct {
+		name  string
+		setup func(v *Vatel) []EndpointOption
+		ctrl  func() Handler
+	}{
+		{"OnRequest", func(v *Vatel) []EndpointOption { v.AddMiddleware(OnRequest, fail); return nil }, nil},
+		{"OnAuthentication", func(v *Vatel) []EndpointOption { v.AddMiddleware(OnAuthentication, fail); return nil }, nil},
+		{"OnHandle", func(v *Vatel) []EndpointOption { v.AddMiddleware(OnHandle, fail); return nil }, nil},
+		{"handler", func(*Vatel) []EndpointOption { return nil }, func() Handler { return &plainHandler{retErr: ErrForbidden.New()} }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			v := NewVatel()
+			opts := tc.setup(v)
+			var global, local EndpointMeta
+			v.AddMiddleware(OnErrorResponse, func(_ Context, m EndpointMeta) error { global = m; return nil })
+			opts = append(opts, func(e *Endpoint) {
+				e.AddMiddleware(OnErrorResponse, func(_ Context, m EndpointMeta) error { local = m; return nil })
+			})
+			ctrl := tc.ctrl
+			if ctrl == nil {
+				ctrl = func() Handler { return &plainHandler{} }
+			}
+			fctx := newGETCtx("/items")
+			run(v, GET("/items", ctrl, opts...), fctx)
+			if got := responseStatus(fctx); got != 403 {
+				t.Fatalf("status = %d, want 403", got)
+			}
+			for name, m := range map[string]EndpointMeta{"global": global, "per-endpoint": local} {
+				if m.Method != "GET" || m.Path != "/items" {
+					t.Errorf("%s OnErrorResponse meta = %+v, want GET /items", name, m)
+				}
+			}
+		})
+	}
+}
+
+func TestHandler_CompressRoute(t *testing.T) {
+	v := NewVatel()
+	v.Add(Endpoints{GET("/big", func() Handler { return &bigResultHandler{} }, WithCompress())})
+	mux := router.New()
+	l := zerolog.Nop()
+	if err := v.BuildHandlers(mux, &l); err != nil {
+		t.Fatal(err)
+	}
+	fctx := newGETCtx("/big")
+	fctx.Request.Header.Set("Accept-Encoding", "gzip")
+	mux.Handler(fctx)
+	if got := string(fctx.Response.Header.Peek("Content-Encoding")); got != "gzip" {
+		t.Errorf("Content-Encoding = %q, want gzip", got)
+	}
+}
+
+type bigResultHandler struct{ Output[string] }
+
+func (h *bigResultHandler) Handle(Context) error {
+	h.Out = strings.Repeat("compressible ", 200)
+	return nil
+}
+
+func TestLog_SkippedOptionalBody_NotLogged(t *testing.T) {
+	var buf bytes.Buffer
+	fctx := newPOSTCtx("/items", nil)
+	runLogged(t, NewVatel(), POST("/items", func() Handler { return &secretBodyHandler{} },
+		WithOptionalBody(), WithLogOption(LogExit|LogReqBody|LogReqInput)), fctx, &buf)
+
+	m := lastLogLine(t, &buf)
+	for _, key := range []string{"requestBody", "reqInput", "requestBodyLoggingFailed"} {
+		if _, ok := m[key]; ok {
+			t.Errorf("%s logged for a skipped optional body: %s", key, buf.String())
+		}
+	}
+}
+
+func TestHandler_HEADMetricSizeZero(t *testing.T) {
+	mr := &mockMetrics{lastSize: -1}
+	fctx := &fasthttp.RequestCtx{}
+	fctx.Request.Header.SetMethod("HEAD")
+	fctx.Request.SetRequestURI("/items")
+	run(NewVatel(WithMetricReporter(mr)), HEAD("/items", func() Handler { return &resultHandler{} }), fctx)
+	if mr.lastSize != 0 {
+		t.Errorf("HEAD metric size = %d, want 0", mr.lastSize)
+	}
+}
+
+type countingQueryHandler struct {
+	QueryParams[struct {
+		Page int `param:"page"`
+	}]
+	called *bool
+}
+
+func (c *countingQueryHandler) Handle(Context) error { *c.called = true; return nil }
+
+// ── *date.Date path and query params ─────────────────────────────────────────
+
+type ptrDateQueryHandler struct {
+	QueryParams[struct {
+		From *date.Date `param:"from"`
+	}]
+	got *date.Date
+}
+
+func (h *ptrDateQueryHandler) Handle(Context) error { h.got = h.Query.From; return nil }
+
+type ptrDatePathHandler struct {
+	PathParams[struct {
+		Day *date.Date `param:"day"`
+	}]
+	got *date.Date
+}
+
+func (h *ptrDatePathHandler) Handle(Context) error { h.got = h.Params.Day; return nil }
+
+func TestHandler_PtrDateParams(t *testing.T) {
+	want, err := date.Parse("2024-01-02")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	qh := &ptrDateQueryHandler{}
+	fctx, _, _ := serveLogged(t, NewVatel(), Endpoints{
+		GET("/q", func() Handler { return qh }, WithLogOption(LogExit)),
+	}, "GET", "/q?from=2024-01-02")
+	if got := responseStatus(fctx); got != 200 {
+		t.Fatalf("query: status = %d, want 200: %s", got, fctx.Response.Body())
+	}
+	if qh.got == nil || *qh.got != want {
+		t.Errorf("query: From = %v, want %v", qh.got, want)
+	}
+
+	ph := &ptrDatePathHandler{}
+	fctx, _, _ = serveLogged(t, NewVatel(), Endpoints{
+		GET("/p/{day}", func() Handler { return ph }, WithLogOption(LogExit)),
+	}, "GET", "/p/2024-01-02")
+	if got := responseStatus(fctx); got != 200 {
+		t.Fatalf("path: status = %d, want 200: %s", got, fctx.Response.Body())
+	}
+	if ph.got == nil || *ph.got != want {
+		t.Errorf("path: Day = %v, want %v", ph.got, want)
+	}
+}
+
+// ── Func on a parametrized path ──────────────────────────────────────────────
+
+func TestFunc_PathParams(t *testing.T) {
+	var id string
+	fctx, _, _ := serveLogged(t, NewVatel(), Endpoints{
+		DELETE("/orders/{id}", Func(func(ctx Context) error {
+			id = ctx.PathValue("id")
+			return nil
+		}), WithLogOption(LogExit)),
+	}, "DELETE", "/orders/42")
+	if got := responseStatus(fctx); got != 200 {
+		t.Fatalf("status = %d, want 200: %s", got, fctx.Response.Body())
+	}
+	if id != "42" {
+		t.Errorf("PathValue(id) = %q, want 42", id)
 	}
 }

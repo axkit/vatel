@@ -9,6 +9,7 @@ import (
 
 	"github.com/axkit/date"
 	"github.com/axkit/errors"
+	"github.com/fasthttp/router"
 	"github.com/rs/zerolog"
 	"github.com/valyala/fasthttp"
 )
@@ -469,4 +470,125 @@ func mustFields(t *testing.T, in any) []fieldInfo {
 		t.Fatal(err)
 	}
 	return fields
+}
+
+// ── BuildHandlers: router panics become errors ───────────────────────────────
+
+func TestBuildHandlers_RouterConflicts_ReturnError(t *testing.T) {
+	cases := []struct {
+		name string
+		eps  Endpoints
+	}{
+		{"path without leading slash", Endpoints{GET("orders", Func(func(Context) error { return nil }))}},
+		{"duplicate route", Endpoints{
+			GET("/a", Func(func(Context) error { return nil })),
+			GET("/a", Func(func(Context) error { return nil })),
+		}},
+		{"own GET /", Endpoints{GET("/", Func(func(Context) error { return nil }))}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			v := NewVatel()
+			v.Add(tc.eps)
+			mux := router.New()
+			l := zerolog.Nop()
+
+			var err error
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						t.Fatalf("BuildHandlers panicked: %v", r)
+					}
+				}()
+				err = v.BuildHandlers(mux, &l)
+			}()
+			if err == nil {
+				t.Fatal("BuildHandlers: want an error")
+			}
+			if err2 := v.BuildHandlers(mux, &l); err2 == nil || !strings.Contains(err2.Error(), "previous build failed") {
+				t.Errorf("second BuildHandlers = %v, want 'previous build failed'", err2)
+			}
+		})
+	}
+}
+
+// ── BuildHandlers: unsupported param and query input types ──────────────────
+
+type mapQueryHandler struct {
+	QueryParams[map[string]string]
+}
+
+func (h *mapQueryHandler) Handle(Context) error { return nil }
+
+type mapGetInputHandler struct {
+	Body[map[string]string]
+}
+
+func (h *mapGetInputHandler) Handle(Context) error { return nil }
+
+type intParamHandler struct{ id int }
+
+func (h *intParamHandler) Param() any           { return &h.id }
+func (h *intParamHandler) Handle(Context) error { return nil }
+
+type nilParamHandler struct{}
+
+func (h *nilParamHandler) Param() any           { return nil }
+func (h *nilParamHandler) Handle(Context) error { return nil }
+
+func TestBuildHandlers_NonStructParamInput_ReturnsError(t *testing.T) {
+	cases := map[string]Endpoint{
+		"QueryParams of a map": GET("/q", func() Handler { return &mapQueryHandler{} }),
+		"GET Body of a map":    GET("/q", func() Handler { return &mapGetInputHandler{} }),
+		"Param of an int":      GET("/p/{id}", func() Handler { return &intParamHandler{} }),
+		"nil Param":            GET("/p/{id}", func() Handler { return &nilParamHandler{} }),
+	}
+	for name, e := range cases {
+		t.Run(name, func(t *testing.T) {
+			v := NewVatel()
+			v.Add(Endpoints{e})
+			var err error
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						t.Fatalf("BuildHandlers panicked: %v", r)
+					}
+				}()
+				err = v.BuildHandlers(router.New(), discardLogger())
+			}()
+			if err == nil {
+				t.Fatal("BuildHandlers = nil, want an error")
+			}
+			if !strings.Contains(err.Error(), "struct") {
+				t.Errorf("error = %v, want it to name the struct requirement", err)
+			}
+		})
+	}
+}
+
+type cyclicFilter struct {
+	Name   string        `param:"name"`
+	Parent *cyclicFilter // ignored: a cycle
+	Range  struct {
+		Min int `param:"min"`
+	}
+}
+
+type cyclicQueryHandler struct {
+	QueryParams[cyclicFilter]
+}
+
+func (h *cyclicQueryHandler) Handle(Context) error { return nil }
+
+func TestBuildHandlers_CyclicQueryType(t *testing.T) {
+	h := &cyclicQueryHandler{}
+	fctx, _, _ := serveLogged(t, NewVatel(), Endpoints{
+		GET("/q", func() Handler { return h }, WithLogOption(LogExit)),
+	}, "GET", "/q?name=a&min=3")
+	if got := responseStatus(fctx); got != 200 {
+		t.Fatalf("status = %d, want 200: %s", got, fctx.Response.Body())
+	}
+	if h.Query.Name != "a" || h.Query.Range.Min != 3 || h.Query.Parent != nil {
+		t.Errorf("query = %+v, want name a, min 3 and no parent", h.Query)
+	}
 }
