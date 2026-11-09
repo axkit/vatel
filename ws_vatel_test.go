@@ -296,7 +296,7 @@ func TestWsConns_SetGetRemove(t *testing.T) {
 	if err := cs.add(c, nil); err != nil {
 		t.Fatalf("add: %v", err)
 	}
-	if got, _, ok := cs.serving(c); !ok || got != AuthPayload(tp) {
+	if got, ok := cs.serving(c); !ok || got != AuthPayload(tp) {
 		t.Fatalf("serving after add = %v, %v", got, ok)
 	}
 	if err := cs.add(&websocket.Conn{}, nil); err != errWsDuplicateID {

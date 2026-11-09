@@ -13,7 +13,8 @@ go get github.com/axkit/vatel@latest
 ```
 
 Requires Go 1.26, [fasthttp](https://github.com/valyala/fasthttp) v1.77.0+ and
-[fasthttp/router](https://github.com/fasthttp/router) v1.5.4+ (Go modules raise them in your
+[fasthttp/router](https://github.com/fasthttp/router) v1.5.4+ and, for WebSocket,
+[regorov/websocket](https://github.com/regorov/websocket) v0.1.4+ (Go modules raise them in your
 project automatically). Errors are built with [github.com/axkit/errors](https://github.com/axkit/errors) v1.1.0+.
 Upgrading from v0.14? See [MIGRATION.md](MIGRATION.md).
 
@@ -831,7 +832,14 @@ mux.GET("/ws", wv.Upgrade) // the HTTP route that upgrades to WebSocket
   one second (`OnClose` gets a nil error). A connection opened after that is closed at
   once, without the callbacks. `wv.Shutdown()` alone does not wait.
 - A write to `ctx.BodyWriter()` after the connection is closed (by `Shutdown` or the
-  client) returns an error instead of blocking.
+  client) returns `websocket.ErrConnClosed` instead of blocking. A write to a client that
+  does not read blocks once the outbound queue (128 frames) is full; after the write
+  timeout of a frame, `vatel.WithWsWriteTimeout(d)` (default `vatel.DefaultWsWriteTimeout`,
+  10 s; 0 means no limit), the write fails and the connection ends.
+- A message larger than 1 MB (the `MaxPayloadSize` of `github.com/regorov/websocket`), also
+  when assembled from fragments, closes the connection with status 1009 (message too big).
+  `OnClose` gets the client's close status as a `websocket.Error` when the client closed
+  the connection.
 - A panic in a WS handler is recovered (see [Panics](#panics)): the client gets a 500
   `VTL-0005` error frame and the connection keeps serving messages.
 - `UpgradeWithID(ctx, id)`: the ID must be unique among live connections. A connection

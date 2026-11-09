@@ -7,7 +7,6 @@ import (
 	"io"
 	"net"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/axkit/errors"
@@ -30,7 +29,6 @@ type wsConns struct {
 type wsConn struct {
 	conn      *websocket.Conn // nil when a payload is set for an unknown connection
 	nc        net.Conn        // the network connection of conn
-	w         *wsWriter       // the writer of conn
 	tp        AuthPayload
 	goingAway bool // closed by closeAll: its messages are not served
 }
@@ -38,37 +36,16 @@ type wsConn struct {
 var (
 	errWsShutdown    = stderrors.New("server shutdown")
 	errWsDuplicateID = stderrors.New("duplicate connection id")
-	errWsClosed      = stderrors.New("websocket connection closed")
 )
 
-// wsWriter writes text frames to a WebSocket connection until the connection
-// is closed. The writer goroutine of the websocket library stops after it has
-// sent a close frame, and a write blocks forever once the outbound queue of a
-// stopped writer is full, so a write after the close fails with errWsClosed
-// instead.
-type wsWriter struct {
-	c      *websocket.Conn
-	closed atomic.Bool
-}
-
-// Write sends p as a text frame. It blocks while the outbound queue of the
-// connection is full.
-func (w *wsWriter) Write(p []byte) (int, error) {
-	if w.closed.Load() {
-		return 0, errWsClosed
-	}
-	return w.c.Write(p)
-}
-
-// close makes further writes fail. It reports whether w was open.
-func (w *wsWriter) close() bool {
-	return !w.closed.Swap(true)
-}
-
-// wsCloseTimeout is how long a connection closed by the server waits for the
-// client to answer the close frame (and for a stalled write) before its
-// network reads and writes fail.
+// wsCloseTimeout is how long a write stalled on a client that does not read
+// may hold up a connection closed by the server: its network reads and writes
+// fail after it.
 const wsCloseTimeout = time.Second
+
+// DefaultWsWriteTimeout is the default write timeout of a WebSocket frame (see
+// WithWsWriteTimeout).
+const DefaultWsWriteTimeout = 10 * time.Second
 
 func newWsConns() wsConns {
 	return wsConns{conns: make(map[uint64]*wsConn), drained: make(chan struct{})}
@@ -87,11 +64,11 @@ func (cs *wsConns) add(c *websocket.Conn, nc net.Conn) error {
 	wc, ok := cs.conns[c.ID()]
 	switch {
 	case !ok:
-		cs.conns[c.ID()] = &wsConn{conn: c, nc: nc, w: &wsWriter{c: c}}
+		cs.conns[c.ID()] = &wsConn{conn: c, nc: nc}
 	case wc.conn != nil:
 		return errWsDuplicateID
 	default:
-		wc.conn, wc.nc, wc.w = c, nc, &wsWriter{c: c}
+		wc.conn, wc.nc = c, nc
 	}
 	return nil
 }
@@ -108,20 +85,18 @@ func (cs *wsConns) setPayload(cid uint64, tp AuthPayload) {
 }
 
 // serving reports whether the messages of c are served: c is registered and
-// not being closed by closeAll. It returns the token payload of c, if any,
-// and the writer of c.
-func (cs *wsConns) serving(c *websocket.Conn) (AuthPayload, *wsWriter, bool) {
+// not being closed by closeAll. It returns the token payload of c, if any.
+func (cs *wsConns) serving(c *websocket.Conn) (AuthPayload, bool) {
 	cs.mu.RLock()
 	defer cs.mu.RUnlock()
 	if wc, ok := cs.conns[c.ID()]; ok && wc.conn == c && !wc.goingAway {
-		return wc.tp, wc.w, true
+		return wc.tp, true
 	}
-	return nil, nil, false
+	return nil, false
 }
 
-// remove unregisters the connection c and makes its further writes fail (the
-// writer of the library has stopped or is stopping). It reports whether c
-// was registered and whether closeAll closed it.
+// remove unregisters the connection c. It reports whether c was registered
+// and whether closeAll closed it.
 func (cs *wsConns) remove(c *websocket.Conn) (registered, goingAway bool) {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
@@ -129,7 +104,6 @@ func (cs *wsConns) remove(c *websocket.Conn) (registered, goingAway bool) {
 	if !ok || wc.conn != c {
 		return false, false
 	}
-	wc.w.close()
 	delete(cs.conns, c.ID())
 	cs.checkDrained()
 	return true, wc.goingAway
@@ -171,40 +145,23 @@ func (cs *wsConns) closeAll() {
 			continue
 		}
 		wc.goingAway = true
-		go closeConn(wc.conn, wc.nc, wc.w, websocket.StatusGoAway, errWsShutdown.Error())
+		go closeConn(wc.conn, wc.nc, websocket.StatusGoAway, errWsShutdown.Error())
 	}
 	cs.checkDrained()
 }
 
-// closeConn starts the closing handshake of the connection c, whose network
-// connection is nc and whose writer is w (nil for a connection that was not
-// registered): it queues a close frame with status and reason, after which
-// the writer of c stops, and makes further writes to w fail, so they cannot
-// block on the outbound queue of the stopped writer. The client's answering
-// close frame ends the connection; nc reads and writes fail after
-// wsCloseTimeout, so a client that does not answer, or does not read, does
-// not hold the connection open.
-//
-// The websocket library's Conn.Close and Conn.CloseDetail are not safe to call
-// outside the goroutine of the connection: they close a channel that the
-// library closes too when the client close frame arrives. closeConn does not
-// close it and may run in any goroutine. It blocks while the outbound queue of
-// c is full; the deadline frees a writer stalled on the network, which then
-// drains the queue. It does nothing when w is closed already (the connection
-// has ended).
-func closeConn(c *websocket.Conn, nc net.Conn, w *wsWriter, status websocket.StatusCode, reason string) {
+// closeConn closes the connection c, whose network connection is nc, with
+// status and reason: Conn.CloseDetail (safe from any goroutine) queues the
+// close frame, after which writes to c fail with websocket.ErrConnClosed, and
+// the library closes nc once the queued frames are written (at most about one
+// second later). CloseDetail blocks while the outbound queue of c is full, and
+// a client that does not read can stall the writer of c, so nc reads and
+// writes first get a deadline of wsCloseTimeout.
+func closeConn(c *websocket.Conn, nc net.Conn, status websocket.StatusCode, reason string) {
 	if nc != nil {
 		nc.SetDeadline(time.Now().Add(wsCloseTimeout)) //nolint:errcheck
 	}
-	if w != nil && !w.close() {
-		return
-	}
-	fr := websocket.AcquireFrame()
-	fr.SetClose()
-	fr.SetStatus(status)
-	fr.SetFin()
-	fr.Write([]byte(reason)) //nolint:errcheck
-	c.WriteFrame(fr)
+	c.CloseDetail(status, reason)
 }
 
 // WebsocketVatel manages WebSocket endpoint registration and message routing.
@@ -222,9 +179,20 @@ type WebsocketVatel struct {
 
 // WsOption holds WebSocket-specific configuration.
 type WsOption struct {
-	log      *zerolog.Logger
-	td       TokenDecoder
-	authFunc func(ctx WebsocketContext, path string, requiredPerms []string) error
+	log             *zerolog.Logger
+	td              TokenDecoder
+	authFunc        func(ctx WebsocketContext, path string, requiredPerms []string) error
+	writeTimeout    time.Duration
+	writeTimeoutSet bool
+}
+
+// WithWsWriteTimeout sets how long writing one frame to a WebSocket client may
+// take; the default is DefaultWsWriteTimeout, 0 means no limit. A write of a
+// client that does not read blocks once the outbound queue of its connection
+// (128 frames) is full; when the timeout expires the write fails and the
+// connection ends, so the handler writing to it does not block forever.
+func WithWsWriteTimeout(d time.Duration) func(*WsOption) {
+	return func(o *WsOption) { o.writeTimeout, o.writeTimeoutSet = d, true }
 }
 
 // WithLogger sets the logger of WS endpoints; their lines get "layer":"ws".
@@ -260,6 +228,9 @@ func NewWebsocketVatel(optFunc ...func(*WsOption)) *WebsocketVatel {
 	}
 	for _, f := range optFunc {
 		f(&wv.cfg)
+	}
+	if !wv.cfg.writeTimeoutSet {
+		wv.cfg.writeTimeout = DefaultWsWriteTimeout
 	}
 	wv.ws.HandleData(wv.onMessage)
 	// Always register onOpen and onClose so the registry stays consistent.
@@ -360,18 +331,21 @@ const wsNetConnKey = "vatel.wsNetConn"
 // with the ID of a live connection (UpgradeWithID), is closed at once, without
 // the OnOpen and OnClose callbacks, and its messages are not served.
 func (wv *WebsocketVatel) onOpen(c *websocket.Conn) {
+	// No frame is written before onOpen returns, so setting the timeout here
+	// does not race with the writer of c.
+	c.WriteTimeout = wv.cfg.writeTimeout
 	nc, _ := c.UserValue(wsNetConnKey).(net.Conn)
 	switch err := wv.conns.add(c, nc); err {
 	case nil:
 	case errWsShutdown:
-		closeConn(c, nc, nil, websocket.StatusGoAway, err.Error())
+		closeConn(c, nc, websocket.StatusGoAway, err.Error())
 		return
 	default:
 		if wv.log != nil {
 			wv.log.Warn().Uint64("connectionId", c.ID()).Str("client", c.RemoteAddr().String()).
 				Msg("ws connection rejected: duplicate connection id")
 		}
-		closeConn(c, nc, nil, websocket.StatusViolation, err.Error())
+		closeConn(c, nc, websocket.StatusViolation, err.Error())
 		return
 	}
 	if wv.callbackOnOpen != nil {
@@ -441,16 +415,16 @@ func ToClientJSON(err error) []byte {
 }
 
 func (wv *WebsocketVatel) onMessage(c *websocket.Conn, _ bool, data []byte) {
-	tp, w, ok := wv.conns.serving(c)
+	tp, ok := wv.conns.serving(c)
 	if !ok {
 		return // rejected by onOpen or closed by Shutdown
 	}
 	msg, e, err := wv.route(data)
 	if err != nil {
-		wv.writeEnvelopeError(c, w, msg.Path, err)
+		wv.writeEnvelopeError(c, msg.Path, err)
 		return
 	}
-	wv.serveMessage(c, w, e, msg, tp)
+	wv.serveMessage(c, e, msg, tp)
 }
 
 // route decodes the message envelope data and returns it with the endpoint
@@ -474,14 +448,13 @@ func (wv *WebsocketVatel) route(data []byte) (WebsocketRequest, *Endpoint, error
 
 // serveMessage serves the message msg of connection c with the endpoint e:
 // authorization, input decoding, the handler, the reply, the exit log line
-// and the metric. Replies are written to w, the writer of c. tp is the token
-// payload of c, if any.
+// and the metric. tp is the token payload of c, if any.
 //
 // A panic is recovered: the client gets ErrInternalError (500, VTL-0005), the
 // panic value and the stack are logged, the metric is reported, the Alarmer is
 // called, and the connection goes on serving messages.
-func (wv *WebsocketVatel) serveMessage(c *websocket.Conn, w io.Writer, e *Endpoint, msg WebsocketRequest, tp AuthPayload) {
-	ctx := &WsContext{conn: c, w: w, created: time.Now()}
+func (wv *WebsocketVatel) serveMessage(c *websocket.Conn, e *Endpoint, msg WebsocketRequest, tp AuthPayload) {
+	ctx := NewWsContext(c)
 	verbose := e.v.cfg.verboseError
 	lo := effectiveLogLevel(e.LogOptions)
 
@@ -492,7 +465,7 @@ func (wv *WebsocketVatel) serveMessage(c *websocket.Conn, w io.Writer, e *Endpoi
 	zc := zco
 	defer func() {
 		if r := recover(); r != nil {
-			e.wsRecoverPanic(w, lo, verbose, zco, ctx.Created(), r)
+			e.wsRecoverPanic(c, lo, verbose, zco, ctx.Created(), r)
 		}
 	}()
 
@@ -503,7 +476,7 @@ func (wv *WebsocketVatel) serveMessage(c *websocket.Conn, w io.Writer, e *Endpoi
 
 	zc, err := wv.authorize(ctx, e, zc)
 	if err != nil {
-		e.wsWriteErrorResponse(w, lo, verbose, zc, ctx.Created(), err)
+		e.wsWriteErrorResponse(c, lo, verbose, zc, ctx.Created(), err)
 		return
 	}
 
@@ -517,23 +490,23 @@ func (wv *WebsocketVatel) serveMessage(c *websocket.Conn, w io.Writer, e *Endpoi
 	if input, ok := h.(Inputer); ok {
 		in := input.Input()
 		if err := decodeWSInput(msg.Data, in, e.inputFields.HasRules()); err != nil {
-			e.wsWriteErrorResponse(w, lo, verbose, zc, ctx.Created(), err)
+			e.wsWriteErrorResponse(c, lo, verbose, zc, ctx.Created(), err)
 			return
 		}
 		if err := validate(in); err != nil {
-			e.wsWriteErrorResponse(w, lo, verbose, zc, ctx.Created(), err)
+			e.wsWriteErrorResponse(c, lo, verbose, zc, ctx.Created(), err)
 			return
 		}
 	}
 
 	if err := h.Handle(ctx); err != nil {
-		e.wsWriteErrorResponse(w, lo, verbose, zc, ctx.Created(), err)
+		e.wsWriteErrorResponse(c, lo, verbose, zc, ctx.Created(), err)
 		return
 	}
 
-	zc, size, err := e.writeWSResult(w, h, lo, zc)
+	zc, size, err := e.writeWSResult(c, h, lo, zc)
 	if err != nil {
-		e.wsWriteErrorResponse(w, lo, verbose, zc, ctx.Created(), err)
+		e.wsWriteErrorResponse(c, lo, verbose, zc, ctx.Created(), err)
 		return
 	}
 
@@ -574,13 +547,12 @@ func (e *Endpoint) writeWSResult(w io.Writer, h WebsocketHandler, lo LogOption, 
 }
 
 // writeEnvelopeError logs an error of the message envelope (invalid JSON, no
-// path, an unknown path) and sends it to the client c with its writer w. No
-// endpoint is known, so no metric is reported; path is the requested path, if
-// any.
-func (wv *WebsocketVatel) writeEnvelopeError(c *websocket.Conn, w io.Writer, path string, err error) {
+// path, an unknown path) and sends it to the client c. No endpoint is known,
+// so no metric is reported; path is the requested path, if any.
+func (wv *WebsocketVatel) writeEnvelopeError(c *websocket.Conn, path string, err error) {
 	if wv.v == nil {
 		// Not served by a Vatel (BuildHandlers was not called).
-		w.Write(ToClientJSON(err)) //nolint:errcheck
+		c.Write(ToClientJSON(err)) //nolint:errcheck
 		return
 	}
 	_, body, _ := wv.v.errorResponse(err, wv.v.cfg.verboseError)
@@ -590,7 +562,7 @@ func (wv *WebsocketVatel) writeEnvelopeError(c *websocket.Conn, w io.Writer, pat
 	}
 	zl := zc.RawJSON("err", errors.ToJSON(err, errors.WithAttributes(errors.ServerOutputFormat))).Logger()
 	zl.Error().Msg("ws request failed")
-	w.Write(body) //nolint:errcheck
+	c.Write(body) //nolint:errcheck
 }
 
 // decodeWSInput unmarshals the "data" field of a WebSocket message into dest.

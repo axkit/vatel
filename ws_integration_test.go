@@ -166,11 +166,11 @@ type wsHarness struct {
 	authTP    []any
 }
 
-func newWSHarness(t *testing.T) *wsHarness {
+func newWSHarness(t *testing.T, opts ...func(*WsOption)) *wsHarness {
 	t.Helper()
 	h := &wsHarness{t: t, log: &syncBuffer{}, metrics: &syncMetrics{}}
 
-	wv := NewWebsocketVatel(
+	wv := NewWebsocketVatel(append([]func(*WsOption){
 		WithTokenDecoder(&mockDecoder{token: &mockTokener{payload: &mockPayload{perms: []byte{1}}}}),
 		WithWsAuthFunc(func(ctx WebsocketContext, path string, perms []string) error {
 			h.mu.Lock()
@@ -180,7 +180,7 @@ func newWSHarness(t *testing.T) *wsHarness {
 			h.authTP = append(h.authTP, ctx.TokenPayload())
 			return nil
 		}),
-	)
+	}, opts...)...)
 	wv.OnOpen(func(*websocket.Conn) { h.opened.Add(1) })
 	wv.OnClose(func(*websocket.Conn, error) { h.closed.Add(1) })
 	h.wv = wv
@@ -664,4 +664,18 @@ func TestWS_ShutdownFloodingHandlerFinishes(t *testing.T) {
 		t.Errorf("OnClose calls when Shutdown returned = %d, want 2", n)
 	}
 	h.waitMetric("flood", 1) // the handler finished
+}
+
+// A live connection whose client does not read: once the outbound queue is
+// full, a write of the handler fails after the write timeout instead of
+// blocking forever, so the handler returns and the connection ends.
+func TestWS_NonReadingClientWriteTimeout(t *testing.T) {
+	h := newWSHarness(t, WithWsWriteTimeout(200*time.Millisecond))
+	c, conn := h.dialPath("/ws")
+	defer conn.Close()
+	if _, err := c.Write([]byte(`{"path":"flood"}`)); err != nil {
+		t.Fatal(err)
+	}
+	h.waitMetric("flood", 1) // the handler finished
+	h.waitFor("OnClose", func() bool { return h.closed.Load() == 1 })
 }

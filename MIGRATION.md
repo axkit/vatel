@@ -127,6 +127,7 @@ Per-endpoint middleware: `e.AddMiddleware(pos, f...)` inside an `EndpointOption`
 | `WithLogger` (stored, but not used) | now used: WS endpoints log to it (`"layer":"ws"`); without it, to the logger passed to `BuildHandlers` |
 | `AuthMessageData` | deprecated, unused |
 | — | new: `wv.Shutdown()` (called by `v.Shutdown`) |
+| — | new: `vatel.WithWsWriteTimeout(d)`, `vatel.DefaultWsWriteTimeout` (10 s) |
 
 ## 2. Behaviour changes
 
@@ -379,9 +380,23 @@ Per-endpoint middleware: `e.AddMiddleware(pos, f...)` inside an `EndpointOption`
   does not wait; `Vatel.Shutdown` waits, within its `ctx`, until every connection has
   closed.
 - A write to `WebsocketContext.BodyWriter()` after its connection is closed (by
-  `Shutdown` or by the client) returns an error. Before, the writer of the websocket
-  library had stopped after the close frame, so writes blocked forever once its outbound
-  queue (128 frames) was full: the handler, its connection and `OnClose` hung.
+  `Shutdown` or by the client) returns `websocket.ErrConnClosed` (websocket v0.1.4).
+  Before, the writer of the websocket library had stopped after the close frame, so writes
+  blocked forever once its outbound queue (128 frames) was full: the handler, its
+  connection and `OnClose` hung.
+- **New default write timeout.** Writing one frame to a client may take at most
+  `vatel.DefaultWsWriteTimeout` (10 s); change it with `vatel.WithWsWriteTimeout(d)` (0:
+  no limit, as before). A client that does not read used to block the handler writing to
+  it forever once the outbound queue was full; now the write fails after the timeout and
+  the connection ends (`OnClose` is called).
+- With `github.com/regorov/websocket` v0.1.4: a message larger than `MaxPayloadSize`
+  (1 MB by default) closes the connection with status 1009 (message too big) also when it
+  is assembled from fragments (before, only a single frame was limited); a connection
+  whose client drops TCP without a close frame now ends completely (its goroutines leaked
+  before; `OnClose` is still called); the server answers a client close frame and lets
+  queued frames flush (at most 1 s) before closing the network connection; `OnClose` gets
+  the client's close status as `websocket.Error` (before, often nil); the client
+  (`MakeClient`/`Dial`) no longer loses frames sent right after the 101 response.
 - `UpgradeWithID` with the ID of a live connection: the new connection is closed at once
   with status 1008 (policy violation), without `OnOpen`/`OnClose`, and its messages are
   not served (before: it replaced the live connection in the registry and inherited its
@@ -406,7 +421,9 @@ Per-endpoint middleware: `e.AddMiddleware(pos, f...)` inside an `EndpointOption`
   v1.25.0 or later). `github.com/axkit/bitset` is a regular v1.0.4 dependency (no
   `replace`).
 - Minimum versions: Go 1.26 (required by fasthttp v1.77.0), `github.com/valyala/fasthttp`
-  v1.77.0 (v0.14: v1.31.0) and `github.com/fasthttp/router` v1.5.4 (v0.14: v1.4.4).
+  v1.77.0 (v0.14: v1.31.0), `github.com/fasthttp/router` v1.5.4 (v0.14: v1.4.4) and
+  `github.com/regorov/websocket` v0.1.4 (thread-safe `Conn.CloseDetail`, writes after a
+  close fail with `websocket.ErrConnClosed` instead of blocking).
   `Shutdown` relies on fasthttp's `ShutdownWithContext` of these versions. Go's minimal
   version selection moves your project to them when you upgrade vatel; code that uses
   fasthttp or fasthttp/router directly should be checked against their changelogs

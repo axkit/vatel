@@ -10,7 +10,7 @@ require (
 	github.com/axkit/tinymap v0.0.2
 	github.com/fasthttp/router v1.5.4
 	github.com/google/uuid v1.6.0
-	github.com/regorov/websocket v0.1.3
+	github.com/regorov/websocket v0.1.4
 	github.com/rs/zerolog v1.26.0
 	github.com/tidwall/gjson v1.14.2
 	github.com/tidwall/sjson v1.2.5

@@ -33,7 +33,8 @@ go mod tidy
 
 Vatel is a REST framework built on [fasthttp](https://github.com/valyala/fasthttp) and
 fasthttp/router. Requires Go 1.26 (fasthttp v1.77.0 needs it), fasthttp v1.77.0+ and fasthttp/router
-v1.5.4+ (`Shutdown` relies on fasthttp's `ShutdownWithContext`, see Core types); CI reads the version
+v1.5.4+ (`Shutdown` relies on fasthttp's `ShutdownWithContext`, see Core types), regorov/websocket v0.1.4+
+(see WebSocket); CI reads the version
 from `go.mod`. User docs: `README.md`; v0.14 → v1.25 changes: `MIGRATION.md`. Plans live in
 `docs/plans/`, deferred work in `docs/backlog/`.
 
@@ -194,11 +195,13 @@ endpoints use `Inputer` (+ `Validator`)/`Resulter` (no middleware, no Paramer/Qu
 Built-in `updateAccessToken` endpoint calls `OnTokenUpdate`, then stores the payload per connection (`wsConns`:
 one table of live connections and payloads); a callback error rejects the token. WS handlers have no Go
 context. `e.wsWriteErrorResponse` uses the HTTP `errorResponse` (status mapping, `LogSilent`, metrics,
-`Alarmer`). All writes to a connection go through its `wsWriter` (`WsContext.BodyWriter`): after the close
-frame the library's writer goroutine stops and `Conn.Write` would block forever once the 128-frame queue is
-full, so `closeConn`/`remove` mark the writer closed and later writes fail. `Vatel.Shutdown` waits (within
-ctx) for `wsConns.drained`; `WebsocketVatel.Shutdown` does not wait. A `TokenDecoder` returning `(nil, nil)`
-is a bad token (here and in `auth`).
+`Alarmer`). Library: `github.com/regorov/websocket` v0.1.4 — `Conn.CloseDetail` is safe from any goroutine,
+`Write` after a close returns `websocket.ErrConnClosed`, but on a live connection `Write` blocks while the
+128-frame queue is full (backpressure). So `onOpen` sets `Conn.WriteTimeout` (`WithWsWriteTimeout`, default
+`DefaultWsWriteTimeout` 10 s), and `closeConn` sets a 1 s deadline on the net.Conn before `CloseDetail` (it
+can block on a full queue); `closeAll` closes each connection in its own goroutine. `Vatel.Shutdown` waits
+(within ctx) for `wsConns.drained`; `WebsocketVatel.Shutdown` does not wait. A `TokenDecoder` returning
+`(nil, nil)` is a bad token (here and in `auth`).
 
 ### DI interfaces (`vatel.go`)
 
