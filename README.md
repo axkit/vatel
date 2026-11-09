@@ -907,16 +907,18 @@ wv.OnTokenUpdate(func(_ uint64, prev, next vatel.AuthPayload) error {
 
 - `OnTokenUpdate(f func(cid uint64, prev, next AuthPayload) error)` runs without a lock.
   If another payload is stored for the connection while it runs (a concurrent
-  `UpdateAccessToken` for the same `cid`), or the connection closes, `UpdateAccessToken`
-  returns `ErrWsTokenConflict` (409, `VTL-0010`) and stores nothing; it does not retry,
-  as the callback need not be idempotent.
+  `UpdateAccessToken` for the same `cid`), or the connection closes or starts closing,
+  `UpdateAccessToken` returns `ErrWsTokenConflict` (409, `VTL-0010`) and stores nothing; it
+  does not retry, as the callback need not be idempotent. For a connection that is already
+  closing it returns `ErrWsTokenConflict` without calling the callback.
 - **`WsCloseError`** (`vatel.NewWsCloseError(code, reason, err)`, fields `Code`, `Reason`,
   `Err`). When the handler of any WS message — including `updateAccessToken` (through
   `OnTokenUpdate`) and the `WithWsAuthFunc` function — returns an error with a
   `*WsCloseError` in its chain (`errors.As`), the client first gets the usual error reply
   to that message, then the connection is closed with `Code` and `Reason`; its further
   messages are not served. The reply is built from `Err` when it has an `*errors.Error`
-  with a status; otherwise from the code: 4001 → 401 `ErrUnauthorized`, 4003 → 403
+  with a status (an `*errors.Error` joined or wrapped next to the `WsCloseError`, outside
+  `Err`, does not count); otherwise from the code: 4001 → 401 `ErrUnauthorized`, 4003 → 403
   `ErrForbidden`, 4009 → 409 `ErrWsContextChanged` (`VTL-0009`), any other code → 400. It
   is logged and reported to metrics, never passed to the `Alarmer`. A rejected token is
   not stored. An application that calls `wv.UpdateAccessToken` itself gets the error and
@@ -937,7 +939,10 @@ wv.OnTokenUpdate(func(_ uint64, prev, next vatel.AuthPayload) error {
   a non-zero time closes its connection with 4001 when it expires. Each accepted
   `updateAccessToken` restarts the timer, so the client sends a fresh token before the
   current one expires. A payload that has already expired is rejected with 401 and the
-  connection keeps its previous payload.
+  connection keeps its previous payload. A payload stored with `UpdateAccessToken` for an
+  ID before its connection opened (`UpgradeWithID`) that has expired by then is dropped:
+  the connection opens without a payload (its next token is the first, `prev == nil`, and
+  the authentication timeout applies). An expired payload never authorizes a message.
 - **Authentication timeout.** `vatel.WithWsAuthTimeout(d)` closes a connection with 4001
   if no token was accepted within `d` after it opened (a rejected token does not count).
   Default 0: no limit. It has no effect without `WithTokenDecoder`.

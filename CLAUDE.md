@@ -217,16 +217,19 @@ can block on a full queue); `closeAll` closes each connection in its own gorouti
 WS security context (one connection = one user + organization; vatel only gives the mechanism):
 `OnTokenUpdate(func(cid, prev, next AuthPayload) error)` runs without the lock; `UpdateAccessToken` reads
 `(entry, payload, ver)` with `wsConns.lookup`, calls it, then `storePayload` stores only if the entry pointer and
-`wsConn.ver` are unchanged, else `ErrWsTokenConflict` (409, VTL-0010, no retry). An already expired payload
-(`Expirer`) → `ErrUnauthorized`, nothing closed. A `*WsCloseError` in a message error chain (handler,
+`wsConn.ver` are unchanged and the entry is not `closing`, else `ErrWsTokenConflict` (409, VTL-0010, no retry;
+a closing entry is rejected before the callback too). An already expired payload (`Expirer`) → `ErrUnauthorized`,
+nothing closed. A payload pre-stored for an ID that has expired when `wsConns.add` opens the connection is
+dropped (`tp` nil, `authed` false, `ver++`): no payload, auth timeout applies; `serving` never returns an
+expired payload. A `*WsCloseError` in a message error chain (handler,
 `updateAccessToken`/`OnTokenUpdate`, `WithWsAuthFunc`): `wv.writeError` writes the reply first, then `closeLive`
 (the close frame is queued after it; closing earlier would drop the reply). Reply status from `Err`'s
-`*errors.Error`, else from the code (`wsReplyError`: 4001→401, 4003→403, 4009→409 `ErrWsContextChanged`
-VTL-0009, other→400); never alarmed (a panic is: `wsWriteError(..., alarm=true)`). Every server close marks the
+`*errors.Error` only (not the whole chain: `wsReplyError` returns `xe.Wrap(err)`), else from the code
+(`wsReplyError`: 4001→401, 4003→403, 4009→409 `ErrWsContextChanged` VTL-0009, other→400); never alarmed (a panic is: `wsWriteError(..., alarm=true)`). Every server close marks the
 entry `closing` (`wsConn.startClose`: not served, timer stopped) and goes through `closeConn`, which cuts the
 reason to 123 bytes on a rune boundary. `CloseConn` closes in a goroutine; `VisitConns` iterates a snapshot
 (`wsConns.live`), so its callback may call `CloseConn`. One `time.AfterFunc` per entry (`armTimer`): auth
-timeout while `ver == 0` (`WithWsAuthTimeout`, only with a `TokenDecoder`), else the payload expiry; it fires
+timeout while `!authed` (`WithWsAuthTimeout`, only with a `TokenDecoder`), else the payload expiry; it fires
 only if the entry and `ver` are unchanged; stopped by `startClose`/`remove`/`closeAll`.
 
 ### DI interfaces (`vatel.go`)

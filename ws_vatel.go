@@ -36,8 +36,9 @@ type wsConn struct {
 	conn      *websocket.Conn // nil when a payload is set for an unknown connection
 	nc        net.Conn        // the network connection of conn
 	tp        AuthPayload
+	authed    bool        // tp was stored by UpdateAccessToken (and not dropped as expired): no auth timeout
 	exp       time.Time   // expiry of tp (Expirer), zero if none
-	ver       uint64      // number of payloads stored: UpdateAccessToken compares it
+	ver       uint64      // number of payload changes: UpdateAccessToken compares it
 	closing   bool        // closed by the server: its messages are not served
 	goingAway bool        // closed by closeAll: OnClose gets a nil error
 	timer     *time.Timer // closes the live connection when tp expires, or, without a payload, after the auth timeout
@@ -62,7 +63,9 @@ func newWsConns() wsConns {
 }
 
 // add registers the connection c with its network connection nc. A payload
-// stored for its ID before it opened becomes its payload. After closeAll it
+// stored for its ID before it opened becomes its payload, unless it has
+// expired by then: it is dropped, and c opens without a payload (its next
+// token is the first one, and the auth timeout applies). After closeAll it
 // returns errWsShutdown, and errWsDuplicateID when a live connection has the
 // ID of c; c is not registered then.
 func (cs *wsConns) add(c *websocket.Conn, nc net.Conn) error {
@@ -80,38 +83,52 @@ func (cs *wsConns) add(c *websocket.Conn, nc net.Conn) error {
 		return errWsDuplicateID
 	default:
 		wc.conn, wc.nc = c, nc
+		if wc.expired(time.Now()) {
+			// The version changes, so an UpdateAccessToken that read the
+			// expired payload as prev does not store its token.
+			wc.tp, wc.authed, wc.exp = nil, false, time.Time{}
+			wc.ver++
+		}
 	}
 	cs.armTimer(c.ID(), wc)
 	return nil
 }
 
+// expired reports whether the payload of wc has an expiry (Expirer) that is
+// not after now. The mutex of its table must be held.
+func (wc *wsConn) expired(now time.Time) bool {
+	return !wc.exp.IsZero() && !now.Before(wc.exp)
+}
+
 // lookup returns the entry of the connection cid (nil if there is none), its
-// payload and the version of the payload, for storePayload.
-func (cs *wsConns) lookup(cid uint64) (wc *wsConn, tp AuthPayload, ver uint64) {
+// payload and the version of the payload, for storePayload, and whether the
+// connection is closing.
+func (cs *wsConns) lookup(cid uint64) (wc *wsConn, tp AuthPayload, ver uint64, closing bool) {
 	cs.mu.RLock()
 	defer cs.mu.RUnlock()
 	if wc = cs.conns[cid]; wc != nil {
-		return wc, wc.tp, wc.ver
+		return wc, wc.tp, wc.ver, wc.closing
 	}
-	return nil, nil, 0
+	return nil, nil, 0, false
 }
 
 // storePayload stores the token payload tp, which expires at exp (zero:
-// never), for the connection cid, unless its entry is no longer seen or its
-// payload is no longer of version ver (see lookup): another payload was stored
-// meanwhile, or the connection closed. It reports whether tp was stored.
+// never), for the connection cid, unless its entry is no longer seen, its
+// payload is no longer of version ver (see lookup), or it is closing: another
+// payload was stored meanwhile, or the connection closed or is closing. It
+// reports whether tp was stored.
 func (cs *wsConns) storePayload(cid uint64, seen *wsConn, ver uint64, tp AuthPayload, exp time.Time) bool {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 	wc := cs.conns[cid]
-	if wc != seen || (wc != nil && wc.ver != ver) {
+	if wc != seen || (wc != nil && (wc.ver != ver || wc.closing)) {
 		return false
 	}
 	if wc == nil {
 		wc = &wsConn{}
 		cs.conns[cid] = wc
 	}
-	wc.tp, wc.exp = tp, exp
+	wc.tp, wc.authed, wc.exp = tp, true, exp
 	wc.ver++
 	cs.armTimer(cid, wc)
 	return true
@@ -130,9 +147,9 @@ func (cs *wsConns) armTimer(cid uint64, wc *wsConn) {
 	var d time.Duration
 	var reason string
 	switch {
-	case wc.ver == 0 && cs.authTimeout > 0:
+	case !wc.authed && cs.authTimeout > 0:
 		d, reason = cs.authTimeout, "authentication timeout"
-	case wc.ver > 0 && !wc.exp.IsZero():
+	case wc.authed && !wc.exp.IsZero():
 		d, reason = time.Until(wc.exp), "token expired"
 	default:
 		return
@@ -186,14 +203,19 @@ func (cs *wsConns) startClose(cid uint64, c *websocket.Conn) (*websocket.Conn, n
 }
 
 // serving reports whether the messages of c are served: c is registered and
-// not being closed by the server. It returns the token payload of c, if any.
+// not being closed by the server. It returns the token payload of c, if any;
+// none once the payload has expired (its timer is about to close c).
 func (cs *wsConns) serving(c *websocket.Conn) (AuthPayload, bool) {
 	cs.mu.RLock()
 	defer cs.mu.RUnlock()
-	if wc, ok := cs.conns[c.ID()]; ok && wc.conn == c && !wc.closing {
-		return wc.tp, true
+	wc, ok := cs.conns[c.ID()]
+	if !ok || wc.conn != c || wc.closing {
+		return nil, false
 	}
-	return nil, false
+	if wc.expired(time.Now()) {
+		return nil, true
+	}
+	return wc.tp, true
 }
 
 // wsConnInfo is a live connection as VisitConns passes it.
@@ -329,8 +351,9 @@ const (
 // *WsCloseError in its chain, the client first gets the error reply to the
 // message, then the connection is closed with Code and Reason.
 //
-// The reply is built from Err when the chain has an *errors.Error with a
-// status; otherwise from Code: WsStatusAuthRequired gives ErrUnauthorized
+// The reply is built from Err when its chain has an *errors.Error with a
+// status (other errors joined or wrapped next to the WsCloseError do not
+// count); otherwise from Code: WsStatusAuthRequired gives ErrUnauthorized
 // (401), WsStatusForbidden ErrForbidden (403), WsStatusContextChanged
 // ErrWsContextChanged (409), any other code 400. It is never alarmed.
 //
@@ -366,14 +389,15 @@ func (e *WsCloseError) Unwrap() error { return e.Err }
 var errWsClosed = errors.Template("bad request").StatusCode(400).Severity(errors.Tiny)
 
 // wsReplyError returns the error sent to the client for err and the
-// *WsCloseError in its chain, if any (see WsCloseError).
+// *WsCloseError in its chain, if any (see WsCloseError). The reply of a
+// WsCloseError is an *errors.Error wrapping err, so err is logged whole.
 func wsReplyError(err error) (error, *WsCloseError) {
 	var wce *WsCloseError
 	if !stderrors.As(err, &wce) {
 		return err, nil
 	}
-	if xe := vatelError(err); xe != nil && errors.Serialize(xe).StatusCode != 0 {
-		return err, wce
+	if xe := vatelError(wce.Err); xe != nil && errors.Serialize(xe).StatusCode != 0 {
+		return xe.Wrap(err), wce
 	}
 	t := errWsClosed
 	switch wce.Code {
@@ -391,7 +415,10 @@ func wsReplyError(err error) (error, *WsCloseError) {
 // WebSocket connection whose payload has a non-zero ExpiresAt is closed with
 // WsStatusAuthRequired at that time, unless the client sends a new token
 // (updateAccessToken) before; an already expired payload is rejected by
-// UpdateAccessToken with ErrUnauthorized.
+// UpdateAccessToken with ErrUnauthorized, and a payload stored for an ID
+// before its connection opened (UpgradeWithID) that has expired by then is
+// dropped: the connection opens without a payload. An expired payload never
+// authorizes a message.
 type Expirer interface {
 	ExpiresAt() time.Time
 }
@@ -429,8 +456,8 @@ func WithWsWriteTimeout(d time.Duration) func(*WsOption) {
 }
 
 // WithWsAuthTimeout closes a connection that has no token payload d after it
-// opened (no successful UpdateAccessToken, nor a payload stored for its ID
-// before it opened) with WsStatusAuthRequired. A rejected token does not
+// opened (no successful UpdateAccessToken, nor an unexpired payload stored for
+// its ID before it opened) with WsStatusAuthRequired. A rejected token does not
 // count. The default 0 means no limit. It has no effect without
 // WithTokenDecoder.
 func WithWsAuthTimeout(d time.Duration) func(*WsOption) {
@@ -969,13 +996,16 @@ func (e *Endpoint) wsRecoverPanic(w io.Writer, lo LogOption, verbose bool, zc ze
 // calls the OnTokenUpdate callback, if any, with the payload stored so far;
 // unless the callback returns an error, it stores the new payload for cid. A
 // token that cannot be decoded, or whose payload (Expirer) has expired, is
-// rejected with ErrUnauthorized; if another payload was stored for cid while
-// the callback ran, or the connection closed, it returns ErrWsTokenConflict.
+// rejected with ErrUnauthorized; if the connection is closing (the callback
+// is not called), or another payload was stored for cid while the callback
+// ran, or the connection closed or started closing, it returns
+// ErrWsTokenConflict.
 // A rejected token is not stored: the connection keeps its payload. Storing a
 // payload arms the expiry of the connection (Expirer) and ends its
 // WithWsAuthTimeout. A payload stored for a cid without a live connection
 // becomes the payload of the connection opened with that ID
-// (UpgradeWithID). Without WithTokenDecoder it does nothing.
+// (UpgradeWithID), unless it has expired by then: the connection then opens
+// without a payload. Without WithTokenDecoder it does nothing.
 //
 // A *WsCloseError returned by the callback is returned as is: the
 // updateAccessToken endpoint then closes the connection after its reply; a
@@ -1000,7 +1030,10 @@ func (wv *WebsocketVatel) UpdateAccessToken(cid uint64, token string) error {
 			return ErrUnauthorized.New().Msg("token expired")
 		}
 	}
-	wc, prev, ver := wv.conns.lookup(cid)
+	wc, prev, ver, closing := wv.conns.lookup(cid)
+	if closing {
+		return ErrWsTokenConflict.New()
+	}
 	if wv.callbackOnTokenUpdate != nil {
 		if err := wv.callbackOnTokenUpdate(cid, prev, next); err != nil {
 			return err

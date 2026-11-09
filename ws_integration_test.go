@@ -1228,3 +1228,37 @@ func TestWS_ShutdownStopsTimers(t *testing.T) {
 		t.Errorf("timers armed after Shutdown: %d", n)
 	}
 }
+
+// A token stored for an ID (UpdateAccessToken) before its connection opened
+// that has expired by then authorizes nothing: the connection opens without a
+// payload, its first token is accepted as the first one (prev == nil), and
+// without one the auth timeout closes it with 4001.
+func TestWS_PreStoredExpiredPayload(t *testing.T) {
+	h := newWSHarness(t, WithTokenDecoder(ctxDecoder{}), WithWsAuthTimeout(time.Second))
+	h.wv.OnTokenUpdate(sameSecurityContext)
+	for _, cid := range []uint64{501, 502} {
+		if err := h.wv.UpdateAccessToken(cid, "1/10/50ms"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	c, _ := h.dialPath("/wsid/501")
+	h.sendOn(c, `{"path":"perm","data":{"name":"a"}}`)
+	h.mu.Lock()
+	tp := h.authTP[len(h.authTP)-1]
+	h.mu.Unlock()
+	if tp != nil {
+		t.Errorf("message authorized with the expired payload %v", tp)
+	}
+	// Another organization than the expired payload: accepted as the first token.
+	if got := h.sendOn(c, tokenMsg("1/20")); !strings.Contains(got, `"result":"Ok"`) {
+		t.Errorf("first token reply = %s, want Ok", got)
+	}
+
+	c2, _ := h.dialPath("/wsid/502")
+	if _, code, reason := readClose(t, c2); code != WsStatusAuthRequired || reason != "authentication timeout" {
+		t.Errorf("close = %d %q, want 4001 \"authentication timeout\"", code, reason)
+	}
+	h.sendOn(c, `{"path":"secret","data":{"name":"still open"}}`)
+}

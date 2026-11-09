@@ -30,7 +30,7 @@ func (cs *wsConns) payload(cid uint64) (AuthPayload, bool) {
 // setPayload stores tp for the connection cid unconditionally. Tests only:
 // UpdateAccessToken stores a payload with storePayload.
 func (cs *wsConns) setPayload(cid uint64, tp AuthPayload) {
-	wc, _, ver := cs.lookup(cid)
+	wc, _, ver, _ := cs.lookup(cid)
 	cs.storePayload(cid, wc, ver, tp, time.Time{})
 }
 
@@ -550,5 +550,116 @@ func TestWsRecoverPanic_CloseErrorValueAlarmed(t *testing.T) {
 	}
 	if n := m.alarms(); n != 1 {
 		t.Errorf("alarms = %d, want 1", n)
+	}
+}
+
+// wsReplyError builds the reply from WsCloseError.Err only: an unrelated
+// *errors.Error joined next to the close error does not set the reply.
+func TestWsReplyError_FromCloseErrorOnly(t *testing.T) {
+	v := NewVatel()
+	tests := []struct {
+		name     string
+		err      error
+		wantCode string
+		wantSt   int
+	}{
+		{"unrelated error joined, Err nil", stderrors.Join(ErrValidationFailed.New(), NewWsCloseError(WsStatusForbidden, "x", nil)), "VTL-0003", 403},
+		{"unrelated error joined after", stderrors.Join(NewWsCloseError(WsStatusContextChanged, "x", nil), ErrInvalidRequestBody.New()), "VTL-0009", 409},
+		{"unrelated error joined, Err coded", stderrors.Join(ErrValidationFailed.New(), NewWsCloseError(WsStatusForbidden, "x", ErrUnknownPath.New())), "VTL-0008", 404},
+		{"Err coded, wrapped", fmt.Errorf("ctx: %w", NewWsCloseError(WsStatusForbidden, "x", ErrValidationFailed.New())), "VTL-0006", 400},
+		{"Err plain", NewWsCloseError(WsStatusAuthRequired, "x", stderrors.New("plain")), "VTL-0004", 401},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reply, wce := wsReplyError(tt.err)
+			if wce == nil {
+				t.Fatal("no WsCloseError found")
+			}
+			st, body, _ := v.errorResponse(reply, false)
+			if st != tt.wantSt || !strings.Contains(string(body), `"code":"`+tt.wantCode+`"`) {
+				t.Errorf("reply = %d %s, want %d %s", st, body, tt.wantSt, tt.wantCode)
+			}
+		})
+	}
+}
+
+// UpdateAccessToken for a connection that is closing returns
+// ErrWsTokenConflict and stores nothing, whether it was closing before the
+// callback (the callback is not called) or started closing while it ran.
+func TestUpdateAccessToken_ClosingConnection(t *testing.T) {
+	wv := NewWebsocketVatel(WithTokenDecoder(ctxDecoder{}))
+	c := &websocket.Conn{} // ID 0
+	if err := wv.conns.add(c, nil); err != nil {
+		t.Fatal(err)
+	}
+	wv.OnTokenUpdate(func(cid uint64, _, _ AuthPayload) error {
+		if _, _, ok := wv.conns.startClose(cid, nil); !ok {
+			t.Error("startClose in the callback = false")
+		}
+		return nil
+	})
+	if err := wv.UpdateAccessToken(c.ID(), "1/10"); !errors.Is(err, ErrWsTokenConflict) {
+		t.Errorf("closing while the callback ran: err = %v, want ErrWsTokenConflict", err)
+	}
+	if _, ok := wv.conns.payload(c.ID()); ok {
+		t.Error("payload stored for a closing connection")
+	}
+
+	calls := 0
+	wv.OnTokenUpdate(func(uint64, AuthPayload, AuthPayload) error { calls++; return nil })
+	if err := wv.UpdateAccessToken(c.ID(), "1/10"); !errors.Is(err, ErrWsTokenConflict) {
+		t.Errorf("closing before: err = %v, want ErrWsTokenConflict", err)
+	}
+	if calls != 0 {
+		t.Errorf("callback calls for a closing connection = %d, want 0", calls)
+	}
+	if _, ok := wv.conns.payload(c.ID()); ok {
+		t.Error("payload stored for a closing connection")
+	}
+}
+
+// A payload stored for an ID before its connection opened, which has expired
+// by then, is dropped on open: the connection has no payload (the next token
+// is the first, prev == nil) and the auth timeout applies.
+func TestWsConns_AddDropsExpiredPayload(t *testing.T) {
+	cs := newWsConns()
+	cs.authTimeout = time.Hour
+	c := &websocket.Conn{} // ID 0
+	cs.storePayload(c.ID(), nil, 0, &mockPayload{}, time.Now().Add(-time.Second))
+	if err := cs.add(c, nil); err != nil {
+		t.Fatal(err)
+	}
+	if tp, ok := cs.serving(c); !ok || tp != nil {
+		t.Errorf("serving = %v, %v; want no payload, served", tp, ok)
+	}
+	if _, prev, _, _ := cs.lookup(c.ID()); prev != nil {
+		t.Errorf("prev = %v, want nil", prev)
+	}
+	wc := cs.conns[c.ID()]
+	if wc.timer == nil || !wc.exp.IsZero() {
+		t.Errorf("timer %v, exp %v; want the auth timer and no expiry", wc.timer, wc.exp)
+	}
+	cs.remove(c)
+
+	// A payload that has not expired is kept.
+	tp := &mockPayload{}
+	cs.storePayload(c.ID(), nil, 0, tp, time.Now().Add(time.Hour))
+	if err := cs.add(c, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := cs.serving(c); got != AuthPayload(tp) {
+		t.Errorf("serving = %v, want the stored payload", got)
+	}
+	cs.remove(c)
+}
+
+// A payload that has expired does not authorize a message, even before the
+// expiry timer closed the connection.
+func TestWsConns_ServingExpiredPayload(t *testing.T) {
+	cs := newWsConns()
+	c := &websocket.Conn{}
+	cs.conns[c.ID()] = &wsConn{conn: c, tp: &mockPayload{}, exp: time.Now().Add(-time.Millisecond), ver: 1, authed: true}
+	if tp, ok := cs.serving(c); !ok || tp != nil {
+		t.Errorf("serving = %v, %v; want no payload, served", tp, ok)
 	}
 }

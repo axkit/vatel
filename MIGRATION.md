@@ -436,13 +436,15 @@ Per-endpoint middleware: `e.AddMiddleware(pos, f...)` inside an `EndpointOption`
   `UpdateAccessToken` (and sent to the client of the `updateAccessToken` endpoint). A token
   that cannot be decoded gives `ErrUnauthorized` (401). `f` runs without a lock: if another
   payload is stored for the connection meanwhile (a concurrent `UpdateAccessToken` for the
-  same ID), or it closes, `UpdateAccessToken` returns the new `ErrWsTokenConflict` (409,
-  `VTL-0010`) and stores nothing (no retry).
+  same ID), or it closes or starts closing, `UpdateAccessToken` returns the new
+  `ErrWsTokenConflict` (409, `VTL-0010`) and stores nothing (no retry); for a connection
+  already closing it returns it without calling `f`.
 - New: an error with a `*WsCloseError` in its chain returned by a WS message handler,
   `OnTokenUpdate` (through `updateAccessToken`) or the `WithWsAuthFunc` function sends the
   error reply to the message, then closes the connection with its `Code` and `Reason`;
   later messages of the connection are not served. The reply comes from its `Err` if that
-  has an `*errors.Error` with a status, otherwise from the code (4001 → 401
+  has an `*errors.Error` with a status (other errors in the chain do not count), otherwise
+  from the code (4001 → 401
   `ErrUnauthorized`, 4003 → 403 `ErrForbidden`, 4009 → 409 the new `ErrWsContextChanged`,
   `VTL-0009`, other → 400); it is never passed to the `Alarmer`. A panic is still a 500
   and alarmed, whatever its value. Close codes are exported as `WsStatusAuthRequired`
@@ -458,7 +460,11 @@ Per-endpoint middleware: `e.AddMiddleware(pos, f...)` inside an `EndpointOption`
   its connection with 4001 when it expires; each accepted `updateAccessToken` restarts
   the timer. Before, a connection stayed authorized after its token expired. A payload
   that has already expired is rejected by `UpdateAccessToken` with `ErrUnauthorized`
-  (401); the connection keeps its previous payload. Payload types that already have an
+  (401); the connection keeps its previous payload. A payload stored with
+  `UpdateAccessToken` for an ID before its connection opened that has expired by then is
+  dropped when the connection opens (`UpgradeWithID`): the connection has no payload, its
+  next token is the first (`prev == nil`) and `WithWsAuthTimeout` applies. An expired
+  payload never authorizes a message. Payload types that already have an
   `ExpiresAt() time.Time` method get this behaviour.
 - New: `WithWsAuthTimeout(d)` closes a connection without an accepted token `d` after it
   opened with 4001; default 0 (no limit), no effect without `WithTokenDecoder`.
