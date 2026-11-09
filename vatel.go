@@ -393,16 +393,19 @@ func (l *serverListener) Close() error {
 
 // Shutdown gracefully stops the server:
 //
-//  1. It closes all active WebSocket connections without waiting for them
-//     (clients receive a "going away" frame and can reconnect; see
-//     WebsocketVatel.Shutdown) and stops accepting new connections.
-//     ListenAndServe returns nil; called later, it returns ErrServerClosed.
-//  2. It waits until no HTTP request is in flight: requests being handled
-//     and requests still being received (headers or body being read) finish
-//     normally, and their responses carry "Connection: close". Idle
-//     keep-alive connections do not hold it up: they are closed. A new
-//     connection that has sent nothing yet gets about 5 seconds to start its
-//     request (as in net/http), then it is closed too.
+//  1. It starts closing all active WebSocket connections (clients receive a
+//     "going away" frame and can reconnect; see WebsocketVatel.Shutdown) and
+//     stops accepting new connections. ListenAndServe returns nil; called
+//     later, it returns ErrServerClosed.
+//  2. It waits until no HTTP request is in flight and every WebSocket
+//     connection has closed. Requests being handled and requests still
+//     being received (headers or body being read) finish normally, and
+//     their responses carry "Connection: close". Idle keep-alive connections
+//     do not hold it up: they are closed. A new connection that has sent
+//     nothing yet gets about 5 seconds to start its request (as in
+//     net/http), then it is closed too. A WebSocket message being handled is
+//     finished; a WebSocket client that does not answer the close frame is
+//     disconnected after about one second.
 //  3. It cancels the request contexts (Context.Context()) and returns nil.
 //
 // When ctx is done before step 2 ends, the request contexts of requests still
@@ -413,9 +416,10 @@ func (l *serverListener) Close() error {
 // "Connection: close".
 //
 // Without a server started by ListenAndServe the request contexts are
-// cancelled at once. Requests that start after Shutdown get a cancelled
-// context. Calling Shutdown again, also concurrently, is safe: each call
-// waits for the server with its own ctx.
+// cancelled at once, and Shutdown waits, within ctx, only for the WebSocket
+// connections. Requests that start after Shutdown get a cancelled context.
+// Calling Shutdown again, also concurrently, is safe: each call waits with
+// its own ctx.
 //
 // Pass a context with a deadline to bound the graceful phase:
 //
@@ -428,19 +432,31 @@ func (v *Vatel) Shutdown(ctx context.Context) error {
 	srv := v.srv
 	v.mu.Unlock()
 
+	// wsClosed is closed when every WebSocket connection has closed.
+	wsClosed := closedChan
 	if v.cfg.wv != nil {
 		v.cfg.wv.Shutdown()
+		wsClosed = v.cfg.wv.conns.drained
 	}
 	if srv == nil {
 		v.cancel()
-		return nil
+		select {
+		case <-wsClosed:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 
 	stopped := v.stopServer()
 	select {
 	case <-stopped:
-		v.cancel()
-		return nil
+		select {
+		case <-wsClosed:
+			v.cancel()
+			return nil
+		case <-ctx.Done():
+		}
 	case <-ctx.Done():
 	}
 
@@ -453,6 +469,13 @@ func (v *Vatel) Shutdown(ctx context.Context) error {
 	}
 	return ctx.Err()
 }
+
+// closedChan is a closed channel.
+var closedChan = func() chan struct{} {
+	c := make(chan struct{})
+	close(c)
+	return c
+}()
 
 // stopServer starts stopping the server started by ListenAndServe, once, and
 // returns a channel closed when it has stopped.

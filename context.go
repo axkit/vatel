@@ -61,6 +61,7 @@ type VatelContext struct {
 	tp         any
 	verboseErr bool
 	ctx        context.Context
+	reported   bool // the request was reported to the MetricReporter
 }
 
 // NewContext creates a Context wrapping the given fasthttp request context.

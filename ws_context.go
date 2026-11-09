@@ -26,6 +26,7 @@ type WsContext struct {
 	kv      tinymap.TinyMap
 	tp      any
 	conn    *websocket.Conn
+	w       io.Writer // the writer of conn, if set; see wsWriter
 	created time.Time
 }
 
@@ -42,7 +43,14 @@ func (c *WsContext) TokenPayload() any      { return c.tp }
 func (c *WsContext) ID() uint64             { return c.conn.ID() }
 func (c *WsContext) Created() time.Time     { return c.created }
 
-func (c *WsContext) BodyWriter() io.Writer { return c.conn }
+// BodyWriter returns the writer of messages to the client. Writes to it after
+// the connection is closed fail instead of blocking.
+func (c *WsContext) BodyWriter() io.Writer {
+	if c.w != nil {
+		return c.w
+	}
+	return c.conn
+}
 
 func (c *WsContext) Get(key string) any { return c.kv.Get(key) }
 

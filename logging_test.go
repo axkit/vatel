@@ -532,6 +532,44 @@ func TestLog_DynamicResultMasked(t *testing.T) {
 	}
 }
 
+// switchingResultHandler returns a result without mask tags at compile time
+// and a result of another type, with a mask tag, at request time.
+type switchingResultHandler struct{ out any }
+
+func (h *switchingResultHandler) Result() any { return h.out }
+
+func (h *switchingResultHandler) Handle(Context) error {
+	h.out = &secretItem{Name: "a", Password: "p1"}
+	return nil
+}
+
+// The mask rules of a result follow its type at request time, not the type
+// Result() returned at compile time.
+func TestLog_ResultTypeChangesAtRequestTime(t *testing.T) {
+	v := NewVatel()
+	e := GET("/items", func() Handler {
+		return &switchingResultHandler{out: &struct {
+			Name string `json:"name"`
+		}{}}
+	}, WithLogOption(LogExit|LogRespBody))
+	if err := e.compile(v); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	l := zerolog.New(&buf)
+	fctx := newGETCtx("/items")
+	e.handler(&l)(fctx)
+	if !strings.Contains(string(fctx.Response.Body()), `"password":"p1"`) {
+		t.Errorf("client body = %s, want it unmasked", fctx.Response.Body())
+	}
+	if strings.Contains(buf.String(), "p1") {
+		t.Errorf("secret leaked to log: %s", buf.String())
+	}
+	if obj, _ := lastLogLine(t, &buf)["respBody"].(map[string]any); obj["password"] != jsonmask.DefaultMask {
+		t.Errorf("respBody = %s, want password masked", buf.String())
+	}
+}
+
 // ── log level controls ───────────────────────────────────────────────────────
 
 func TestLog_LevelControls(t *testing.T) {

@@ -73,9 +73,10 @@ registered it yet) and run `srv.ShutdownWithContext(context.Background())` in a 
 byte of a request until its response is written (so requests still being received, pipelined requests
 and `MaxConnsPerIP`-wrapped connections are covered). It is not given `ctx`: on expiry fasthttp resets its stop flag and forgets the
 listeners, so leftover connections would keep serving and a second call would not wait. `Shutdown`
-waits for `stopped` or `ctx`: stopped → cancel the base context, return nil; `ctx` done → cancel the
-base context at once, wait up to `shutdownGrace` (1 s) for `stopped`, return `ctx.Err()`. Concurrent
-calls share `stopped`, each with its own `ctx`.
+waits for `stopped` and the WS connections (`wsConns.drained`) or `ctx`: both done → cancel the base
+context, return nil; `ctx` done → cancel the base context at once, wait up to `shutdownGrace` (1 s) for
+`stopped`, return `ctx.Err()`. Without a server it cancels at once and waits for `drained` or `ctx`.
+Concurrent calls share `stopped`, each with its own `ctx`.
 
 **`Endpoint`** — embeds `EndpointMeta` (`Method`, `Path`, `Perms`, `LogOptions`) plus public config
 (`Compress`, `ManualStatusCode`, `SuccessStatusCode`, `ResponseContentType`, `OptionalBody`, `Timeout`) and
@@ -118,6 +119,12 @@ resolve log level (endpoint LogOptions, X-Set-Log-Level header, LogSilent preced
 
 Any error goes to `writeErrorResponse`: log (unless `LogSilent` and < 500), JSON error body from
 `errorResponse`, metrics, `Alarmer` for >= 500, `OnErrorResponse` middleware with `e.EndpointMeta`.
+
+A panic anywhere in the closure (middleware, decoding, handler, serialization, hooks) is recovered by a
+deferred `recoverPanic`: `Response.Reset()`, then `ErrInternalError` (500, VTL-0005; the panic value reaches
+the client only if verbose) with `panic` and `stack` log fields, `Alarmer`; the metric and `OnErrorResponse`
+only if `VatelContext.reported` is not set yet (a hook after the response panicked). A panic inside the
+recovery is logged and dropped. WS: `serveMessage` defers `wsRecoverPanic` (error frame, connection stays).
 
 ### Middleware
 
@@ -163,9 +170,10 @@ Log keys: `requestBody`, `reqInput`, `reqQuery`, `respBody` (`result` only with 
 Struct tag `mask`: `"-"` removes the field, a name applies a function registered with
 `jsonmask.RawJsonMask.AddFunc` (unregistered → `"***"`). A default `jsonmask.New()` is used when
 `WithJsonMasker` is not set, so tagged fields are always masked in the log; the client response is never
-masked. Rules are computed at compile time (`inputFields`, `querierMaskFields`, `resultFields`; a result type
-unknown at compile, e.g. `OptionalOutput`, gets rules per type in `resultFieldsByType`); masking runs only
-when a type has tags. The request body of an input type with tags is logged from the decoded input, never
+masked. Rules are computed at compile time (`inputFields`, `querierMaskFields`); result rules are cached per
+runtime type in `resultFieldsByType` (seeded with the compile-time `Result()` type), since `Result()` may
+return another type per request (e.g. `OptionalOutput`, an `any` field); masking runs only when a type has
+tags. The request body of an input type with tags is logged from the decoded input, never
 raw (gjson paths are case-sensitive and see only the first duplicate key). A masked param that fails to
 parse gives an error without the parse error (it quotes the value). Path/query params: `mask:"-"` omits, any other value logs `"***"`. Path params are
 logged only by `decodeParams`; their user-value keys (`pathParamKeys`) are skipped elsewhere.
@@ -186,7 +194,11 @@ endpoints use `Inputer` (+ `Validator`)/`Resulter` (no middleware, no Paramer/Qu
 Built-in `updateAccessToken` endpoint calls `OnTokenUpdate`, then stores the payload per connection (`wsConns`:
 one table of live connections and payloads); a callback error rejects the token. WS handlers have no Go
 context. `e.wsWriteErrorResponse` uses the HTTP `errorResponse` (status mapping, `LogSilent`, metrics,
-`Alarmer`).
+`Alarmer`). All writes to a connection go through its `wsWriter` (`WsContext.BodyWriter`): after the close
+frame the library's writer goroutine stops and `Conn.Write` would block forever once the 128-frame queue is
+full, so `closeConn`/`remove` mark the writer closed and later writes fail. `Vatel.Shutdown` waits (within
+ctx) for `wsConns.drained`; `WebsocketVatel.Shutdown` does not wait. A `TokenDecoder` returning `(nil, nil)`
+is a bad token (here and in `auth`).
 
 ### DI interfaces (`vatel.go`)
 

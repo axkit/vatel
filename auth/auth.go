@@ -128,6 +128,10 @@ func (c *Config) decode(at []byte) (vatel.AuthPayload, error) {
 	if err != nil {
 		return nil, vatel.ErrUnauthorized.Wrap(err)
 	}
+	if token == nil {
+		// A broken Decoder: neither a token nor an error.
+		return nil, vatel.ErrUnauthorized.New().Msg("auth: Decoder returned no token")
+	}
 	return token.ApplicationPayload(), nil
 }
 

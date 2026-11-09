@@ -247,6 +247,18 @@ func TestUpdateAccessToken_DecodeError(t *testing.T) {
 	}
 }
 
+// A decoder returning neither a token nor an error rejects the token.
+func TestUpdateAccessToken_DecoderReturnsNilToken(t *testing.T) {
+	wv := NewWebsocketVatel(WithTokenDecoder(&mockDecoder{}))
+	err := wv.UpdateAccessToken(1, "token")
+	if !errors.Is(err, ErrUnauthorized) {
+		t.Errorf("want ErrUnauthorized, got %v", err)
+	}
+	if _, ok := wv.conns.payload(1); ok {
+		t.Error("payload must not be stored")
+	}
+}
+
 func TestUpdateAccessToken_NoDecoder(t *testing.T) {
 	wv := NewWebsocketVatel()
 	called := false
@@ -284,7 +296,7 @@ func TestWsConns_SetGetRemove(t *testing.T) {
 	if err := cs.add(c, nil); err != nil {
 		t.Fatalf("add: %v", err)
 	}
-	if got, ok := cs.serving(c); !ok || got != AuthPayload(tp) {
+	if got, _, ok := cs.serving(c); !ok || got != AuthPayload(tp) {
 		t.Fatalf("serving after add = %v, %v", got, ok)
 	}
 	if err := cs.add(&websocket.Conn{}, nil); err != errWsDuplicateID {

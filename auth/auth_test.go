@@ -253,6 +253,20 @@ func TestNilDecoder(t *testing.T) {
 	wantError(t, get(h, "/auth", ""), "/auth no token", 401, "VTL-0004")
 }
 
+// nilDecoder returns neither a token nor an error.
+type nilDecoder struct{}
+
+func (nilDecoder) Decode([]byte) (vatel.Tokener, error) { return nil, nil }
+
+// A Decoder returning (nil, nil) is a bad token, not a panic.
+func TestDecoderReturnsNilToken(t *testing.T) {
+	h := newServerWith(t, &Config{Decoder: nilDecoder{}, Authorizer: allowAll{}})
+
+	wantAuthenticated(t, get(h, "/public", "good"), "/public", false)
+	wantError(t, get(h, "/auth", "good"), "/auth", 401, "VTL-0004")
+	wantError(t, get(h, "/perms", "good"), "/perms", 401, "VTL-0004")
+}
+
 func TestRequirePermsForbidden(t *testing.T) {
 	h := newServerWith(t, &Config{Decoder: decoder{}, Authorizer: denyAll{}})
 

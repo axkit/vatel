@@ -178,6 +178,10 @@ Per-endpoint middleware: `e.AddMiddleware(pos, f...)` inside an `EndpointOption`
   `Bearer ` prefix, as in v0.14). A nil `Decoder` or a `RevokeCheck` error gives 500
   `VTL-0005` on `RequireAuth`/`RequirePerms` endpoints; public endpoints serve the
   request as unauthenticated.
+- A `Decoder` that returns neither a token nor an error (`nil, nil`) is treated as a bad
+  token: 401 `VTL-0004` on `RequireAuth`/`RequirePerms` endpoints, unauthenticated on
+  public ones; for the WebSocket `updateAccessToken` endpoint, `ErrUnauthorized`. Before,
+  it panicked.
 
 ### Errors
 
@@ -191,6 +195,16 @@ Per-endpoint middleware: `e.AddMiddleware(pos, f...)` inside an `EndpointOption`
   error: `"internal error"`, `VTL-0005`, 500 (or "service unavailable"/"gateway timeout"
   for 503/504). The full error is logged. With verbose errors the client gets the
   original text. The same applies to WebSocket error messages.
+- **Panics are recovered.** A panic in the HTTP request pipeline (middleware, path/query/
+  body decoding, the handler, response serialization, `OnSuccessResponse` and
+  `OnErrorResponse` middleware) or in a WebSocket message handler no longer crashes the
+  process (v0.14 and fasthttp do not recover panics). The response written so far is
+  dropped and the client gets `ErrInternalError` (500, `VTL-0005`, "internal error"; the
+  panic value only with verbose errors). The panic value (`panic`) and the stack
+  (`stack`) are logged, the request is reported to the metrics once, the `Alarmer` is
+  called and `OnErrorResponse` middleware runs (not for a panic of a middleware that runs
+  after the response is written). A WebSocket connection keeps serving messages after the
+  error frame.
 - A middleware at `OnErrorResponse` receives the endpoint metadata (`Method`, `Path`,
   `Perms`, `LogOptions`), whatever the pipeline position of the error.
 - An error returned by an `OnSuccessResponse` middleware is ignored: the response, its
@@ -251,6 +265,9 @@ Per-endpoint middleware: `e.AddMiddleware(pos, f...)` inside an `EndpointOption`
 
 - A `Resulter` whose `Result()` returns nil or a nil pointer writes no body; v0.14 wrote
   `null`. Use `OptionalOutput[T]` for responses with an optional body.
+- The log of a result is masked by the rules of the type `Result()` returns for the
+  request, not of the type it returned when the endpoint was built: a result of another
+  type with `mask` tags is no longer logged unmasked.
 
 ### Logging
 
@@ -312,12 +329,13 @@ Per-endpoint middleware: `e.AddMiddleware(pos, f...)` inside an `EndpointOption`
 - New: `ctx.Context()` is a child of the `Vatel` base context. `Shutdown(ctx)` stops
   accepting connections, waits until no request is in flight, including requests whose
   headers or body are still being received, closes idle keep-alive connections (a new
-  connection that has sent nothing gets about 5 s to start its request), cancels the base
-  context and returns nil. When `ctx` is done first,
+  connection that has sent nothing gets about 5 s to start its request), waits until every
+  WebSocket connection has closed, cancels the base context and returns nil. When `ctx`
+  is done first,
   it cancels the base context at once, waits up to one more second for the cancelled
   requests and returns `ctx.Err()`; requests still running then are not interrupted and
   their connections close when they finish. Without a server started by `ListenAndServe`
-  it cancels at once; a repeated or concurrent `Shutdown` is safe (each call waits with
+  it cancels at once and waits, within `ctx`, only for the WebSocket connections; a repeated or concurrent `Shutdown` is safe (each call waits with
   its own `ctx`). `ListenAndServe` returns nil after
   `Shutdown` and `ErrServerClosed` when called after it. The server it starts has
   `IdleTimeout` = `DefaultIdleTimeout` (90 s) and `CloseOnShutdown`; change it with
@@ -351,14 +369,19 @@ Per-endpoint middleware: `e.AddMiddleware(pos, f...)` inside an `EndpointOption`
   logged); no metric is reported.
 - A WebSocket connection opened after `Shutdown` (of `Vatel` or `WebsocketVatel`) is
   closed at once with a "going away" status, without the `OnOpen`/`OnClose` callbacks.
-- `Shutdown` closes WebSocket connections without waiting and without panics: it queues
-  the "going away" close frame from its own goroutine per connection (before: a
-  synchronous `CloseDetail` that could panic with "close of closed channel" when the
-  client closed at the same time, or when `Shutdown` ran concurrently, and blocked while
-  the outbound queue of a connection was full). Messages arriving after it are not
-  served; a client that does not answer the close frame, or does not read, is
-  disconnected after about one second. `OnClose` of a connection closed by `Shutdown`
-  gets a nil error.
+- `Shutdown` closes WebSocket connections without panics: it queues the "going away"
+  close frame from its own goroutine per connection (before: a synchronous `CloseDetail`
+  that could panic with "close of closed channel" when the client closed at the same time,
+  or when `Shutdown` ran concurrently, and blocked while the outbound queue of a
+  connection was full). Messages arriving after it are not served; a client that does not
+  answer the close frame, or does not read, is disconnected after about one second.
+  `OnClose` of a connection closed by `Shutdown` gets a nil error. `WebsocketVatel.Shutdown`
+  does not wait; `Vatel.Shutdown` waits, within its `ctx`, until every connection has
+  closed.
+- A write to `WebsocketContext.BodyWriter()` after its connection is closed (by
+  `Shutdown` or by the client) returns an error. Before, the writer of the websocket
+  library had stopped after the close frame, so writes blocked forever once its outbound
+  queue (128 frames) was full: the handler, its connection and `OnClose` hung.
 - `UpgradeWithID` with the ID of a live connection: the new connection is closed at once
   with status 1008 (policy violation), without `OnOpen`/`OnClose`, and its messages are
   not served (before: it replaced the live connection in the registry and inherited its

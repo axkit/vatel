@@ -10,6 +10,7 @@ import (
 	"iter"
 	"path"
 	"reflect"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -100,8 +101,7 @@ type Endpoint struct {
 	jm                    JsonMasker      // WithJsonMasker, or defaultMasker
 	inputFields           jsonmask.Fields // masking rules of Inputer input
 	querierMaskFields     jsonmask.Fields // masking rules of Querier input
-	resultFields          jsonmask.Fields // masking rules of Resulter result
-	resultFieldsByType    *sync.Map       // result type unknown at compile: reflect.Type → jsonmask.Fields
+	resultFieldsByType    *sync.Map       // masking rules of Resulter results: reflect.Type → jsonmask.Fields
 	paramFields           []fieldInfo     // precomputed path param layout
 	inputQueryFields      []fieldInfo     // precomputed query layout of Inputer input (GET/DELETE/HEAD/OPTIONS)
 	querierFields         []fieldInfo     // precomputed query layout of Querier input
@@ -208,13 +208,21 @@ func (e *Endpoint) handler(l *zerolog.Logger) func(*fasthttp.RequestCtx) {
 		reqCtx, cancel := e.requestContext()
 		defer cancel()
 		ctx := newContext(fctx, reqCtx)
+		zco := l.With().Str("client", realip.FromRequest(fctx))
+		zc := zco
+		// A panic of middleware, decoding, the handler, response writing or a
+		// hook is answered with a 500 error; the server keeps running.
+		defer func() {
+			if r := recover(); r != nil {
+				e.recoverPanic(ctx, lo, verbose, zco, r)
+			}
+		}()
+
 		// reqId is a user value, so every log line of the request gets it
 		// once, from the user value visitor.
 		if e.v.cfg.logRequestID {
 			ctx.Set("reqId", fctx.ID())
 		}
-		zco := l.With().Str("client", realip.FromRequest(fctx))
-		zc := zco
 
 		if err := e.runMiddleware(ctx, OnRequest, lo, verbose, zc); err != nil {
 			return
@@ -270,6 +278,7 @@ func (e *Endpoint) handler(l *zerolog.Logger) func(*fasthttp.RequestCtx) {
 			logExit(zc, lo, ctx.VisitUserValues, e.isPathParamKey, dur)
 		}
 		e.reportMetric(fctx.Response.StatusCode(), dur, len(fctx.Response.Body()))
+		ctx.reported = true
 
 		// The response is written: errors of OnSuccessResponse middleware
 		// are ignored.
@@ -356,7 +365,7 @@ func (e *Endpoint) middlewareAt(pos MiddlewarePos) iter.Seq[func(Context, Endpoi
 
 // runMiddleware executes global then per-endpoint middleware at pos in order.
 // On the first error it writes the error response and returns it.
-func (e *Endpoint) runMiddleware(ctx Context, pos MiddlewarePos, lo LogOption, verbose bool, zc zerolog.Context) error {
+func (e *Endpoint) runMiddleware(ctx *VatelContext, pos MiddlewarePos, lo LogOption, verbose bool, zc zerolog.Context) error {
 	for mw := range e.middlewareAt(pos) {
 		if err := mw(ctx, e.EndpointMeta); err != nil {
 			e.writeErrorResponse(ctx, lo, verbose, zc, err)
@@ -588,14 +597,12 @@ func (e *Endpoint) writeJSON(w io.Writer, lo LogOption, res any, zc zerolog.Cont
 	return zc, len(buf), err
 }
 
-// resultRules returns the masking rules of the result res. Rules of a result
-// type unknown at compile time (Result() returned an untyped nil, as
-// OptionalOutput does before the handler sets Out) are built on first use and
-// cached per type.
+// resultRules returns the masking rules of the result res. They follow the
+// type of res: Result() may return a result of another type than at compile
+// time (an untyped nil, as OptionalOutput does before the handler sets Out, or
+// any value of an interface-typed field). Rules of a type are built on first
+// use and cached.
 func (e *Endpoint) resultRules(res any) jsonmask.Fields {
-	if e.resultFieldsByType == nil {
-		return e.resultFields
-	}
 	t := reflect.TypeOf(res)
 	if f, ok := e.resultFieldsByType.Load(t); ok {
 		return f.(jsonmask.Fields)
@@ -608,11 +615,66 @@ func (e *Endpoint) resultRules(res any) jsonmask.Fields {
 // writeErrorResponse logs the error (at level lo), writes an error JSON body,
 // reports metrics, triggers the alarm if critical, and runs OnErrorResponse
 // middleware with the endpoint metadata.
-func (e *Endpoint) writeErrorResponse(ctx Context, lo LogOption, verbose bool, zc zerolog.Context, err error) {
+func (e *Endpoint) writeErrorResponse(ctx *VatelContext, lo LogOption, verbose bool, zc zerolog.Context, err error) {
 	if err == nil {
 		return
 	}
 
+	statusCode, size := e.writeError(ctx, lo, verbose, zc, err)
+	e.reportMetric(statusCode, time.Since(ctx.RequestTime()), size)
+	ctx.reported = true
+	e.alarm(statusCode, err)
+	e.runHooks(ctx, OnErrorResponse)
+}
+
+// recoverPanic answers a request whose pipeline panicked with r. The response
+// written so far is dropped and replaced with ErrInternalError (500, VTL-0005;
+// the panic value reaches the client only when verbose is set). The panic
+// value and the stack are logged, the Alarmer is called, and, unless the
+// request was reported already (a panic of a hook that runs after the
+// response is written), the metric is reported and OnErrorResponse middleware
+// runs. A panic during the recovery itself is logged and dropped.
+func (e *Endpoint) recoverPanic(ctx *VatelContext, lo LogOption, verbose bool, zc zerolog.Context, r any) {
+	defer func() {
+		if r := recover(); r != nil {
+			zl := withPanic(zc, r).Logger()
+			zl.Error().Msg("panic while recovering from a panic")
+		}
+	}()
+
+	err := panicError(r)
+	reported := ctx.reported
+	ctx.fh.Response.Reset()
+	statusCode, size := e.writeError(ctx, lo, verbose, withPanic(zc, r), err)
+	if !reported {
+		e.reportMetric(statusCode, time.Since(ctx.RequestTime()), size)
+		ctx.reported = true
+	}
+	e.alarm(statusCode, err)
+	if !reported {
+		e.runHooks(ctx, OnErrorResponse)
+	}
+}
+
+// panicError returns the error of a recovered panic value r: ErrInternalError
+// wrapping "panic: <r>".
+func panicError(r any) error {
+	if err, ok := r.(error); ok {
+		return ErrInternalError.Wrap(fmt.Errorf("panic: %w", err))
+	}
+	return ErrInternalError.Wrap(fmt.Errorf("panic: %v", r))
+}
+
+// withPanic adds the panic value r and the stack of the panicking goroutine
+// to zc. It is called from a deferred function, so the stack includes the
+// frames that panicked.
+func withPanic(zc zerolog.Context, r any) zerolog.Context {
+	return zc.Str("panic", fmt.Sprint(r)).Str("stack", string(debug.Stack()))
+}
+
+// writeError logs the error (at level lo) and writes the error JSON body with
+// its status. It returns the status and the size of the body.
+func (e *Endpoint) writeError(ctx *VatelContext, lo LogOption, verbose bool, zc zerolog.Context, err error) (int, int) {
 	statusCode, body, xe := e.errorResponse(err, verbose)
 	if statusCode == fasthttp.StatusTooManyRequests && xe != nil {
 		if ra, ok := errors.Serialize(xe, errors.WithAttributes(errors.AddFields)).Fields["Retry-After"]; ok {
@@ -638,10 +700,7 @@ func (e *Endpoint) writeErrorResponse(ctx Context, lo LogOption, verbose bool, z
 	ctx.SetContentType([]byte(jsonContentType))
 	ctx.SetStatusCode(statusCode)
 	ctx.BodyWriter().Write(body) //nolint:errcheck
-
-	e.reportMetric(statusCode, time.Since(ctx.RequestTime()), len(body))
-	e.alarm(statusCode, err)
-	e.runHooks(ctx, OnErrorResponse)
+	return statusCode, len(body)
 }
 
 // errorResponse returns the status code of err and the error JSON sent to the
@@ -845,13 +904,13 @@ func parsePathParamKeys(p string) []string {
 
 // compileMask precomputes masking rules of the Inputer input and the Resulter
 // result of controller c. Rules of a result type unknown at compile time
-// (Result() returns an untyped nil) are built per type on first use.
+// (Result() returns an untyped nil or a value of another type) are built per
+// type on first use.
 func (e *Endpoint) compileMask(c any) {
 	if ri, ok := c.(Resulter); ok {
+		e.resultFieldsByType = &sync.Map{}
 		if res := ri.Result(); res != nil {
-			e.resultFields = e.jm.Fields(res, maskTag)
-		} else {
-			e.resultFieldsByType = &sync.Map{}
+			e.resultFieldsByType.Store(reflect.TypeOf(res), e.jm.Fields(res, maskTag))
 		}
 	}
 	if ii, ok := c.(Inputer); ok {

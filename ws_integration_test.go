@@ -132,6 +132,11 @@ func (wsSlowHandler) Handle(WebsocketContext) error {
 	return nil
 }
 
+// wsPanicHandler panics.
+type wsPanicHandler struct{}
+
+func (wsPanicHandler) Handle(WebsocketContext) error { panic("SECRET ws panic") }
+
 // wsFloodHandler writes more messages than the outbound queue holds.
 type wsFloodHandler struct{}
 
@@ -148,12 +153,14 @@ type wsHarness struct {
 	log     *syncBuffer
 	metrics *syncMetrics
 	wv      *WebsocketVatel
+	v       *Vatel
 	ln      *fasthttputil.InmemoryListener
 	opened  atomic.Int32 // OnOpen calls
 	served  atomic.Int32 // wsValidatedHandler calls
 	closed  atomic.Int32 // OnClose calls
 
 	mu        sync.Mutex
+	conns     []net.Conn // client connections, closed before the cleanup Shutdown
 	authPaths []string
 	authPerms [][]string
 	authTP    []any
@@ -178,6 +185,7 @@ func newWSHarness(t *testing.T) *wsHarness {
 	wv.OnClose(func(*websocket.Conn, error) { h.closed.Add(1) })
 	h.wv = wv
 	v := NewVatel(WithWebsocketSupport(wv), WithMetricReporter(h.metrics), WithAlarmer(h.metrics))
+	h.v = v
 	v.Add(Endpoints{
 		WS("secret", func() WebsocketHandler { return &wsSecretHandler{} }, WithLogOption(LogExit|LogRespBody)),
 		WS("silent", func() WebsocketHandler { return &wsSecretHandler{} }, WithLogOption(LogSilent)),
@@ -186,6 +194,7 @@ func newWSHarness(t *testing.T) *wsHarness {
 		WS("pin", func() WebsocketHandler { return &wsPINHandler{} }, WithLogOption(LogExit)),
 		WS("slow", func() WebsocketHandler { return wsSlowHandler{} }),
 		WS("flood", func() WebsocketHandler { return wsFloodHandler{} }),
+		WS("panic", func() WebsocketHandler { return wsPanicHandler{} }),
 		WS("validated", func() WebsocketHandler { return &wsValidatedHandler{served: &h.served} }, WithLogOption(LogExit)),
 	})
 
@@ -202,6 +211,13 @@ func newWSHarness(t *testing.T) *wsHarness {
 	go func() { served <- v.serve(ln, mux) }()
 	waitServing(t, v)
 	t.Cleanup(func() {
+		// Closed clients end their connections at once: Shutdown does not
+		// wait for unanswered close frames.
+		h.mu.Lock()
+		for _, c := range h.conns {
+			c.Close()
+		}
+		h.mu.Unlock()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		v.Shutdown(ctx) //nolint:errcheck
@@ -228,6 +244,9 @@ func (h *wsHarness) dialPath(path string) (*websocket.Client, net.Conn) {
 		h.t.Fatalf("dial: %v", err)
 	}
 	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	h.mu.Lock()
+	h.conns = append(h.conns, conn)
+	h.mu.Unlock()
 	c, err := websocket.MakeClient(conn, "http://test"+path)
 	if err != nil {
 		h.t.Fatalf("websocket client: %v", err)
@@ -596,4 +615,53 @@ func TestWS_ShutdownGoingAway(t *testing.T) {
 		t.Errorf("OnClose error = %v, want nil", got)
 	}
 	h.waitMetric("slow", 1) // the message being handled was finished
+}
+
+// A panic in a WS handler is recovered: the client gets a 500 VTL-0005 error
+// frame, the panic is logged with its stack, reported to the metrics and the
+// Alarmer, and the connection keeps serving messages.
+func TestWS_HandlerPanic(t *testing.T) {
+	h := newWSHarness(t)
+
+	got := h.send(`{"path":"panic"}`)
+	if !strings.Contains(got, "VTL-0005") || strings.Contains(got, "SECRET") {
+		t.Errorf("reply = %s, want VTL-0005 without the panic value", got)
+	}
+	out := h.waitLog(`"panic":"SECRET ws panic"`)
+	if !strings.Contains(out, `"stack":"goroutine`) {
+		t.Errorf("stack not logged: %s", out)
+	}
+	if st, alarms := h.waitMetric("panic", 1); st[0] != 500 || alarms != 1 {
+		t.Errorf("metric = %v, alarms = %d; want [500] and 1", st, alarms)
+	}
+
+	// The connection is still usable.
+	if got := h.send(`{"path":"secret","data":{"name":"a"}}`); got != `{"name":"a","password":"p1"}` {
+		t.Errorf("reply after a panic = %s", got)
+	}
+}
+
+// Shutdown while a handler floods a client that does not read: the writes of
+// the handler after the close frame fail instead of blocking on the full
+// outbound queue, so the handler returns and the connection is unregistered
+// (OnClose) before Vatel.Shutdown returns.
+func TestWS_ShutdownFloodingHandlerFinishes(t *testing.T) {
+	h := newWSHarness(t)
+	c, conn := h.dialPath("/ws")
+	defer conn.Close()
+	if _, err := c.Write([]byte(`{"path":"flood"}`)); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond) // the handler fills the queue and blocks
+
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	if err := h.v.Shutdown(ctx); err != nil {
+		t.Errorf("Shutdown = %v, want nil", err)
+	}
+	// h.client did not send anything: closed as well.
+	if n := h.closed.Load(); n != 2 {
+		t.Errorf("OnClose calls when Shutdown returned = %d, want 2", n)
+	}
+	h.waitMetric("flood", 1) // the handler finished
 }

@@ -250,7 +250,7 @@ starts a `fasthttp.Server` with `IdleTimeout` = `vatel.DefaultIdleTimeout` (90 s
 `Handler`). After `Shutdown` it returns nil; called after
 `Shutdown`, it returns `vatel.ErrServerClosed`. You can also serve `mux.Handler` with your
 own server; then `Shutdown` only cancels request contexts and closes WebSocket
-connections.
+connections (waiting, within its `ctx`, until they have closed).
 
 ## Controllers and carriers
 
@@ -491,6 +491,7 @@ v.Add(vatel.Endpoints{
   `Authorization` header value; nothing strips a `Bearer ` prefix, so strip it in the
   decoder. A nil `Decoder` or a `RevokeCheck` error fails `RequireAuth`/`RequirePerms`
   endpoints with 500 `VTL-0005`; public endpoints serve the request as unauthenticated.
+  A `Decoder` returning neither a token nor an error counts as a bad token (401).
 - `Config.Disabled = true` turns all checks off; it is read on every request without
   synchronisation, so set it before the server starts serving.
 
@@ -548,6 +549,19 @@ status 0): 504 if the chain contains `context.DeadlineExceeded`, 503 for
 `context.Canceled`, 500 otherwise. An error with status 429 and a `Retry-After` field sets
 the `Retry-After` header. Errors with status >= 500 are passed to the `Alarmer`
 (`vatel.WithAlarmer`).
+
+### Panics
+
+vatel recovers a panic anywhere in the pipeline of an HTTP request (middleware,
+path/query/body decoding, the handler, response serialization, `OnSuccessResponse` and
+`OnErrorResponse` middleware) and in a WebSocket message handler; the server keeps
+running. The response written so far (status, headers, body) is dropped and the client
+gets `ErrInternalError`: 500, `VTL-0005`, "internal error" (the panic value only with
+verbose errors). The panic value is logged under `panic` and the stack under `stack`,
+whatever the log level; the request is reported to the metrics once, the `Alarmer` is
+called and `OnErrorResponse` middleware runs (not when the panic came from a middleware
+that runs after the response is written). A WebSocket client gets the error frame and its
+connection keeps serving messages.
 
 Predefined errors:
 
@@ -620,16 +634,17 @@ type LoginInput struct {
   ```go
   jm := jsonmask.New()
   jm.AddFunc("phone", func(s string) string {
-  	if len(s) < 4 {
-  		return jsonmask.DefaultMask
-  	}
-  	return strings.Repeat("*", len(s)-4) + s[len(s)-4:]
+      if len(s) < 4 {
+          return jsonmask.DefaultMask
+      }
+      return strings.Repeat("*", len(s)-4) + s[len(s)-4:]
   })
   v := vatel.NewVatel(vatel.WithJsonMasker(jm))
   ```
 
 - Masked log keys: `requestBody`, `reqInput`, `reqQuery`, `respBody`, `result`, including
-  elements of arrays (`Body[[]T]`, `Output[[]T]`) and `OptionalOutput[T]`. If masking
+  elements of arrays (`Body[[]T]`, `Output[[]T]`) and `OptionalOutput[T]`. A result is
+  masked by the rules of the type `Result()` returns for the request. If masking
   fails only the error is logged (`requestBodyMaskingFailed`, `reqInputMaskingFailed`,
   `respBodyMaskingFailed` or `resultMaskingFailed`), never the unmasked value.
 - The request body of an input type with `mask` tags is logged as the decoded input, not
@@ -667,12 +682,13 @@ Types without `mask` tags are logged unchanged.
 `ctx.Context()` returns a Go context for the request; pass it to database and HTTP calls.
 
 - It is a child of a base context owned by the `Vatel`. `v.Shutdown(ctx)`:
-  1. closes WebSocket connections and stops accepting new connections;
-  2. waits until no request is in flight: requests being handled and requests still
-     being received (headers or body) finish normally, and their responses carry
-     `Connection: close`. Idle keep-alive connections do not hold it up: they are closed.
-     A new connection that has sent nothing yet gets about 5 seconds to start its request
-     (as in net/http), then it is closed too;
+  1. starts closing WebSocket connections and stops accepting new connections;
+  2. waits until no request is in flight and every WebSocket connection has closed:
+     requests being handled and requests still being received (headers or body) finish
+     normally, and their responses carry `Connection: close`. Idle keep-alive
+     connections do not hold it up: they are closed. A new connection that has sent
+     nothing yet gets about 5 seconds to start its request (as in net/http), then it is
+     closed too. A WebSocket message being handled is finished;
   3. cancels the base context and returns nil.
 
   When `ctx` is done first, the base context is cancelled at once, so handlers still
@@ -680,7 +696,8 @@ Types without `mask` tags are logged unchanged.
   to finish and returns `ctx.Err()`; requests still running after that are not
   interrupted, and their connections are closed when they finish. Requests that start
   after `Shutdown` get a cancelled context. Without a server started by `ListenAndServe`,
-  the base context is cancelled at once. Calling `Shutdown` again, also concurrently, is
+  the base context is cancelled at once and `Shutdown` waits, within `ctx`, only for the
+  WebSocket connections. Calling `Shutdown` again, also concurrently, is
   safe: each call waits for the server with its own `ctx`.
 - `vatel.WithTimeout(d)` (endpoint) and `vatel.WithDefaultTimeout(d)` (`Vatel`, for
   endpoints without their own timeout) add a deadline. Such a context is also cancelled
@@ -808,10 +825,15 @@ mux.GET("/ws", wv.Upgrade) // the HTTP route that upgrades to WebSocket
 - `vatel.WithLogger(l)` sets the logger of WS endpoints (lines get `"layer":"ws"`);
   without it they log to the logger passed to `BuildHandlers`.
 - `OnOpen` and `OnClose` register connection callbacks. `v.Shutdown` closes all WebSocket
-  connections with a "going away" status first, without waiting for them: their further
-  messages are not served, and a client that does not answer the close frame is
-  disconnected after about one second (`OnClose` gets a nil error). A connection opened
-  after that is closed at once, without the callbacks.
+  connections with a "going away" status first and waits, within its `ctx`, until they
+  have closed: their further messages are not served, the message being handled is
+  finished, and a client that does not answer the close frame is disconnected after about
+  one second (`OnClose` gets a nil error). A connection opened after that is closed at
+  once, without the callbacks. `wv.Shutdown()` alone does not wait.
+- A write to `ctx.BodyWriter()` after the connection is closed (by `Shutdown` or the
+  client) returns an error instead of blocking.
+- A panic in a WS handler is recovered (see [Panics](#panics)): the client gets a 500
+  `VTL-0005` error frame and the connection keeps serving messages.
 - `UpgradeWithID(ctx, id)`: the ID must be unique among live connections. A connection
   with the ID of a live one is closed at once with status 1008 (policy violation),
   without the callbacks; its messages are not served and it does not share the token
