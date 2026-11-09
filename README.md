@@ -14,7 +14,7 @@ go get github.com/axkit/vatel@latest
 
 Requires Go 1.26, [fasthttp](https://github.com/valyala/fasthttp) v1.77.0+ and
 [fasthttp/router](https://github.com/fasthttp/router) v1.5.4+ and, for WebSocket,
-[regorov/websocket](https://github.com/regorov/websocket) v0.1.4+ (Go modules raise them in your
+[regorov/websocket](https://github.com/regorov/websocket) v0.1.5+ (Go modules raise them in your
 project automatically). Errors are built with [github.com/axkit/errors](https://github.com/axkit/errors) v1.1.0+.
 Upgrading from v0.14? See [MIGRATION.md](MIGRATION.md).
 
