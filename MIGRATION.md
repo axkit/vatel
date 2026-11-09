@@ -147,6 +147,8 @@ Per-endpoint middleware: `e.AddMiddleware(pos, f...)` inside an `EndpointOption`
   `Param()`, `QueryInput()` or GET/DELETE/HEAD/OPTIONS `Input()` that does not return a
   pointer to a struct. A nested struct of a type already being flattened in a query or
   path input (a cycle such as `Parent *Filter`) is skipped instead of recursing forever.
+- `BuildHandlers` errors name the endpoint as "endpoint <METHOD> <path>: <reason>"
+  (`WS` for WS endpoints).
 - Middleware and endpoints added after `BuildHandlers` have no effect: it copies them.
 - Removed: `NoInputLog`, `NoResultLog`, `LanguageLabel`.
 - The `?description=true` query parameter no longer returns an endpoint description page;
@@ -402,7 +404,7 @@ written against it may need these changes:
 - `OnErrorResponse` middleware receives the endpoint metadata for errors at every
   pipeline position (v1.24.2: an empty `EndpointMeta` for middleware errors).
 - The duplicate WS path error of `WebsocketVatel.RegisterEndpoint` is a plain error
-  "WS endpoint <path>: already registered" (v1.24.2: an `*errors.Error` with a `path`
+  "endpoint WS <path>: already registered" (v1.24.2: an `*errors.Error` with a `path`
   field).
 - `ListenAndServe` after a failed `BuildHandlers` returns "previous build failed" (v1.24.2
   started the server with part of the routes).

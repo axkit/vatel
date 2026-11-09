@@ -51,7 +51,7 @@ type MetricReporter interface {
 
 // JsonMasker masks sensitive fields in JSON payloads for logging.
 type JsonMasker interface {
-	Fields(structure interface{}, tag string) jsonmask.Fields
+	Fields(structure any, tag string) jsonmask.Fields
 	Mask(src []byte, fields jsonmask.Fields) ([]byte, error)
 }
 
@@ -96,6 +96,11 @@ const shutdownGrace = time.Second
 // ErrServerClosed is returned by ListenAndServe called after Shutdown.
 var ErrServerClosed = stderrors.New("vatel: server closed")
 
+var (
+	errHandlersBuilt = stderrors.New("vatel: handlers already built")
+	errServerStarted = stderrors.New("vatel: server already started")
+)
+
 // NewVatel returns a new Vatel instance. The root GET / endpoint (table of
 // contents) is registered automatically.
 func NewVatel(optFunc ...func(*Option)) *Vatel {
@@ -104,7 +109,7 @@ func NewVatel(optFunc ...func(*Option)) *Vatel {
 		optFunc[i](&v.cfg)
 	}
 	v.baseCtx, v.cancel = context.WithCancel(context.Background())
-	v.ep = []Endpoint{{EndpointMeta: EndpointMeta{Method: "GET", Path: "/"}, Controller: func() Handler { return &tocController{s: &v} }}}
+	v.ep = []Endpoint{{EndpointMeta: EndpointMeta{Method: fasthttp.MethodGet, Path: "/"}, Controller: func() Handler { return &tocController{s: &v} }}}
 	return &v
 }
 
@@ -133,22 +138,32 @@ func WithServerConfig(f func(*fasthttp.Server)) func(*Option) {
 	return func(o *Option) { o.serverConfig = f }
 }
 
+// WithMetricReporter sets the reporter of per-request metrics: method, path
+// template, status, duration and response size (0 for HEAD).
 func WithMetricReporter(mr MetricReporter) func(*Option) {
 	return func(o *Option) { o.mr = mr }
 }
 
+// WithWebsocketSupport enables WS endpoints, served by wv. The application
+// routes an HTTP path to wv.Upgrade.
 func WithWebsocketSupport(wv *WebsocketVatel) func(*Option) {
 	return func(o *Option) { o.wv = wv }
 }
 
+// WithUrlPrefix sets a prefix joined to the path of every HTTP endpoint, e.g.
+// "/api/v1".
 func WithUrlPrefix(s string) func(*Option) {
 	return func(o *Option) { o.urlPrefix = s }
 }
 
+// WithRequestID logs the fasthttp request ID as "reqId" (connectionId for WS
+// messages); it is also stored in the request context under "reqId".
 func WithRequestID() func(*Option) {
 	return func(o *Option) { o.logRequestID = true }
 }
 
+// WithStaticLoggingLevel makes vatel ignore the X-Set-Log-Level request
+// header.
 func WithStaticLoggingLevel() func(*Option) {
 	return func(o *Option) { o.staticLoggingLevel = true }
 }
@@ -173,6 +188,8 @@ func WithDefaultTimeout(d time.Duration) func(*Option) {
 	return func(o *Option) { o.defaultTimeout = d }
 }
 
+// WithDefaultLogOption sets the log verbosity of endpoints without their own
+// WithLogOption. Without it only errors are logged.
 func WithDefaultLogOption(lo LogOption) func(*Option) {
 	return func(o *Option) { o.defaultLogOption = lo }
 }
@@ -185,6 +202,7 @@ func WithJsonMasker(jm JsonMasker) func(*Option) {
 	return func(o *Option) { o.jm = jm }
 }
 
+// WithAlarmer sets the receiver of errors with status >= 500.
 func WithAlarmer(ala Alarmer) func(*Option) {
 	return func(o *Option) { o.ala = ala }
 }
@@ -226,7 +244,7 @@ func (v *Vatel) BuildHandlers(mux *router.Router, l *zerolog.Logger) error {
 		if v.buildErr != nil {
 			return fmt.Errorf("vatel: previous build failed: %w", v.buildErr)
 		}
-		return fmt.Errorf("vatel: handlers already built")
+		return errHandlersBuilt
 	}
 	v.built = true
 	v.buildErr = v.registerEndpoints(mux, l)
@@ -255,9 +273,9 @@ func (v *Vatel) registerEndpoints(mux *router.Router, l *zerolog.Logger) error {
 		e := &v.ep[i]
 		logger := l.With().Str("method", e.Method).Str("path", e.Path).Logger()
 
-		if e.Method == "WS" {
+		if e.Method == methodWS {
 			if v.cfg.wv == nil {
-				return fmt.Errorf("WS endpoint %s: websocket support is not set (WithWebsocketSupport)", e.Path)
+				return fmt.Errorf("endpoint %s %s: websocket support is not set (WithWebsocketSupport)", methodWS, e.Path)
 			}
 			if err := v.cfg.wv.RegisterEndpoint(v, e, &logger); err != nil {
 				return err
@@ -272,7 +290,7 @@ func (v *Vatel) registerEndpoints(mux *router.Router, l *zerolog.Logger) error {
 		if e.Compress {
 			h = fasthttp.CompressHandler(h)
 		}
-		if err := handle(mux, e.Method, e.Path, h); err != nil {
+		if err := registerRoute(mux, e.Method, e.Path, h); err != nil {
 			return err
 		}
 
@@ -282,9 +300,9 @@ func (v *Vatel) registerEndpoints(mux *router.Router, l *zerolog.Logger) error {
 	return nil
 }
 
-// handle registers h with the router, returning the router's panic (a
+// registerRoute registers h with the router, returning the router's panic (a
 // duplicate or conflicting route) as an error.
-func handle(mux *router.Router, method, path string, h fasthttp.RequestHandler) (err error) {
+func registerRoute(mux *router.Router, method, path string, h fasthttp.RequestHandler) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("endpoint %s %s: %v", method, path, r)
@@ -339,7 +357,7 @@ func (v *Vatel) serve(ln net.Listener, mux *router.Router) error {
 		v.mu.Unlock()
 		ln.Close() //nolint:errcheck
 		if started {
-			return fmt.Errorf("vatel: server already started")
+			return errServerStarted
 		}
 		return ErrServerClosed
 	}

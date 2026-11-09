@@ -51,7 +51,7 @@ func (m *mockAlarmer) Alarm(error) { m.alarmed = true }
 type plainHandler struct {
 	called bool
 	retErr error
-	ctxVal interface{} // stores ctx.Get("key") if set
+	ctxVal any // stores ctx.Get("key") if set
 }
 
 func (h *plainHandler) Handle(ctx Context) error {
@@ -69,7 +69,7 @@ type queryHandler struct {
 	called bool
 }
 
-func (h *queryHandler) Input() interface{}       { return &h.in }
+func (h *queryHandler) Input() any               { return &h.in }
 func (h *queryHandler) Handle(ctx Context) error { h.called = true; return nil }
 
 // bodyHandler decodes a POST body.
@@ -81,7 +81,7 @@ type bodyHandler struct {
 	called bool
 }
 
-func (h *bodyHandler) Input() interface{}       { return &h.in }
+func (h *bodyHandler) Input() any               { return &h.in }
 func (h *bodyHandler) Handle(ctx Context) error { h.called = true; return nil }
 
 // pathHandler decodes URL path parameters.
@@ -92,7 +92,7 @@ type pathHandler struct {
 	called bool
 }
 
-func (h *pathHandler) Param() interface{}       { return &h.param }
+func (h *pathHandler) Param() any               { return &h.param }
 func (h *pathHandler) Handle(ctx Context) error { h.called = true; return nil }
 
 // resultHandler produces a JSON response.
@@ -102,7 +102,7 @@ type resultHandler struct {
 	}
 }
 
-func (h *resultHandler) Result() interface{} { return &h.out }
+func (h *resultHandler) Result() any { return &h.out }
 func (h *resultHandler) Handle(ctx Context) error {
 	h.out.Message = "hello"
 	return nil
@@ -111,7 +111,7 @@ func (h *resultHandler) Handle(ctx Context) error {
 // nilResultHandler returns nil from Result(), signalling no response body.
 type nilResultHandler struct{ out *struct{ V int } }
 
-func (h *nilResultHandler) Result() interface{}      { return h.out }
+func (h *nilResultHandler) Result() any              { return h.out }
 func (h *nilResultHandler) Handle(ctx Context) error { return nil }
 
 // tokenHandler records the token payload it sees.

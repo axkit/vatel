@@ -44,9 +44,9 @@ type Context interface {
 	SetVerboseError(bool)
 
 	// Per-request key-value store (for middleware ↔ handler communication)
-	Set(key string, val interface{}) Context
-	Get(key string) interface{}
-	VisitUserValues(func(key []byte, val interface{}))
+	Set(key string, val any) Context
+	Get(key string) any
+	VisitUserValues(func(key []byte, val any))
 
 	// Context returns the request context. It is cancelled by Vatel.Shutdown
 	// and, when the endpoint has a timeout (WithTimeout, WithDefaultTimeout),
@@ -142,16 +142,16 @@ func (c *VatelContext) SetTokenPayload(tp any) { c.tp = tp }
 func (c *VatelContext) VerboseError() bool     { return c.verboseErr }
 func (c *VatelContext) SetVerboseError(v bool) { c.verboseErr = v }
 
-func (c *VatelContext) Set(key string, val interface{}) Context {
+func (c *VatelContext) Set(key string, val any) Context {
 	c.fh.SetUserValue(key, val)
 	return c
 }
 
-func (c *VatelContext) Get(key string) interface{} {
+func (c *VatelContext) Get(key string) any {
 	return c.fh.UserValue(key)
 }
 
-func (c *VatelContext) VisitUserValues(f func(key []byte, val interface{})) {
+func (c *VatelContext) VisitUserValues(f func(key []byte, val any)) {
 	c.fh.VisitUserValues(f)
 }
 

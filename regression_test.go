@@ -44,7 +44,7 @@ func TestLog_RequestBody_NonCanonicalKeysMasked(t *testing.T) {
 				t.Errorf("secret leaked to log: %s", buf.String())
 			}
 			m := lastLogLine(t, &buf)
-			obj, ok := m["requestBody"].(map[string]interface{})
+			obj, ok := m["requestBody"].(map[string]any)
 			if !ok || obj["password"] != jsonmask.DefaultMask || obj["name"] != "a" {
 				t.Errorf("requestBody = %v, want password masked and name kept: %s", m["requestBody"], buf.String())
 			}
@@ -340,7 +340,7 @@ func TestLog_WithJsonMasker_CustomFunc(t *testing.T) {
 
 	m := lastLogLine(t, &buf)
 	for _, key := range []string{"requestBody", "reqInput", "respBody"} {
-		if obj, _ := m[key].(map[string]interface{}); obj["password"] != "CUSTOM" {
+		if obj, _ := m[key].(map[string]any); obj["password"] != "CUSTOM" {
 			t.Errorf("%s = %v, want the custom masker output", key, m[key])
 		}
 	}
@@ -350,7 +350,7 @@ func TestLog_WithJsonMasker_CustomFunc(t *testing.T) {
 // out, so its result type is unknown at compile time.
 type dynamicResultHandler struct{ out *secretItem }
 
-func (h *dynamicResultHandler) Result() interface{} {
+func (h *dynamicResultHandler) Result() any {
 	if h.out == nil {
 		return nil
 	}
@@ -379,7 +379,7 @@ func TestLog_DynamicResultMasked(t *testing.T) {
 		if strings.Contains(buf.String(), "p1") {
 			t.Errorf("secret leaked to log: %s", buf.String())
 		}
-		if obj, _ := lastLogLine(t, &buf)["respBody"].(map[string]interface{}); obj["password"] != jsonmask.DefaultMask {
+		if obj, _ := lastLogLine(t, &buf)["respBody"].(map[string]any); obj["password"] != jsonmask.DefaultMask {
 			t.Errorf("respBody = %s, want password masked", buf.String())
 		}
 	}
@@ -676,12 +676,12 @@ func (h *mapGetInputHandler) Handle(Context) error { return nil }
 
 type intParamHandler struct{ id int }
 
-func (h *intParamHandler) Param() interface{}   { return &h.id }
+func (h *intParamHandler) Param() any           { return &h.id }
 func (h *intParamHandler) Handle(Context) error { return nil }
 
 type nilParamHandler struct{}
 
-func (h *nilParamHandler) Param() interface{}   { return nil }
+func (h *nilParamHandler) Param() any           { return nil }
 func (h *nilParamHandler) Handle(Context) error { return nil }
 
 func TestBuildHandlers_NonStructParamInput_ReturnsError(t *testing.T) {

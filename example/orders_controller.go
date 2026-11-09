@@ -6,6 +6,7 @@ import (
 	"github.com/axkit/errors"
 	"github.com/axkit/vatel"
 	"github.com/axkit/vatel/auth"
+	"github.com/valyala/fasthttp"
 )
 
 // Order is the domain model returned by order endpoints.
@@ -81,9 +82,7 @@ type CreateOrderController struct {
 	vatel.Output[Order]
 }
 
-func (c *CreateOrderController) Handle(ctx vatel.Context) error {
-	claims := ctx.TokenPayload().(*Claims)
-
+func (c *CreateOrderController) Handle(vatel.Context) error {
 	o := Order{
 		ID:         len(orderStore) + 1,
 		CustomerID: c.In.CustomerID,
@@ -92,8 +91,6 @@ func (c *CreateOrderController) Handle(ctx vatel.Context) error {
 		Status:     "pending",
 		CreatedAt:  time.Now(),
 	}
-	_ = claims.UserID // available for audit logging, ownership tracking, etc.
-
 	orderStore = append(orderStore, o)
 	c.Out = o
 	return nil
@@ -156,9 +153,9 @@ func OrderEndpoints(cfg *auth.Config) vatel.Endpoints {
 		vatel.GET("/orders", func() vatel.Handler { return &ListOrdersController{} }, read),
 		vatel.GET("/orders/{id}", func() vatel.Handler { return &GetOrderController{} }, read),
 		vatel.POST("/orders", func() vatel.Handler { return &CreateOrderController{} }, write,
-			vatel.WithSuccessStatusCode(201)),
+			vatel.WithSuccessStatusCode(fasthttp.StatusCreated)),
 		vatel.PUT("/orders/{id}", func() vatel.Handler { return &UpdateOrderController{} }, write),
 		vatel.DELETE("/orders/{id}", func() vatel.Handler { return &DeleteOrderController{} }, write,
-			vatel.WithSuccessStatusCode(204)),
+			vatel.WithSuccessStatusCode(fasthttp.StatusNoContent)),
 	}
 }

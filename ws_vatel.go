@@ -128,6 +128,8 @@ func WithLogger(log *zerolog.Logger) func(*WsOption) {
 	}
 }
 
+// WithTokenDecoder sets the decoder of tokens sent to the built-in
+// updateAccessToken endpoint. Without it the endpoint stores nothing.
 func WithTokenDecoder(td TokenDecoder) func(*WsOption) {
 	return func(o *WsOption) { o.td = td }
 }
@@ -162,7 +164,7 @@ func NewWebsocketVatel(optFunc ...func(*WsOption)) *WebsocketVatel {
 func (wv *WebsocketVatel) Endpoints() []Endpoint {
 	return []Endpoint{
 		{
-			EndpointMeta:        EndpointMeta{Path: "updateAccessToken", Method: "WS", LogOptions: LogConfidential},
+			EndpointMeta:        EndpointMeta{Path: "updateAccessToken", Method: methodWS, LogOptions: LogConfidential},
 			WebsocketController: func() WebsocketHandler { return &AccessTokenUpdateHandler{wv: wv} },
 		},
 	}
@@ -179,10 +181,11 @@ func (wv *WebsocketVatel) bind(v *Vatel, l *zerolog.Logger) {
 	wv.log = &wl
 }
 
-// RegisterEndpoint is called by Vatel.buildHandlers for every endpoint with method "WS".
+// RegisterEndpoint is called by Vatel.BuildHandlers (registerEndpoints) for
+// every endpoint with method "WS".
 func (wv *WebsocketVatel) RegisterEndpoint(v *Vatel, e *Endpoint, l *zerolog.Logger) error {
 	if _, ok := wv.path[e.Path]; ok {
-		return fmt.Errorf("WS endpoint %s: already registered", e.Path)
+		return fmt.Errorf("endpoint %s %s: already registered", methodWS, e.Path)
 	}
 	if err := wv.compileWS(v, e, l); err != nil {
 		return err
@@ -203,12 +206,12 @@ func (wv *WebsocketVatel) compileWS(v *Vatel, e *Endpoint, l *zerolog.Logger) er
 
 	// If the endpoint declares required permissions, an auth function must be set.
 	if len(e.Perms) > 0 && wv.cfg.authFunc == nil {
-		return fmt.Errorf("WS endpoint %s: WithWsAuthFunc() must be set for endpoints declaring Perms", e.Path)
+		return fmt.Errorf("endpoint %s %s: WithWsAuthFunc() must be set for endpoints declaring Perms", methodWS, e.Path)
 	}
 
 	c := e.WebsocketController()
 	if c == nil {
-		return fmt.Errorf("endpoint WS %s: missing WebsocketController", e.Path)
+		return fmt.Errorf("endpoint %s %s: missing WebsocketController", methodWS, e.Path)
 	}
 
 	_, hasRespBody := c.(Resulter)
@@ -297,30 +300,40 @@ func ToClientJSON(err error) []byte {
 	return errors.ToJSON(err, errors.WithAttributes(errors.ClientOutputFormat))
 }
 
-func (wv *WebsocketVatel) onMessage(c *websocket.Conn, isBinary bool, data []byte) {
-	ctx := NewWsContext(c)
+func (wv *WebsocketVatel) onMessage(c *websocket.Conn, _ bool, data []byte) {
+	msg, e, err := wv.route(data)
+	if err != nil {
+		wv.writeEnvelopeError(c, msg.Path, err)
+		return
+	}
+	wv.serveMessage(c, e, msg)
+}
 
+// route decodes the message envelope data and returns it with the endpoint
+// of its path.
+func (wv *WebsocketVatel) route(data []byte) (WebsocketRequest, *Endpoint, error) {
 	var msg WebsocketRequest
 	if err := json.Unmarshal(data, &msg); err != nil {
 		// The message may carry data of a masked type: the error must not
 		// quote it.
-		wv.writeEnvelopeError(c, "", jsonDecodeError(err, true, "ws message is not valid JSON"))
-		return
+		return msg, nil, jsonDecodeError(err, true, "ws message is not valid JSON")
 	}
-
 	if msg.Path == "" {
-		wv.writeEnvelopeError(c, "", ErrInvalidRequestBody.New().Msg("ws message has no path"))
-		return
+		return msg, nil, ErrInvalidRequestBody.New().Msg("ws message has no path")
 	}
-
 	e, ok := wv.path[msg.Path]
 	if !ok {
-		wv.writeEnvelopeError(c, msg.Path, ErrUnknownPath.New())
-		return
+		return msg, nil, ErrUnknownPath.New()
 	}
+	return msg, e, nil
+}
 
+// serveMessage serves the message msg of connection c with the endpoint e:
+// authorization, input decoding, the handler, the reply, the exit log line
+// and the metric.
+func (wv *WebsocketVatel) serveMessage(c *websocket.Conn, e *Endpoint, msg WebsocketRequest) {
+	ctx := NewWsContext(c)
 	verbose := e.v.cfg.verboseError
-
 	lo := effectiveLogLevel(e.LogOptions)
 
 	zco := e.wsLogger.With().Str("client", c.RemoteAddr().String())
@@ -334,20 +347,10 @@ func (wv *WebsocketVatel) onMessage(c *websocket.Conn, isBinary bool, data []byt
 		ctx.SetTokenPayload(tp)
 	}
 
-	// ── Authorization ────────────────────────────────────────────────────────
-	if wv.cfg.authFunc != nil {
-		if len(e.Perms) > 0 {
-			switch len(e.Perms) {
-			case 1:
-				zc = zc.Str("perm", e.Perms[0])
-			default:
-				zc = zc.Strs("perms", e.Perms)
-			}
-		}
-		if err := wv.cfg.authFunc(ctx, msg.Path, e.Perms); err != nil {
-			e.wsWriteErrorResponse(c, lo, verbose, &zc, ctx.Created(), err)
-			return
-		}
+	zc, err := wv.authorize(ctx, e, zc)
+	if err != nil {
+		e.wsWriteErrorResponse(c, lo, verbose, zc, ctx.Created(), err)
+		return
 	}
 
 	if lo&LogEnter == LogEnter {
@@ -357,41 +360,58 @@ func (wv *WebsocketVatel) onMessage(c *websocket.Conn, isBinary bool, data []byt
 	}
 
 	h := e.WebsocketController()
-
-	// ── Input decoding ───────────────────────────────────────────────────────
 	if input, ok := h.(Inputer); ok {
 		if err := decodeWSInput(msg.Data, input.Input(), e.inputFields.HasRules()); err != nil {
-			e.wsWriteErrorResponse(c, lo, verbose, &zc, ctx.Created(), err)
+			e.wsWriteErrorResponse(c, lo, verbose, zc, ctx.Created(), err)
 			return
 		}
 	}
 
-	// ── Handler ──────────────────────────────────────────────────────────────
 	if err := h.Handle(ctx); err != nil {
-		e.wsWriteErrorResponse(c, lo, verbose, &zc, ctx.Created(), err)
+		e.wsWriteErrorResponse(c, lo, verbose, zc, ctx.Created(), err)
 		return
 	}
 
-	// ── Response serialization ───────────────────────────────────────────────
-	size := 0
-	if e.hasRespBody {
-		res := h.(Resulter).Result()
-		if !isNilResult(res) {
-			n, err := e.writeJSON(c, lo, res, &zc)
-			if err != nil {
-				e.wsWriteErrorResponse(c, lo, verbose, &zc, ctx.Created(), err)
-				return
-			}
-			size = n
-		}
+	zc, size, err := e.writeWSResult(c, h, lo, zc)
+	if err != nil {
+		e.wsWriteErrorResponse(c, lo, verbose, zc, ctx.Created(), err)
+		return
 	}
 
-	// ── Exit logging + metrics ───────────────────────────────────────────────
 	dur := time.Since(ctx.Created())
 	if lo&LogExit == LogExit {
 		logExit(zc, lo, ctx.VisitValues, nil, dur)
 	}
 	e.reportMetric(fasthttp.StatusOK, dur, size)
+}
+
+// authorize calls the WithWsAuthFunc function, if any, for the endpoint e and
+// returns zc with the permissions it requires.
+func (wv *WebsocketVatel) authorize(ctx WebsocketContext, e *Endpoint, zc zerolog.Context) (zerolog.Context, error) {
+	if wv.cfg.authFunc == nil {
+		return zc, nil
+	}
+	switch len(e.Perms) {
+	case 0:
+	case 1:
+		zc = zc.Str("perm", e.Perms[0])
+	default:
+		zc = zc.Strs("perms", e.Perms)
+	}
+	return zc, wv.cfg.authFunc(ctx, e.Path, e.Perms)
+}
+
+// writeWSResult sends the result of h, if it has one, to the client w. It
+// returns zc with the logged result and the size of the reply.
+func (e *Endpoint) writeWSResult(w io.Writer, h WebsocketHandler, lo LogOption, zc zerolog.Context) (zerolog.Context, int, error) {
+	if !e.hasRespBody {
+		return zc, 0, nil
+	}
+	res := h.(Resulter).Result()
+	if isNilResult(res) {
+		return zc, 0, nil
+	}
+	return e.writeJSON(w, lo, res, zc)
 }
 
 // writeEnvelopeError logs an error of the message envelope (invalid JSON, no
@@ -417,7 +437,7 @@ func (wv *WebsocketVatel) writeEnvelopeError(c *websocket.Conn, path string, err
 // A malformed or missing payload is a client error: ErrInvalidRequestBody
 // (400). masked reports whether the type of dest has mask rules (see
 // jsonDecodeError).
-func decodeWSInput(data []byte, dest interface{}, masked bool) error {
+func decodeWSInput(data []byte, dest any, masked bool) error {
 	if err := json.Unmarshal(data, dest); err != nil {
 		return jsonDecodeError(err, masked, "ws message data is not valid JSON")
 	}
@@ -427,7 +447,7 @@ func decodeWSInput(data []byte, dest interface{}, masked bool) error {
 // wsWriteErrorResponse logs an error (at level lo) and sends it to the
 // WebSocket client w. The status and the client JSON are resolved as for
 // HTTP (see errorResponse).
-func (e *Endpoint) wsWriteErrorResponse(w io.Writer, lo LogOption, verbose bool, zc *zerolog.Context, created time.Time, err error) {
+func (e *Endpoint) wsWriteErrorResponse(w io.Writer, lo LogOption, verbose bool, zc zerolog.Context, created time.Time, err error) {
 	if err == nil {
 		return
 	}

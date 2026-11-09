@@ -14,11 +14,11 @@ type AccessTokenUpdateHandler struct {
 	}
 }
 
-func (c *AccessTokenUpdateHandler) Input() interface{} {
+func (c *AccessTokenUpdateHandler) Input() any {
 	return &c.input
 }
 
-func (c *AccessTokenUpdateHandler) Result() interface{} {
+func (c *AccessTokenUpdateHandler) Result() any {
 	return &c.output
 }
 

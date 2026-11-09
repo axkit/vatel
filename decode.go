@@ -51,8 +51,8 @@ func paramError(fi *fieldInfo, err error) error {
 }
 
 // setParam parses the path or query parameter val into the field sf according
-// to fi. kind names the param source ("path" or "query") in errors.
-func setParam(sf reflect.Value, fi *fieldInfo, val, kind string) error {
+// to fi. source names the param source ("path" or "query") in errors.
+func setParam(sf reflect.Value, fi *fieldInfo, val, source string) error {
 	if fi.isPtr {
 		if sf.IsNil() {
 			sf.Set(reflect.New(sf.Type().Elem()))
@@ -104,7 +104,7 @@ func setParam(sf reflect.Value, fi *fieldInfo, val, kind string) error {
 		sf.SetBool(b)
 	default:
 		return ErrValidationFailed.New().
-			Msg("unsupported "+kind+" param type").
+			Msg("unsupported "+source+" param type").
 			Set("param", fi.tag).
 			Set("kind", fi.kind.String())
 	}
@@ -114,20 +114,20 @@ func setParam(sf reflect.Value, fi *fieldInfo, val, kind string) error {
 // buildParamFields reflects on the value returned by Param() and returns
 // precomputed field metadata. It uses the query layout, so path params support
 // the same field types as query params (pointers, date.Date, nested structs).
-func buildParamFields(param interface{}) ([]fieldInfo, error) {
+func buildParamFields(param any) ([]fieldInfo, error) {
 	return buildQueryFields(param, "Param()")
 }
 
 // buildQueryFields reflects on in, the value returned by QueryInput() or
-// Input() (named by method in errors), and returns precomputed field metadata,
+// Input() (named by getter in errors), and returns precomputed field metadata,
 // flattening nested structs. A mask tag on a nested struct applies to its
 // fields that have no mask tag of their own. in must be a non-nil pointer to a
 // struct. A nested struct whose type is already being flattened (a cycle such
 // as a Parent *Filter field) is skipped.
-func buildQueryFields(in interface{}, method string) ([]fieldInfo, error) {
+func buildQueryFields(in any, getter string) ([]fieldInfo, error) {
 	t := reflect.TypeOf(in)
-	if t == nil || t.Kind() != reflect.Ptr || t.Elem().Kind() != reflect.Struct {
-		return nil, fmt.Errorf("%s must return a pointer to a struct, got %v", method, t)
+	if t == nil || t.Kind() != reflect.Pointer || t.Elem().Kind() != reflect.Struct {
+		return nil, fmt.Errorf("%s must return a pointer to a struct, got %v", getter, t)
 	}
 	var fields []fieldInfo
 	flattenQueryFields(t.Elem(), nil, "", map[reflect.Type]bool{}, &fields)
@@ -144,13 +144,13 @@ func flattenQueryFields(t reflect.Type, path []int, parentMask string, visiting 
 		if !f.IsExported() {
 			continue
 		}
-		mask := f.Tag.Get("mask")
+		mask := f.Tag.Get(maskTag)
 		if mask == "" {
 			mask = parentMask
 		}
 
 		ft := f.Type
-		isPtr := ft.Kind() == reflect.Ptr
+		isPtr := ft.Kind() == reflect.Pointer
 		if isPtr {
 			ft = ft.Elem()
 		}
@@ -200,7 +200,7 @@ func flattenQueryFields(t reflect.Type, path []int, parentMask string, visiting 
 // allocating pointer fields as needed.
 func fieldByIndices(v reflect.Value, indices []int) reflect.Value {
 	for _, idx := range indices {
-		if v.Kind() == reflect.Ptr {
+		if v.Kind() == reflect.Pointer {
 			if v.IsNil() {
 				v.Set(reflect.New(v.Type().Elem()))
 			}
@@ -215,7 +215,7 @@ func fieldByIndices(v reflect.Value, indices []int) reflect.Value {
 // using precomputed field infos. Path params arrive as fasthttp user values.
 // Each param is added to zc, masked by its mask tag; this is the only place
 // path params are logged.
-func decodeParams(fctx *fasthttp.RequestCtx, param interface{}, fields []fieldInfo, zc zerolog.Context) (zerolog.Context, error) {
+func decodeParams(fctx *fasthttp.RequestCtx, param any, fields []fieldInfo, zc zerolog.Context) (zerolog.Context, error) {
 	s := reflect.ValueOf(param).Elem()
 
 	for i := range fields {
@@ -239,7 +239,7 @@ func decodeParams(fctx *fasthttp.RequestCtx, param interface{}, fields []fieldIn
 // decodeURLQuery fills query string parameters into the struct pointed to by input
 // using precomputed field infos. Each variable is added to zc, masked by its
 // mask tag.
-func decodeURLQuery(fctx *fasthttp.RequestCtx, input interface{}, fields []fieldInfo, zc zerolog.Context) (zerolog.Context, error) {
+func decodeURLQuery(fctx *fasthttp.RequestCtx, input any, fields []fieldInfo, zc zerolog.Context) (zerolog.Context, error) {
 	s := reflect.ValueOf(input).Elem()
 
 	for i := range fields {
@@ -261,7 +261,7 @@ func decodeURLQuery(fctx *fasthttp.RequestCtx, input interface{}, fields []field
 // optional is true, in which case dest is left untouched and decoded is false.
 // masked reports whether the type of dest has mask rules (see jsonDecodeError).
 // Validation is a separate step (see validate).
-func decodeBody(body []byte, dest interface{}, optional, masked bool) (decoded bool, err error) {
+func decodeBody(body []byte, dest any, optional, masked bool) (decoded bool, err error) {
 	if len(bytes.TrimSpace(body)) == 0 {
 		if optional {
 			return false, nil
@@ -303,7 +303,7 @@ func jsonDecodeError(err error, masked bool, msg string) error {
 // validate calls Validate() if in implements Validator. A validation error is
 // returned as ErrValidationFailed (400, VTL-0006) wrapping it; the fields of
 // an *errors.Error in its chain are kept, and so is its code, if it has one.
-func validate(in interface{}) error {
+func validate(in any) error {
 	v, ok := in.(Validator)
 	if !ok {
 		return nil

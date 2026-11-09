@@ -51,11 +51,13 @@ type object struct {
 	live   bool // the type has at least one rule, directly or through nested types
 }
 
+// RawJsonMask masks fields of JSON documents by rules read from struct tags.
+// Masking functions are registered by name with AddFunc.
 type RawJsonMask struct {
-	// funcname
-	fn map[string]func(string) string
+	fn map[string]func(string) string // masking functions by name
 }
 
+// New returns a RawJsonMask without masking functions.
 func New() *RawJsonMask {
 	return &RawJsonMask{
 		fn: make(map[string](func(string) string)),
@@ -70,7 +72,7 @@ func (jm *RawJsonMask) AddFunc(name string, f func(string) string) {
 // Fields returns masking rules of the type of src, read from the struct tag
 // tag. src may be any value, including nil, a typed nil pointer, a struct, a
 // slice or a pointer to a slice; types without tagged fields give empty rules.
-func (jm *RawJsonMask) Fields(src interface{}, tag string) Fields {
+func (jm *RawJsonMask) Fields(src any, tag string) Fields {
 	t := reflect.TypeOf(src)
 	if t == nil {
 		return nil
@@ -95,7 +97,7 @@ type builder struct {
 }
 
 func deref(t reflect.Type) reflect.Type {
-	for t.Kind() == reflect.Ptr {
+	for t.Kind() == reflect.Pointer {
 		t = t.Elem()
 	}
 	return t

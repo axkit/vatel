@@ -16,7 +16,7 @@ import (
 // serveLogged registers endpoints on a real router (path params become user
 // values of the request context, as in production), serves one request and
 // returns the decoded log lines.
-func serveLogged(t *testing.T, v *Vatel, eps Endpoints, method, uri string) (*fasthttp.RequestCtx, []map[string]interface{}, string) {
+func serveLogged(t *testing.T, v *Vatel, eps Endpoints, method, uri string) (*fasthttp.RequestCtx, []map[string]any, string) {
 	t.Helper()
 	var buf bytes.Buffer
 	l := zerolog.New(&buf)
@@ -31,12 +31,12 @@ func serveLogged(t *testing.T, v *Vatel, eps Endpoints, method, uri string) (*fa
 	fctx.Request.SetRequestURI(uri)
 	mux.Handler(fctx)
 
-	var lines []map[string]interface{}
+	var lines []map[string]any
 	for _, raw := range bytes.Split(bytes.TrimSpace(buf.Bytes()), []byte("\n")) {
 		if len(raw) == 0 {
 			continue
 		}
-		var m map[string]interface{}
+		var m map[string]any
 		if err := json.Unmarshal(raw, &m); err != nil {
 			t.Fatalf("log line is not JSON: %v (%s)", err, raw)
 		}
@@ -185,7 +185,7 @@ type secretLegacyQueryHandler struct {
 	fail error
 }
 
-func (h *secretLegacyQueryHandler) Input() interface{} { return &h.in }
+func (h *secretLegacyQueryHandler) Input() any { return &h.in }
 func (h *secretLegacyQueryHandler) Handle(Context) error {
 	return h.fail
 }

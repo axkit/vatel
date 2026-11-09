@@ -20,7 +20,7 @@ type PathParams[T any] struct {
 }
 
 // Param implements the Paramer interface for path parameter binding.
-func (p *PathParams[T]) Param() interface{} { return &p.Params }
+func (p *PathParams[T]) Param() any { return &p.Params }
 
 // QueryParams is an embeddable generic type that provides URL query string
 // variable binding for struct-based controllers. Embed it and access query
@@ -46,7 +46,7 @@ type QueryParams[T any] struct {
 }
 
 // QueryInput implements the Querier interface for URL query string binding.
-func (q *QueryParams[T]) QueryInput() interface{} { return &q.Query }
+func (q *QueryParams[T]) QueryInput() any { return &q.Query }
 
 // Body is an embeddable generic type that implements Inputer. Embed it and
 // access input data via the In field. For POST/PUT/PATCH the JSON request body
@@ -70,7 +70,7 @@ type Body[T any] struct {
 }
 
 // Input implements the Inputer interface for query/body binding.
-func (b *Body[T]) Input() interface{} { return &b.In }
+func (b *Body[T]) Input() any { return &b.In }
 
 // Output is an embeddable generic type that provides response serialization
 // for struct-based controllers. Assign Out directly — no pointer needed.
@@ -90,7 +90,7 @@ type Output[T any] struct {
 
 // Result implements the Resulter interface. Always returns a non-nil pointer
 // to Out so the framework serializes the response body.
-func (o *Output[T]) Result() interface{} { return &o.Out }
+func (o *Output[T]) Result() any { return &o.Out }
 
 // OptionalOutput is an embeddable generic type for controllers that may or may
 // not produce a response body depending on runtime logic. Set Out to a non-nil
@@ -111,7 +111,7 @@ type OptionalOutput[T any] struct {
 
 // Result implements the Resulter interface. Returns nil when Out is unset,
 // signalling to the framework that no response body should be written.
-func (o *OptionalOutput[T]) Result() interface{} {
+func (o *OptionalOutput[T]) Result() any {
 	if o.Out == nil {
 		return nil
 	}

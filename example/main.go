@@ -26,7 +26,7 @@ func main() {
 		With().Timestamp().Logger()
 
 	authCfg := &auth.Config{
-		Decoder:    &JWTDecoder{secret: os.Getenv("JWT_SECRET")},
+		Decoder:    &JWTDecoder{},
 		Authorizer: &BitsetAuthorizer{},
 	}
 

@@ -1,6 +1,10 @@
 package vatel
 
-import "time"
+import (
+	"time"
+
+	"github.com/valyala/fasthttp"
+)
 
 // methodWS is the pseudo-method of WebSocket endpoints (EndpointMeta.Method).
 const methodWS = "WS"
@@ -69,27 +73,27 @@ func WithTimeout(d time.Duration) EndpointOption {
 
 // GET creates a GET endpoint with the given path, controller factory, and options.
 func GET(path string, ctrl func() Handler, opts ...EndpointOption) Endpoint {
-	return buildEndpoint("GET", path, ctrl, opts...)
+	return buildEndpoint(fasthttp.MethodGet, path, ctrl, opts...)
 }
 
 // POST creates a POST endpoint with the given path, controller factory, and options.
 func POST(path string, ctrl func() Handler, opts ...EndpointOption) Endpoint {
-	return buildEndpoint("POST", path, ctrl, opts...)
+	return buildEndpoint(fasthttp.MethodPost, path, ctrl, opts...)
 }
 
 // PUT creates a PUT endpoint with the given path, controller factory, and options.
 func PUT(path string, ctrl func() Handler, opts ...EndpointOption) Endpoint {
-	return buildEndpoint("PUT", path, ctrl, opts...)
+	return buildEndpoint(fasthttp.MethodPut, path, ctrl, opts...)
 }
 
 // PATCH creates a PATCH endpoint with the given path, controller factory, and options.
 func PATCH(path string, ctrl func() Handler, opts ...EndpointOption) Endpoint {
-	return buildEndpoint("PATCH", path, ctrl, opts...)
+	return buildEndpoint(fasthttp.MethodPatch, path, ctrl, opts...)
 }
 
 // DELETE creates a DELETE endpoint with the given path, controller factory, and options.
 func DELETE(path string, ctrl func() Handler, opts ...EndpointOption) Endpoint {
-	return buildEndpoint("DELETE", path, ctrl, opts...)
+	return buildEndpoint(fasthttp.MethodDelete, path, ctrl, opts...)
 }
 
 // HEAD creates a HEAD endpoint with the given path, controller factory, and options.
@@ -97,7 +101,7 @@ func DELETE(path string, ctrl func() Handler, opts ...EndpointOption) Endpoint {
 // drops the response body of a HEAD request, so only the status code and
 // headers reach the client.
 func HEAD(path string, ctrl func() Handler, opts ...EndpointOption) Endpoint {
-	return buildEndpoint("HEAD", path, ctrl, opts...)
+	return buildEndpoint(fasthttp.MethodHead, path, ctrl, opts...)
 }
 
 // OPTIONS creates an OPTIONS endpoint with the given path, controller factory, and options.
@@ -106,12 +110,12 @@ func HEAD(path string, ctrl func() Handler, opts ...EndpointOption) Endpoint {
 // RequireAuth/RequirePerms on an endpoint that serves a CORS preflight: browsers
 // send the preflight without the Authorization header.
 func OPTIONS(path string, ctrl func() Handler, opts ...EndpointOption) Endpoint {
-	return buildEndpoint("OPTIONS", path, ctrl, opts...)
+	return buildEndpoint(fasthttp.MethodOptions, path, ctrl, opts...)
 }
 
 // WS creates a WebSocket endpoint with the given path, controller factory, and options.
 func WS(path string, ctrl func() WebsocketHandler, opts ...EndpointOption) Endpoint {
-	e := Endpoint{EndpointMeta: EndpointMeta{Method: "WS", Path: path}, WebsocketController: ctrl}
+	e := Endpoint{EndpointMeta: EndpointMeta{Method: methodWS, Path: path}, WebsocketController: ctrl}
 	for _, o := range opts {
 		o(&e)
 	}

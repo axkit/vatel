@@ -78,7 +78,7 @@ func TestWsWriteErrorResponse_LogSilent(t *testing.T) {
 			e := &Endpoint{EndpointMeta: EndpointMeta{Method: "WS", Path: "x"}}
 			compileCommon(NewVatel(), e)
 
-			e.wsWriteErrorResponse(&out, c.lo, false, &zc, time.Now(), c.err)
+			e.wsWriteErrorResponse(&out, c.lo, false, zc, time.Now(), c.err)
 
 			if out.Len() == 0 {
 				t.Error("error must be sent to the client")

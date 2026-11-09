@@ -50,7 +50,11 @@ type GetMeController struct {
 }
 
 func (c *GetMeController) Handle(ctx vatel.Context) error {
-	claims := ctx.TokenPayload().(*Claims)
+	// RequireAuth guarantees a payload unless auth.Config.Disabled is set.
+	claims, ok := ctx.TokenPayload().(*Claims)
+	if !ok {
+		return vatel.ErrUnauthorized.New()
+	}
 	for _, u := range userStore {
 		if u.ID == claims.UserID {
 			c.Out = u

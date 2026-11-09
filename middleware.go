@@ -4,12 +4,14 @@ package vatel
 type MiddlewarePos int
 
 const (
-	OnRequest        MiddlewarePos = iota // first: IP rate limit, request logging
-	OnAuthentication                      // decode token, populate request context
-	OnAuthorization                       // check required permissions per endpoint
-	OnHandle                              // pre-handler: per-user rate limit, audit, tx setup
-	OnSuccessResponse
-	OnErrorResponse
+	OnRequest         MiddlewarePos = iota // first: IP rate limit, request logging
+	OnAuthentication                       // decode token, populate request context
+	OnAuthorization                        // check required permissions per endpoint
+	OnHandle                               // pre-handler: per-user rate limit, audit, tx setup
+	OnSuccessResponse                      // after a successful response is written; errors are ignored
+	OnErrorResponse                        // after an error response is written; errors are ignored
+
+	middlewarePosCount // number of positions
 )
 
 // EndpointMeta carries read-only metadata about the endpoint being served.
@@ -24,5 +26,4 @@ type EndpointMeta struct {
 }
 
 // middlewareSet holds middleware slices for each pipeline position.
-// Size 6 matches the six MiddlewarePos constants (0–5).
-type middlewareSet [6][]func(Context, EndpointMeta) error
+type middlewareSet [middlewarePosCount][]func(Context, EndpointMeta) error

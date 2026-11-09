@@ -247,10 +247,10 @@ what to decode and what to send back:
 
 | Interface | Method | Purpose |
 |---|---|---|
-| `Paramer` | `Param() interface{}` | Pointer to a struct with `param:"name"` fields filled from path parameters. |
-| `Querier` | `QueryInput() interface{}` | Pointer to a struct filled from the URL query string, for every HTTP method. |
-| `Inputer` | `Input() interface{}` | GET/DELETE/HEAD/OPTIONS: filled from the query string; POST/PUT/PATCH: from the JSON body. |
-| `Resulter` | `Result() interface{}` | Value serialized to the JSON response. `nil` (or a nil pointer) means no body. |
+| `Paramer` | `Param() any` | Pointer to a struct with `param:"name"` fields filled from path parameters. |
+| `Querier` | `QueryInput() any` | Pointer to a struct filled from the URL query string, for every HTTP method. |
+| `Inputer` | `Input() any` | GET/DELETE/HEAD/OPTIONS: filled from the query string; POST/PUT/PATCH: from the JSON body. |
+| `Resulter` | `Result() any` | Value serialized to the JSON response. `nil` (or a nil pointer) means no body. |
 | `Validator` | `Validate() error` | Implemented by an input type; called after decoding. |
 
 The returned pointers must point into the controller (not to a local variable).
@@ -621,7 +621,7 @@ type LoginInput struct {
   types. A tagged field is a leaf: a tagged struct, pointer or slice (e.g. `time.Time`) is
   masked or removed as a whole. A tag on an embedded struct applies to each promoted field
   without a tag of its own.
-  Maps and `interface{}` values are not visited. Fields absent from the JSON
+  Maps and `any` (interface) values are not visited. Fields absent from the JSON
   (`omitempty`) are not added.
 - **Path and query parameters**: `mask:"-"` omits the parameter from the log, any other
   non-empty `mask` logs `"***"`. Masking functions are not applied to parameters. A `mask`
@@ -737,8 +737,8 @@ type Ping struct {
 	}
 }
 
-func (h *Ping) Input() interface{}  { return &h.in }
-func (h *Ping) Result() interface{} { return &h.out }
+func (h *Ping) Input() any { return &h.in }
+func (h *Ping) Result() any { return &h.out }
 func (h *Ping) Handle(ctx vatel.WebsocketContext) error {
 	h.out.Seq = h.in.Seq
 	return nil

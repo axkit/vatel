@@ -462,7 +462,7 @@ func TestParseLogLevelHeader(t *testing.T) {
 // ── middlewareSet size ────────────────────────────────────────────────────────
 
 // mustFields returns the query field layout of in, a pointer to a struct.
-func mustFields(t *testing.T, in interface{}) []fieldInfo {
+func mustFields(t *testing.T, in any) []fieldInfo {
 	t.Helper()
 	fields, err := buildQueryFields(in, "Input()")
 	if err != nil {

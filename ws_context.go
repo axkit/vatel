@@ -14,9 +14,9 @@ type WebsocketContext interface {
 	BodyWriter() io.Writer
 	TokenPayload() any
 	SetTokenPayload(tp any)
-	Set(key string, val interface{}) WebsocketContext
-	Get(key string) interface{}
-	VisitValues(func(key []byte, val interface{}))
+	Set(key string, val any) WebsocketContext
+	Get(key string) any
+	VisitValues(func(key []byte, val any))
 	Created() time.Time
 	ID() uint64
 }
@@ -37,20 +37,20 @@ func NewWsContext(c *websocket.Conn) WebsocketContext {
 	}
 }
 
-func (ctx *WsContext) SetTokenPayload(tp any) { ctx.tp = tp }
-func (ctx *WsContext) TokenPayload() any      { return ctx.tp }
-func (ctx *WsContext) ID() uint64             { return ctx.conn.ID() }
-func (ctx *WsContext) Created() time.Time     { return ctx.created }
+func (c *WsContext) SetTokenPayload(tp any) { c.tp = tp }
+func (c *WsContext) TokenPayload() any      { return c.tp }
+func (c *WsContext) ID() uint64             { return c.conn.ID() }
+func (c *WsContext) Created() time.Time     { return c.created }
 
-func (ctx *WsContext) BodyWriter() io.Writer { return ctx.conn }
+func (c *WsContext) BodyWriter() io.Writer { return c.conn }
 
-func (ctx *WsContext) Get(key string) interface{} { return ctx.kv.Get(key) }
+func (c *WsContext) Get(key string) any { return c.kv.Get(key) }
 
-func (ctx *WsContext) Set(key string, val interface{}) WebsocketContext {
-	ctx.kv.Set(key, val)
-	return ctx
+func (c *WsContext) Set(key string, val any) WebsocketContext {
+	c.kv.Set(key, val)
+	return c
 }
 
-func (ctx *WsContext) VisitValues(f func(key []byte, v interface{})) {
-	ctx.kv.VisitValues(f)
+func (c *WsContext) VisitValues(f func(key []byte, v any)) {
+	c.kv.VisitValues(f)
 }

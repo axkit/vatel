@@ -88,12 +88,12 @@ inspect the controller, then once per request.
 ### Handler interfaces and carriers
 
 ```go
-type Handler interface  { Handle(Context) error }
-type Paramer interface  { Param() interface{} }      // path params, fields tagged `param:"name"`
-type Querier interface  { QueryInput() interface{} } // query string, every method
-type Inputer interface  { Input() interface{} }      // GET/DELETE/HEAD/OPTIONS: query; POST/PUT/PATCH: JSON body
-type Resulter interface { Result() interface{} }     // JSON response; nil => no body
-type Validator interface { Validate() error }        // on input types; called after all decoding
+type Handler interface   { Handle(Context) error }
+type Paramer interface   { Param() any }       // path params, fields tagged `param:"name"`
+type Querier interface   { QueryInput() any }  // query string, every method
+type Inputer interface   { Input() any }       // GET/DELETE/HEAD/OPTIONS: query; POST/PUT/PATCH: JSON body
+type Resulter interface  { Result() any }      // JSON response; nil => no body
+type Validator interface { Validate() error }  // on input types; called after all decoding
 ```
 
 Carriers implement them via embedding: `PathParams[T]` (`Params`), `QueryParams[T]` (`Query`, a `Querier`,
@@ -160,7 +160,7 @@ Log keys: `requestBody`, `reqInput`, `reqQuery`, `respBody` (`result` only with 
 Struct tag `mask`: `"-"` removes the field, a name applies a function registered with
 `jsonmask.RawJsonMask.AddFunc` (unregistered → `"***"`). A default `jsonmask.New()` is used when
 `WithJsonMasker` is not set, so tagged fields are always masked in the log; the client response is never
-masked. Rules are computed at compile time (`inputFields`, `queryMaskFields`, `resultFields`; a result type
+masked. Rules are computed at compile time (`inputFields`, `querierMaskFields`, `resultFields`; a result type
 unknown at compile, e.g. `OptionalOutput`, gets rules per type in `resultFieldsByType`); masking runs only
 when a type has tags. The request body of an input type with tags is logged from the decoded input, never
 raw (gjson paths are case-sensitive and see only the first duplicate key). A masked param that fails to

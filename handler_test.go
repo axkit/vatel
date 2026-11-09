@@ -646,7 +646,7 @@ func TestContext_VisitUserValues(t *testing.T) {
 	ctx := NewContext(fctx)
 
 	count := 0
-	ctx.VisitUserValues(func(_ []byte, _ interface{}) { count++ })
+	ctx.VisitUserValues(func(_ []byte, _ any) { count++ })
 	if count != 2 {
 		t.Errorf("want 2 user values, got %d", count)
 	}
@@ -802,7 +802,7 @@ type validatedBodyHandler struct {
 	called bool
 }
 
-func (h *validatedBodyHandler) Input() interface{}       { return &h.in }
+func (h *validatedBodyHandler) Input() any               { return &h.in }
 func (h *validatedBodyHandler) Handle(ctx Context) error { h.called = true; return nil }
 
 func TestHandler_OptionalBody_Validator(t *testing.T) {
@@ -925,7 +925,7 @@ type legacyInputHandler struct {
 	called bool
 }
 
-func (h *legacyInputHandler) Input() interface{}   { return &h.in }
+func (h *legacyInputHandler) Input() any           { return &h.in }
 func (h *legacyInputHandler) Handle(Context) error { h.called = true; return nil }
 
 func TestHandler_LegacyInputer_GETQuery_POSTBody(t *testing.T) {
@@ -982,7 +982,7 @@ type validatedLegacyQueryHandler struct {
 	called bool
 }
 
-func (h *validatedLegacyQueryHandler) Input() interface{}   { return &h.in }
+func (h *validatedLegacyQueryHandler) Input() any           { return &h.in }
 func (h *validatedLegacyQueryHandler) Handle(Context) error { h.called = true; return nil }
 
 type validatedQueryAndBodyHandler struct {
@@ -1087,10 +1087,10 @@ func runLogged(t *testing.T, v *Vatel, e Endpoint, fctx *fasthttp.RequestCtx, bu
 }
 
 // lastLogLine decodes the last JSON log line from buf.
-func lastLogLine(t *testing.T, buf *bytes.Buffer) map[string]interface{} {
+func lastLogLine(t *testing.T, buf *bytes.Buffer) map[string]any {
 	t.Helper()
 	lines := bytes.Split(bytes.TrimSpace(buf.Bytes()), []byte("\n"))
-	var m map[string]interface{}
+	var m map[string]any
 	if err := json.Unmarshal(lines[len(lines)-1], &m); err != nil {
 		t.Fatalf("log line is not JSON: %v (%s)", err, buf.String())
 	}
@@ -1106,14 +1106,14 @@ func TestHandler_Log_QuerierUnderReqQuery_InputerUnderReqInput(t *testing.T) {
 		WithLogOption(LogExit|LogReqInput)), fctx, &buf)
 
 	m := lastLogLine(t, &buf)
-	q, ok := m["reqQuery"].(map[string]interface{})
+	q, ok := m["reqQuery"].(map[string]any)
 	if !ok {
 		t.Fatalf("reqQuery missing in log: %s", buf.String())
 	}
 	if q["Page"] != float64(2) {
 		t.Errorf("reqQuery.Page = %v, want 2", q["Page"])
 	}
-	in, ok := m["reqInput"].(map[string]interface{})
+	in, ok := m["reqInput"].(map[string]any)
 	if !ok {
 		t.Fatalf("reqInput missing in log: %s", buf.String())
 	}
@@ -1453,15 +1453,15 @@ func TestCompile_DefaultMasker_NoPanic(t *testing.T) {
 
 // maskedValues returns the values of key in every element of the JSON array
 // found in the log line under logKey.
-func maskedValues(t *testing.T, m map[string]interface{}, logKey, key string) []interface{} {
+func maskedValues(t *testing.T, m map[string]any, logKey, key string) []any {
 	t.Helper()
-	arr, ok := m[logKey].([]interface{})
+	arr, ok := m[logKey].([]any)
 	if !ok {
 		t.Fatalf("%s is not an array in log: %v", logKey, m)
 	}
-	var res []interface{}
+	var res []any
 	for _, el := range arr {
-		res = append(res, el.(map[string]interface{})[key])
+		res = append(res, el.(map[string]any)[key])
 	}
 	return res
 }
@@ -1542,7 +1542,7 @@ func TestHandler_Log_MasksTaggedFields(t *testing.T) {
 					WithLogOption(LogExit|f.lo)), fctx, &buf)
 
 				m := lastLogLine(t, &buf)
-				obj, ok := m[f.key].(map[string]interface{})
+				obj, ok := m[f.key].(map[string]any)
 				if !ok {
 					t.Fatalf("%s missing in log: %s", f.key, buf.String())
 				}
@@ -1572,7 +1572,7 @@ func TestHandler_Log_MasksOptionalOutput(t *testing.T) {
 		t.Errorf("secret leaked to log: %s", buf.String())
 	}
 	m := lastLogLine(t, &buf)
-	if obj, _ := m["respBody"].(map[string]interface{}); obj["password"] != jsonmask.DefaultMask {
+	if obj, _ := m["respBody"].(map[string]any); obj["password"] != jsonmask.DefaultMask {
 		t.Errorf("respBody = %v, want password masked", m["respBody"])
 	}
 }
@@ -1585,7 +1585,7 @@ func TestHandler_Log_MasksQueryInputs(t *testing.T) {
 			WithLogOption(LogExit|LogReqInput)), fctx, &buf)
 
 		m := lastLogLine(t, &buf)
-		q, _ := m["reqQuery"].(map[string]interface{})
+		q, _ := m["reqQuery"].(map[string]any)
 		if q["Token"] != jsonmask.DefaultMask || q["Name"] != "a" {
 			t.Errorf("reqQuery = %v, want Token masked and Name kept", m["reqQuery"])
 		}
@@ -1597,7 +1597,7 @@ func TestHandler_Log_MasksQueryInputs(t *testing.T) {
 			WithLogOption(LogExit|LogReqInput)), fctx, &buf)
 
 		m := lastLogLine(t, &buf)
-		in, _ := m["reqInput"].(map[string]interface{})
+		in, _ := m["reqInput"].(map[string]any)
 		if in["Token"] != jsonmask.DefaultMask {
 			t.Errorf("reqInput = %v, want Token masked", m["reqInput"])
 		}
@@ -1615,7 +1615,7 @@ func TestHandler_Log_NoMaskTags_Unchanged(t *testing.T) {
 		t.Errorf("result must not repeat respBody: %s", buf.String())
 	}
 	for _, key := range []string{"requestBody", "reqInput", "respBody"} {
-		obj, ok := m[key].(map[string]interface{})
+		obj, ok := m[key].(map[string]any)
 		if !ok {
 			t.Fatalf("%s missing in log: %s", key, buf.String())
 		}

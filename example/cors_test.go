@@ -50,7 +50,7 @@ func TestCORSPreflight(t *testing.T) {
 }
 
 func TestCORSMiddleware(t *testing.T) {
-	authCfg := &auth.Config{Decoder: &JWTDecoder{secret: "s"}, Authorizer: &BitsetAuthorizer{}}
+	authCfg := &auth.Config{Decoder: &JWTDecoder{}, Authorizer: &BitsetAuthorizer{}}
 	v := vatel.NewVatel()
 	v.AddMiddleware(vatel.OnRequest, corsMiddleware)
 	v.AddMiddleware(vatel.OnAuthentication, authCfg.Middleware())

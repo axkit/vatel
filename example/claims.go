@@ -34,11 +34,10 @@ func (t *jwtTokener) ApplicationPayload() vatel.AuthPayload { return t.claims }
 
 // JWTDecoder decodes JWT tokens by base64-decoding the payload segment.
 //
-// WARNING: this example skips signature verification for brevity.
-// In production use a library such as github.com/golang-jwt/jwt/v5.
-type JWTDecoder struct {
-	secret string
-}
+// WARNING: this example skips signature verification for brevity, so it
+// needs no secret. In production use a library such as
+// github.com/golang-jwt/jwt/v5 and verify the signature with your key.
+type JWTDecoder struct{}
 
 func (d *JWTDecoder) Decode(token []byte) (vatel.Tokener, error) {
 	parts := bytes.Split(token, []byte("."))

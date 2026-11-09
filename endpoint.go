@@ -7,6 +7,7 @@ import (
 	stderrors "errors"
 	"fmt"
 	"io"
+	"iter"
 	"path"
 	"reflect"
 	"strings"
@@ -58,10 +59,19 @@ type Endpoint struct {
 	// without accessing internal state.
 	EndpointMeta
 
-	// Additional public configuration fields.
-	Compress            bool
-	ManualStatusCode    bool
-	SuccessStatusCode   int
+	// Compress enables gzip compression of the response. See WithCompress.
+	Compress bool
+
+	// ManualStatusCode leaves the success status to the handler
+	// (ctx.SetStatusCode). See WithManualStatusCode.
+	ManualStatusCode bool
+
+	// SuccessStatusCode is the status of a successful response; zero keeps
+	// 200. See WithSuccessStatusCode.
+	SuccessStatusCode int
+
+	// ResponseContentType is the Content-Type of a successful response; empty
+	// means "application/json; charset=utf-8". See WithContentType.
 	ResponseContentType string
 
 	// OptionalBody allows an empty request body on POST/PUT/PATCH.
@@ -77,23 +87,23 @@ type Endpoint struct {
 	WebsocketController func() WebsocketHandler
 
 	// Internal — populated by compile().
-	v                     *Vatel // shared config, base context and in-flight request counter
+	v                     *Vatel // shared config and base context
 	responseContentType   []byte
-	isPathParametrized    bool
-	pathParamKeys         []string // {name} keys of the path template; logged by decodeParams only
-	isQuerier             bool     // controller implements Querier
-	isURLQueryExpected    bool
-	isRequestBodyExpected bool
-	hasRespBody           bool
+	isParamer             bool            // controller implements Paramer
+	pathParamKeys         []string        // {name} keys of the path template; logged by decodeParams only
+	isQuerier             bool            // controller implements Querier
+	isInputFromQuery      bool            // Inputer input is decoded from the query string (GET/DELETE/HEAD/OPTIONS)
+	isRequestBodyExpected bool            // Inputer input is decoded from the body (POST/PUT/PATCH)
+	hasRespBody           bool            // controller implements Resulter
 	middlewares           middlewareSet   // Vatel middleware, copied by BuildHandlers
 	localMdw              middlewareSet   // per-endpoint middleware, set via AddMiddleware
 	jm                    JsonMasker      // WithJsonMasker, or defaultMasker
 	inputFields           jsonmask.Fields // masking rules of Inputer input
-	queryMaskFields       jsonmask.Fields // masking rules of Querier input
+	querierMaskFields     jsonmask.Fields // masking rules of Querier input
 	resultFields          jsonmask.Fields // masking rules of Resulter result
 	resultFieldsByType    *sync.Map       // result type unknown at compile: reflect.Type → jsonmask.Fields
 	paramFields           []fieldInfo     // precomputed path param layout
-	queryFields           []fieldInfo     // precomputed query layout of Inputer input (GET/DELETE/HEAD/OPTIONS)
+	inputQueryFields      []fieldInfo     // precomputed query layout of Inputer input (GET/DELETE/HEAD/OPTIONS)
 	querierFields         []fieldInfo     // precomputed query layout of Querier input
 	wsLogger              *zerolog.Logger
 }
@@ -133,7 +143,7 @@ type WebsocketHandler interface {
 // The returned pointer must be stable across the request lifetime (i.e. a field
 // of the controller struct, not a local variable).
 type Inputer interface {
-	Input() interface{}
+	Input() any
 }
 
 // Querier is implemented by controllers that bind URL query string variables
@@ -143,23 +153,26 @@ type Inputer interface {
 // QueryParams to implement it. The returned pointer must be stable across the
 // request lifetime.
 type Querier interface {
-	QueryInput() interface{}
+	QueryInput() any
 }
 
 // Resulter is implemented by controllers that produce a JSON response body.
 // Returning nil from Result() suppresses the response body (useful for 304 / 204).
 type Resulter interface {
-	Result() interface{}
+	Result() any
 }
 
 // Paramer is implemented by controllers that bind URL path parameters.
 // The returned pointer must be stable across the request lifetime.
 type Paramer interface {
-	Param() interface{}
+	Param() any
 }
 
 // Sentinel errors.
 var (
+	// ErrAuthorizationHeaderMissed was returned for a request without the
+	// Authorization header.
+	//
 	// Deprecated: neither vatel nor vatel/auth returns it; a request without
 	// a token gets ErrUnauthorized (VTL-0004). Kept for compatibility.
 	ErrAuthorizationHeaderMissed = errors.Template("header Authorization missed").Code("VTL-0001").StatusCode(401).Severity(errors.Medium)
@@ -203,36 +216,38 @@ func (e *Endpoint) handler(l *zerolog.Logger) func(*fasthttp.RequestCtx) {
 		zco := l.With().Str("client", realip.FromRequest(fctx))
 		zc := zco
 
-		if err := e.runMiddleware(ctx, OnRequest, lo, verbose, &zc); err != nil {
+		if err := e.runMiddleware(ctx, OnRequest, lo, verbose, zc); err != nil {
 			return
 		}
 
-		if err := e.runMiddleware(ctx, OnAuthentication, lo, verbose, &zc); err != nil {
+		if err := e.runMiddleware(ctx, OnAuthentication, lo, verbose, zc); err != nil {
 			return
 		}
 		// Auth middleware may enable verbose errors for this token/user.
 		verbose = verbose || ctx.VerboseError()
 
-		if err := e.runMiddleware(ctx, OnAuthorization, lo, verbose, &zc); err != nil {
+		if err := e.runMiddleware(ctx, OnAuthorization, lo, verbose, zc); err != nil {
 			return
 		}
 
 		zc, h, err := e.buildHandler(fctx, lo, zc)
 		if err != nil {
-			e.writeErrorResponse(ctx, lo, verbose, &zc, err)
+			e.writeErrorResponse(ctx, lo, verbose, zc, err)
 			return
 		}
 
 		if lo&LogEnter == LogEnter {
-			e.logEnter(ctx, &zc, zco)
+			// The decoded params and input are logged once, on the enter line.
+			e.logEnter(ctx, zc)
+			zc = zco
 		}
 
-		if err := e.runMiddleware(ctx, OnHandle, lo, verbose, &zc); err != nil {
+		if err := e.runMiddleware(ctx, OnHandle, lo, verbose, zc); err != nil {
 			return
 		}
 
 		if err = h.Handle(ctx); err != nil {
-			e.writeErrorResponse(ctx, lo, verbose, &zc, err)
+			e.writeErrorResponse(ctx, lo, verbose, zc, err)
 			return
 		}
 
@@ -243,8 +258,8 @@ func (e *Endpoint) handler(l *zerolog.Logger) func(*fasthttp.RequestCtx) {
 		if e.hasRespBody {
 			res := h.(Resulter).Result()
 			if !isNilResult(res) {
-				if err := e.writeResponse(ctx, lo, res, &zc); err != nil {
-					e.writeErrorResponse(ctx, lo, verbose, &zc, err)
+				if zc, err = e.writeResponse(ctx, lo, res, zc); err != nil {
+					e.writeErrorResponse(ctx, lo, verbose, zc, err)
 					return
 				}
 			}
@@ -326,15 +341,26 @@ func (e *Endpoint) AddMiddleware(pos MiddlewarePos, f ...func(Context, EndpointM
 	e.localMdw[pos] = append(e.localMdw[pos], f...)
 }
 
+// middlewareAt yields the global, then the per-endpoint middleware at pos.
+func (e *Endpoint) middlewareAt(pos MiddlewarePos) iter.Seq[func(Context, EndpointMeta) error] {
+	return func(yield func(func(Context, EndpointMeta) error) bool) {
+		for _, mws := range [2][]func(Context, EndpointMeta) error{e.middlewares[pos], e.localMdw[pos]} {
+			for _, mw := range mws {
+				if !yield(mw) {
+					return
+				}
+			}
+		}
+	}
+}
+
 // runMiddleware executes global then per-endpoint middleware at pos in order.
 // On the first error it writes the error response and returns it.
-func (e *Endpoint) runMiddleware(ctx Context, pos MiddlewarePos, lo LogOption, verbose bool, zc *zerolog.Context) error {
-	for _, mws := range [2][]func(Context, EndpointMeta) error{e.middlewares[pos], e.localMdw[pos]} {
-		for _, mw := range mws {
-			if err := mw(ctx, e.EndpointMeta); err != nil {
-				e.writeErrorResponse(ctx, lo, verbose, zc, err)
-				return err
-			}
+func (e *Endpoint) runMiddleware(ctx Context, pos MiddlewarePos, lo LogOption, verbose bool, zc zerolog.Context) error {
+	for mw := range e.middlewareAt(pos) {
+		if err := mw(ctx, e.EndpointMeta); err != nil {
+			e.writeErrorResponse(ctx, lo, verbose, zc, err)
+			return err
 		}
 	}
 	return nil
@@ -344,10 +370,8 @@ func (e *Endpoint) runMiddleware(ctx Context, pos MiddlewarePos, lo LogOption, v
 // errors: it is used after the response is written (OnSuccessResponse,
 // OnErrorResponse).
 func (e *Endpoint) runHooks(ctx Context, pos MiddlewarePos) {
-	for _, mws := range [2][]func(Context, EndpointMeta) error{e.middlewares[pos], e.localMdw[pos]} {
-		for _, mw := range mws {
-			mw(ctx, e.EndpointMeta) //nolint:errcheck
-		}
+	for mw := range e.middlewareAt(pos) {
+		mw(ctx, e.EndpointMeta) //nolint:errcheck
 	}
 }
 
@@ -363,40 +387,43 @@ func (e *Endpoint) isPathParamKey(key []byte) bool {
 	return false
 }
 
-// logEnter logs an "enter" event enriched with current user values, then resets
-// zc back to the base context (zco) so subsequent log entries stay clean.
-func (e *Endpoint) logEnter(ctx Context, zc *zerolog.Context, zco zerolog.Context) {
-	ctx.VisitUserValues(func(key []byte, v any) {
-		if e.isPathParamKey(key) {
-			return
+// withUserValues adds the values visit yields to zc, except keys for which
+// skip (if not nil) returns true.
+func withUserValues(zc zerolog.Context, visit func(func([]byte, any)), skip func([]byte) bool) zerolog.Context {
+	visit(func(key []byte, v any) {
+		if skip == nil || !skip(key) {
+			zc = zc.Interface(string(key), v)
 		}
-		*zc = (*zc).Interface(string(key), v)
 	})
-	zl := zc.Logger()
+	return zc
+}
+
+// logEnter logs the "new request" line with zc and the user values of the
+// request.
+func (e *Endpoint) logEnter(ctx Context, zc zerolog.Context) {
+	zl := withUserValues(zc, ctx.VisitUserValues, e.isPathParamKey).Logger()
 	zl.Debug().Msg("new request")
-	*zc = zco
 }
 
 // logExit logs the exit line ("processed", or "completed" with LogEnter) of an
 // HTTP request or a WS message with its duration and the values visit yields,
 // except keys for which skip returns true. A "message" value replaces the
 // message.
-func logExit(zc zerolog.Context, lo LogOption, visit func(func([]byte, interface{})), skip func([]byte) bool, dur time.Duration) {
+func logExit(zc zerolog.Context, lo LogOption, visit func(func([]byte, any)), skip func([]byte) bool, dur time.Duration) {
 	msg := "completed"
 	if lo&LogEnter != LogEnter {
 		msg = "processed"
 	}
-	visit(func(key []byte, v interface{}) {
-		if string(key) == "message" {
-			msg = fmt.Sprint(v)
-			return
-		}
-		if skip != nil && skip(key) {
-			return
-		}
-		zc = zc.Interface(string(key), v)
-	})
-	zl := zc.Logger()
+	withoutMessage := func(f func([]byte, any)) {
+		visit(func(key []byte, v any) {
+			if string(key) == "message" {
+				msg = fmt.Sprint(v)
+				return
+			}
+			f(key, v)
+		})
+	}
+	zl := withUserValues(zc, withoutMessage, skip).Logger()
 	zl.Debug().Str("dur", dur.String()).Msg(msg)
 }
 
@@ -407,14 +434,14 @@ func (e *Endpoint) buildHandler(fctx *fasthttp.RequestCtx, lo LogOption, zc zero
 	h := e.Controller()
 	var err error
 
-	if e.isPathParametrized {
+	if e.isParamer {
 		p := h.(Paramer).Param()
 		if zc, err = decodeParams(fctx, p, e.paramFields, zc); err != nil {
 			return zc, nil, err
 		}
 	}
 
-	var query, in interface{}
+	var query, in any
 
 	if e.isQuerier {
 		query = h.(Querier).QueryInput()
@@ -422,13 +449,13 @@ func (e *Endpoint) buildHandler(fctx *fasthttp.RequestCtx, lo LogOption, zc zero
 			return zc, nil, err
 		}
 		if lo&LogReqInput == LogReqInput {
-			zc = e.logValue(zc, "reqQuery", query, e.queryMaskFields)
+			zc = e.logValue(zc, "reqQuery", query, e.querierMaskFields)
 		}
 	}
 
-	if e.isURLQueryExpected {
+	if e.isInputFromQuery {
 		in = h.(Inputer).Input()
-		if zc, err = decodeURLQuery(fctx, in, e.queryFields, zc); err != nil {
+		if zc, err = decodeURLQuery(fctx, in, e.inputQueryFields, zc); err != nil {
 			return zc, nil, err
 		}
 		if lo&LogReqInput == LogReqInput {
@@ -479,7 +506,7 @@ func (e *Endpoint) buildHandler(fctx *fasthttp.RequestCtx, lo LogOption, zc zero
 // raw body may carry a secret under a key the masker does not match but
 // encoding/json decodes (another letter case, a duplicate key), so it is
 // never logged; when it cannot be decoded only an error marker is logged.
-func (e *Endpoint) logRequestBody(zc zerolog.Context, body []byte, in interface{}, decoded bool) zerolog.Context {
+func (e *Endpoint) logRequestBody(zc zerolog.Context, body []byte, in any, decoded bool) zerolog.Context {
 	if e.inputFields.HasRules() {
 		if !decoded {
 			return zc.Str("requestBodyLoggingFailed", "not logged: the body cannot be decoded and its type has masked fields")
@@ -495,7 +522,7 @@ func (e *Endpoint) logRequestBody(zc zerolog.Context, body []byte, in interface{
 
 // logValue adds v to zc under key. A type without `mask` tags is logged as
 // is; otherwise v is marshalled and masked.
-func (e *Endpoint) logValue(zc zerolog.Context, key string, v interface{}, fields jsonmask.Fields) zerolog.Context {
+func (e *Endpoint) logValue(zc zerolog.Context, key string, v any, fields jsonmask.Fields) zerolog.Context {
 	if !fields.HasRules() {
 		return zc.Interface(key, v)
 	}
@@ -521,31 +548,32 @@ func (e *Endpoint) logJSON(zc zerolog.Context, key string, buf []byte, fields js
 
 // writeResponse marshals res and writes it to the response body,
 // optionally logging and masking sensitive fields.
-func (e *Endpoint) writeResponse(ctx Context, lo LogOption, res interface{}, zc *zerolog.Context) error {
+func (e *Endpoint) writeResponse(ctx Context, lo LogOption, res any, zc zerolog.Context) (zerolog.Context, error) {
 	ctx.SetContentType(e.responseContentType)
-	_, err := e.writeJSON(ctx.BodyWriter(), lo, res, zc)
-	return err
+	zc, _, err := e.writeJSON(ctx.BodyWriter(), lo, res, zc)
+	return zc, err
 }
 
 // isNilResult reports whether a value returned from Resulter.Result() is nil,
 // including typed nils (e.g. (*T)(nil) wrapped in an interface).
-func isNilResult(v interface{}) bool {
+func isNilResult(v any) bool {
 	if v == nil {
 		return true
 	}
 	rv := reflect.ValueOf(v)
-	return rv.Kind() == reflect.Ptr && rv.IsNil()
+	return rv.Kind() == reflect.Pointer && rv.IsNil()
 }
 
 // writeJSON is the shared marshal-mask-log-write implementation used by both
 // HTTP and WebSocket response paths. The marshalled response is masked and
 // logged under "respBody" (LogRespBody) or "result" (LogRespOutput only); the
-// client receives it unmasked. It returns the size of the response. A
-// marshalling error is returned without logging the response.
-func (e *Endpoint) writeJSON(w io.Writer, lo LogOption, res interface{}, zc *zerolog.Context) (int, error) {
+// client receives it unmasked. It returns zc with the logged response and
+// the size of the response. A marshalling error is returned without logging
+// the response.
+func (e *Endpoint) writeJSON(w io.Writer, lo LogOption, res any, zc zerolog.Context) (zerolog.Context, int, error) {
 	buf, err := json.Marshal(res)
 	if err != nil {
-		return 0, err
+		return zc, 0, err
 	}
 
 	if lo&(LogRespOutput|LogRespBody) != 0 {
@@ -553,18 +581,18 @@ func (e *Endpoint) writeJSON(w io.Writer, lo LogOption, res interface{}, zc *zer
 		if lo&LogRespBody == 0 {
 			key = "result"
 		}
-		*zc = e.logJSON(*zc, key, buf, e.resultRules(res))
+		zc = e.logJSON(zc, key, buf, e.resultRules(res))
 	}
 
 	_, err = w.Write(buf)
-	return len(buf), err
+	return zc, len(buf), err
 }
 
 // resultRules returns the masking rules of the result res. Rules of a result
 // type unknown at compile time (Result() returned an untyped nil, as
 // OptionalOutput does before the handler sets Out) are built on first use and
 // cached per type.
-func (e *Endpoint) resultRules(res interface{}) jsonmask.Fields {
+func (e *Endpoint) resultRules(res any) jsonmask.Fields {
 	if e.resultFieldsByType == nil {
 		return e.resultFields
 	}
@@ -572,7 +600,7 @@ func (e *Endpoint) resultRules(res interface{}) jsonmask.Fields {
 	if f, ok := e.resultFieldsByType.Load(t); ok {
 		return f.(jsonmask.Fields)
 	}
-	f := e.jm.Fields(res, "mask")
+	f := e.jm.Fields(res, maskTag)
 	e.resultFieldsByType.Store(t, f)
 	return f
 }
@@ -580,7 +608,7 @@ func (e *Endpoint) resultRules(res interface{}) jsonmask.Fields {
 // writeErrorResponse logs the error (at level lo), writes an error JSON body,
 // reports metrics, triggers the alarm if critical, and runs OnErrorResponse
 // middleware with the endpoint metadata.
-func (e *Endpoint) writeErrorResponse(ctx Context, lo LogOption, verbose bool, zc *zerolog.Context, err error) {
+func (e *Endpoint) writeErrorResponse(ctx Context, lo LogOption, verbose bool, zc zerolog.Context, err error) {
 	if err == nil {
 		return
 	}
@@ -602,18 +630,12 @@ func (e *Endpoint) writeErrorResponse(ctx Context, lo LogOption, verbose bool, z
 	}
 
 	if isErrorLogged(lo, statusCode) {
-		z := *zc
-		ctx.VisitUserValues(func(key []byte, v interface{}) {
-			if e.isPathParamKey(key) {
-				return
-			}
-			z = z.Interface(string(key), v)
-		})
-		zl := z.RawJSON("err", errors.ToJSON(err, errors.WithAttributes(errors.ServerOutputFormat))).Logger()
+		zl := withUserValues(zc, ctx.VisitUserValues, e.isPathParamKey).
+			RawJSON("err", errors.ToJSON(err, errors.WithAttributes(errors.ServerOutputFormat))).Logger()
 		zl.Error().Msg("request failed")
 	}
 
-	ctx.SetContentType([]byte("application/json; charset=utf-8"))
+	ctx.SetContentType([]byte(jsonContentType))
 	ctx.SetStatusCode(statusCode)
 	ctx.BodyWriter().Write(body) //nolint:errcheck
 
@@ -711,7 +733,7 @@ func (e *Endpoint) compile(v *Vatel) error {
 	if e.ResponseContentType != "" {
 		e.responseContentType = []byte(e.ResponseContentType)
 	} else {
-		e.responseContentType = []byte("application/json; charset=utf-8")
+		e.responseContentType = []byte(jsonContentType)
 	}
 
 	c := e.Controller()
@@ -730,7 +752,7 @@ func (e *Endpoint) compile(v *Vatel) error {
 		return fmt.Errorf("endpoint %s %s: controller implements Paramer but path has no parameters", e.Method, origPath)
 	}
 
-	e.isPathParametrized = isParamer
+	e.isParamer = isParamer
 	if isParamer {
 		fields, err := buildParamFields(c.(Paramer).Param())
 		if err != nil {
@@ -754,27 +776,27 @@ func (e *Endpoint) compile(v *Vatel) error {
 			return fmt.Errorf("endpoint %s %s: %w", e.Method, origPath, err)
 		}
 		e.querierFields = fields
-		e.queryMaskFields = e.jm.Fields(qi.QueryInput(), "mask")
+		e.querierMaskFields = e.jm.Fields(qi.QueryInput(), maskTag)
 	}
 
 	// Route input decoding based on HTTP method.
 	switch e.Method {
-	case "GET", "DELETE", "HEAD", "OPTIONS":
+	case fasthttp.MethodGet, fasthttp.MethodDelete, fasthttp.MethodHead, fasthttp.MethodOptions:
 		if e.OptionalBody {
 			return fmt.Errorf("endpoint %s %s: WithOptionalBody is not allowed for a method without a request body", e.Method, origPath)
 		}
-		e.isURLQueryExpected = isInputer
+		e.isInputFromQuery = isInputer
 		if isInputer {
 			fields, err := buildQueryFields(ii.Input(), "Input()")
 			if err != nil {
 				return fmt.Errorf("endpoint %s %s: %w", e.Method, origPath, err)
 			}
-			e.queryFields = fields
+			e.inputQueryFields = fields
 		}
-	case "POST", "PUT", "PATCH":
+	case fasthttp.MethodPost, fasthttp.MethodPut, fasthttp.MethodPatch:
 		e.isRequestBodyExpected = isInputer
 	default:
-		return fmt.Errorf("endpoint %s has unknown HTTP method", origPath)
+		return fmt.Errorf("endpoint %s %s: unknown HTTP method", e.Method, origPath)
 	}
 
 	return nil
@@ -815,18 +837,24 @@ func parsePathParamKeys(p string) []string {
 // compileMask precomputes masking rules of the Inputer input and the Resulter
 // result of controller c. Rules of a result type unknown at compile time
 // (Result() returns an untyped nil) are built per type on first use.
-func (e *Endpoint) compileMask(c interface{}) {
+func (e *Endpoint) compileMask(c any) {
 	if ri, ok := c.(Resulter); ok {
 		if res := ri.Result(); res != nil {
-			e.resultFields = e.jm.Fields(res, "mask")
+			e.resultFields = e.jm.Fields(res, maskTag)
 		} else {
 			e.resultFieldsByType = &sync.Map{}
 		}
 	}
 	if ii, ok := c.(Inputer); ok {
-		e.inputFields = e.jm.Fields(ii.Input(), "mask")
+		e.inputFields = e.jm.Fields(ii.Input(), maskTag)
 	}
 }
+
+// maskTag is the struct tag of masking rules.
+const maskTag = "mask"
+
+// jsonContentType is the Content-Type of JSON responses and error responses.
+const jsonContentType = "application/json; charset=utf-8"
 
 // defaultMasker masks log output of endpoints when WithJsonMasker is not set.
 var defaultMasker = jsonmask.New()
@@ -834,8 +862,6 @@ var defaultMasker = jsonmask.New()
 // compileCommon links the endpoint to the shared Vatel config and resolves
 // the per-endpoint defaults. The Vatel middleware set is copied: middleware
 // added after BuildHandlers has no effect.
-// Auth fields (auth, perms) are left to compileWS for WS endpoints, or to
-// per-endpoint middleware (vatel/auth) for HTTP endpoints.
 func compileCommon(v *Vatel, e *Endpoint) {
 	e.v = v
 	e.middlewares = v.mdw

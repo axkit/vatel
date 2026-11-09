@@ -87,7 +87,7 @@ func TestQueryParams_ImplementsQuerierNotInputer(t *testing.T) {
 	q := &QueryParams[Q]{}
 	q.Query.Page = 3
 
-	var qi interface{} = q
+	var qi any = q
 	querier, ok := qi.(Querier)
 	if !ok {
 		t.Fatal("QueryParams must implement Querier")
@@ -177,13 +177,13 @@ func TestEmbeddedCarriers_InterfacesSatisfied(t *testing.T) {
 	c := &getOrderController{}
 
 	// Check all three optional interfaces are implemented.
-	if _, ok := interface{}(c).(Paramer); !ok {
+	if _, ok := any(c).(Paramer); !ok {
 		t.Error("embedded PathParams should implement Paramer")
 	}
-	if _, ok := interface{}(c).(Inputer); !ok {
+	if _, ok := any(c).(Inputer); !ok {
 		t.Error("embedded Body should implement Inputer")
 	}
-	if _, ok := interface{}(c).(Resulter); !ok {
+	if _, ok := any(c).(Resulter); !ok {
 		t.Error("embedded Output should implement Resulter")
 	}
 }
@@ -416,25 +416,25 @@ func (c *uploadMockCtx) SaveMultipartFile(_ *multipart.FileHeader, path string) 
 	c.savedPath = path
 	return nil
 }
-func (c *uploadMockCtx) BodyWriter() io.Writer                     { return nil }
-func (c *uploadMockCtx) SetContentType([]byte) Context             { return c }
-func (c *uploadMockCtx) SetStatusCode(int) Context                 { return c }
-func (c *uploadMockCtx) SetHeader(_, _ []byte) Context             { return c }
-func (c *uploadMockCtx) Header(string) []byte                      { return nil }
-func (c *uploadMockCtx) RemoteAddr() string                        { return "" }
-func (c *uploadMockCtx) RequestTime() time.Time                    { return time.Time{} }
-func (c *uploadMockCtx) RequestBody() []byte                       { return nil }
-func (c *uploadMockCtx) PathValue(string) string                   { return "" }
-func (c *uploadMockCtx) QueryValue(string) []byte                  { return nil }
-func (c *uploadMockCtx) FormValue(string) []byte                   { return nil }
-func (c *uploadMockCtx) TokenPayload() any                         { return nil }
-func (c *uploadMockCtx) SetTokenPayload(any)                       {}
-func (c *uploadMockCtx) VerboseError() bool                        { return false }
-func (c *uploadMockCtx) SetVerboseError(bool)                      {}
-func (c *uploadMockCtx) Set(string, interface{}) Context           { return c }
-func (c *uploadMockCtx) Get(string) interface{}                    { return nil }
-func (c *uploadMockCtx) VisitUserValues(func([]byte, interface{})) {}
-func (c *uploadMockCtx) Context() context.Context                  { return context.Background() }
+func (c *uploadMockCtx) BodyWriter() io.Writer             { return nil }
+func (c *uploadMockCtx) SetContentType([]byte) Context     { return c }
+func (c *uploadMockCtx) SetStatusCode(int) Context         { return c }
+func (c *uploadMockCtx) SetHeader(_, _ []byte) Context     { return c }
+func (c *uploadMockCtx) Header(string) []byte              { return nil }
+func (c *uploadMockCtx) RemoteAddr() string                { return "" }
+func (c *uploadMockCtx) RequestTime() time.Time            { return time.Time{} }
+func (c *uploadMockCtx) RequestBody() []byte               { return nil }
+func (c *uploadMockCtx) PathValue(string) string           { return "" }
+func (c *uploadMockCtx) QueryValue(string) []byte          { return nil }
+func (c *uploadMockCtx) FormValue(string) []byte           { return nil }
+func (c *uploadMockCtx) TokenPayload() any                 { return nil }
+func (c *uploadMockCtx) SetTokenPayload(any)               {}
+func (c *uploadMockCtx) VerboseError() bool                { return false }
+func (c *uploadMockCtx) SetVerboseError(bool)              {}
+func (c *uploadMockCtx) Set(string, any) Context           { return c }
+func (c *uploadMockCtx) Get(string) any                    { return nil }
+func (c *uploadMockCtx) VisitUserValues(func([]byte, any)) {}
+func (c *uploadMockCtx) Context() context.Context          { return context.Background() }
 
 // makeFileHeader builds a real *multipart.FileHeader containing content.
 func makeFileHeader(filename, content string) *multipart.FileHeader {
