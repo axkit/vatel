@@ -1,7 +1,6 @@
 package vatel
 
 import (
-	"context"
 	"io"
 	"time"
 
@@ -9,25 +8,28 @@ import (
 	"github.com/regorov/websocket"
 )
 
+// WebsocketContext is the per-message interface passed to WebSocket handlers
+// and middleware.
 type WebsocketContext interface {
 	BodyWriter() io.Writer
-	TokenPayload() TokenPayloader
-	SetTokenPayload(tp TokenPayloader)
-	Set(key string, val interface{}) WebsocketContext
-	Get(key string) interface{}
-	VisitValues(func(key []byte, val interface{}))
+	TokenPayload() any
+	SetTokenPayload(tp any)
+	Set(key string, val any) WebsocketContext
+	Get(key string) any
+	VisitValues(func(key []byte, val any))
 	Created() time.Time
 	ID() uint64
 }
 
+// WsContext is the concrete WebsocketContext implementation.
 type WsContext struct {
-	cancel  context.CancelFunc
 	kv      tinymap.TinyMap
-	tp      TokenPayloader
+	tp      any
 	conn    *websocket.Conn
 	created time.Time
 }
 
+// NewWsContext creates a WebsocketContext for the given connection.
 func NewWsContext(c *websocket.Conn) WebsocketContext {
 	return &WsContext{
 		conn:    c,
@@ -35,48 +37,23 @@ func NewWsContext(c *websocket.Conn) WebsocketContext {
 	}
 }
 
-func (ctx *WsContext) SetTokenPayload(tp TokenPayloader) {
-	ctx.tp = tp
+func (c *WsContext) SetTokenPayload(tp any) { c.tp = tp }
+func (c *WsContext) TokenPayload() any      { return c.tp }
+func (c *WsContext) ID() uint64             { return c.conn.ID() }
+func (c *WsContext) Created() time.Time     { return c.created }
+
+// BodyWriter returns the writer of messages to the client. A write after the
+// connection is closed fails with websocket.ErrConnClosed; a write to a client
+// that does not read fails after the write timeout (WithWsWriteTimeout).
+func (c *WsContext) BodyWriter() io.Writer { return c.conn }
+
+func (c *WsContext) Get(key string) any { return c.kv.Get(key) }
+
+func (c *WsContext) Set(key string, val any) WebsocketContext {
+	c.kv.Set(key, val)
+	return c
 }
 
-func (ctx *WsContext) TokenPayload() TokenPayloader {
-	return ctx.tp
-}
-
-func (ctx *WsContext) ID() uint64 {
-	return ctx.conn.ID()
-}
-
-// func (ctx *WsContext) Log(key string, val interface{}) *WsContext {
-// 	if ctx.kv == nil {
-// 		ctx.kv = make(map[string]interface{}, 1)
-// 	}
-// 	ctx.kv[key] = val
-// 	return ctx
-// }
-
-// func (ctx *WsContext) LogValues() map[string]interface{} {
-// 	return ctx.kv
-// }
-//
-
-func (ctx *WsContext) BodyWriter() io.Writer {
-	return ctx.conn
-}
-
-func (ctx *WsContext) Get(key string) interface{} {
-	return ctx.kv.Get(key)
-}
-
-func (ctx *WsContext) Set(key string, val interface{}) WebsocketContext {
-	ctx.kv.Set(key, val)
-	return ctx
-}
-
-func (ctx *WsContext) VisitValues(f func(key []byte, v interface{})) {
-	ctx.kv.VisitValues(f)
-}
-
-func (ctx *WsContext) Created() time.Time {
-	return ctx.created
+func (c *WsContext) VisitValues(f func(key []byte, v any)) {
+	c.kv.VisitValues(f)
 }
