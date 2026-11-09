@@ -137,6 +137,9 @@ Per-endpoint middleware: `e.AddMiddleware(pos, f...)` inside an `EndpointOption`
 - `Endpoint.SuccessStatusCode` (`WithSuccessStatusCode`) is now applied; in v0.14 it was
   ignored. Metrics receive the real response status (v0.14 always reported 200 for a
   successful request).
+- `BuildHandlers` returns an error for an endpoint without a controller factory (`nil`
+  `Controller`/`WebsocketController`), a factory returning a nil (or typed nil) handler,
+  and `vatel.Func(nil)`; before: a panic in `BuildHandlers` or on the first request.
 - A second `BuildHandlers` returns an error, also after a failed build. After a failed
   build the `Vatel` is unusable: a further `BuildHandlers` or `ListenAndServe` returns a
   "previous build failed" error.
@@ -337,6 +340,19 @@ Per-endpoint middleware: `e.AddMiddleware(pos, f...)` inside an `EndpointOption`
   logged); no metric is reported.
 - A WebSocket connection opened after `Shutdown` (of `Vatel` or `WebsocketVatel`) is
   closed at once with a "going away" status, without the `OnOpen`/`OnClose` callbacks.
+- `Shutdown` closes WebSocket connections without waiting and without panics: it queues
+  the "going away" close frame from its own goroutine per connection (before: a
+  synchronous `CloseDetail` that could panic with "close of closed channel" when the
+  client closed at the same time, or when `Shutdown` ran concurrently, and blocked while
+  the outbound queue of a connection was full). Messages arriving after it are not
+  served; a client that does not answer the close frame, or does not read, is
+  disconnected after about one second. `OnClose` of a connection closed by `Shutdown`
+  gets a nil error.
+- `UpgradeWithID` with the ID of a live connection: the new connection is closed at once
+  with status 1008 (policy violation), without `OnOpen`/`OnClose`, and its messages are
+  not served (before: it replaced the live connection in the registry and inherited its
+  token payload, and its close unregistered the live connection). A token payload stored
+  with `UpdateAccessToken` for an ID before its connection opens is still used.
 - New: `WebsocketVatel.OnTokenUpdate(f func(cid uint64, tp AuthPayload) error)` is called
   from `UpdateAccessToken` after the token is decoded and before the payload is stored. An
   error from `f` rejects the token: the payload is not stored (the connection keeps its

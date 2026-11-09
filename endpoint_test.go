@@ -512,6 +512,43 @@ func TestBuildHandlers_RouterConflicts_ReturnError(t *testing.T) {
 	}
 }
 
+// ── BuildHandlers: nil controller factories ──────────────────────────────────
+
+func TestBuildHandlers_NilController_ReturnsError(t *testing.T) {
+	cases := []struct {
+		name string
+		opts []func(*Option)
+		ep   Endpoint
+	}{
+		{"nil HTTP factory", nil, GET("/x", nil)},
+		{"HTTP factory returning nil", nil, GET("/x", func() Handler { return nil })},
+		{"HTTP factory returning a typed nil", nil, GET("/x", func() Handler { return (*plainHandler)(nil) })},
+		{"Func(nil)", nil, GET("/x", Func(nil))},
+		{"nil WS factory", []func(*Option){WithWebsocketSupport(NewWebsocketVatel())}, WS("x", nil)},
+		{"WS factory returning a typed nil", []func(*Option){WithWebsocketSupport(NewWebsocketVatel())},
+			WS("x", func() WebsocketHandler { return (*plainWsHandler)(nil) })},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			v := NewVatel(tc.opts...)
+			v.Add(Endpoints{tc.ep})
+			l := zerolog.Nop()
+			var err error
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						t.Fatalf("BuildHandlers panicked: %v", r)
+					}
+				}()
+				err = v.BuildHandlers(router.New(), &l)
+			}()
+			if err == nil || !strings.Contains(err.Error(), "x") {
+				t.Fatalf("BuildHandlers = %v, want an error naming the endpoint", err)
+			}
+		})
+	}
+}
+
 // ── BuildHandlers: unsupported param and query input types ──────────────────
 
 type mapQueryHandler struct {

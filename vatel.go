@@ -393,8 +393,9 @@ func (l *serverListener) Close() error {
 
 // Shutdown gracefully stops the server:
 //
-//  1. It closes all active WebSocket connections (clients receive a "going
-//     away" frame and can reconnect) and stops accepting new connections.
+//  1. It closes all active WebSocket connections without waiting for them
+//     (clients receive a "going away" frame and can reconnect; see
+//     WebsocketVatel.Shutdown) and stops accepting new connections.
 //     ListenAndServe returns nil; called later, it returns ErrServerClosed.
 //  2. It waits until no HTTP request is in flight: requests being handled
 //     and requests still being received (headers or body being read) finish

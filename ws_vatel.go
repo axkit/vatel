@@ -2,8 +2,10 @@ package vatel
 
 import (
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"io"
+	"net"
 	"sync"
 	"time"
 
@@ -14,8 +16,9 @@ import (
 )
 
 // wsConns is the thread-safe table of live WebSocket connections: the
-// connection, to close it on shutdown, and its token payload, which persists
-// authentication state across messages on the same connection.
+// connection and its network connection, to close it on shutdown, and its
+// token payload, which persists authentication state across messages on the
+// same connection.
 type wsConns struct {
 	mu     sync.RWMutex
 	conns  map[uint64]*wsConn
@@ -23,28 +26,46 @@ type wsConns struct {
 }
 
 type wsConn struct {
-	conn *websocket.Conn // nil when a payload is set for an unknown connection
-	tp   AuthPayload
+	conn      *websocket.Conn // nil when a payload is set for an unknown connection
+	nc        net.Conn        // the network connection of conn
+	tp        AuthPayload
+	goingAway bool // closed by closeAll: its messages are not served
 }
+
+var (
+	errWsShutdown    = stderrors.New("server shutdown")
+	errWsDuplicateID = stderrors.New("duplicate connection id")
+)
+
+// wsCloseTimeout is how long a connection closed by the server waits for the
+// client to answer the close frame (and for a stalled write) before its
+// network reads and writes fail.
+const wsCloseTimeout = time.Second
 
 func newWsConns() wsConns {
 	return wsConns{conns: make(map[uint64]*wsConn)}
 }
 
-// add registers the connection c. After closeAll it returns false and does
-// not register it.
-func (cs *wsConns) add(c *websocket.Conn) bool {
+// add registers the connection c with its network connection nc. A payload
+// stored for its ID before it opened becomes its payload. After closeAll it
+// returns errWsShutdown, and errWsDuplicateID when a live connection has the
+// ID of c; c is not registered then.
+func (cs *wsConns) add(c *websocket.Conn, nc net.Conn) error {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 	if cs.closed {
-		return false
+		return errWsShutdown
 	}
-	if wc, ok := cs.conns[c.ID()]; ok {
-		wc.conn = c
-	} else {
-		cs.conns[c.ID()] = &wsConn{conn: c}
+	wc, ok := cs.conns[c.ID()]
+	switch {
+	case !ok:
+		cs.conns[c.ID()] = &wsConn{conn: c, nc: nc}
+	case wc.conn != nil:
+		return errWsDuplicateID
+	default:
+		wc.conn, wc.nc = c, nc
 	}
-	return true
+	return nil
 }
 
 // setPayload stores the token payload of the connection cid.
@@ -58,45 +79,71 @@ func (cs *wsConns) setPayload(cid uint64, tp AuthPayload) {
 	cs.mu.Unlock()
 }
 
-// payload returns the token payload of the connection cid, if one is stored.
-func (cs *wsConns) payload(cid uint64) (AuthPayload, bool) {
+// serving reports whether the messages of c are served: c is registered and
+// not being closed by closeAll. It returns the token payload of c, if any.
+func (cs *wsConns) serving(c *websocket.Conn) (AuthPayload, bool) {
 	cs.mu.RLock()
 	defer cs.mu.RUnlock()
-	if wc, ok := cs.conns[cid]; ok && wc.tp != nil {
+	if wc, ok := cs.conns[c.ID()]; ok && wc.conn == c && !wc.goingAway {
 		return wc.tp, true
 	}
 	return nil, false
 }
 
-// remove deletes the connection cid and reports whether it was registered.
-func (cs *wsConns) remove(cid uint64) bool {
+// remove unregisters the connection c. It reports whether c was registered
+// and whether closeAll closed it.
+func (cs *wsConns) remove(c *websocket.Conn) (registered, goingAway bool) {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
-	wc, ok := cs.conns[cid]
-	delete(cs.conns, cid)
-	return ok && wc.conn != nil
+	wc, ok := cs.conns[c.ID()]
+	if !ok || wc.conn != c {
+		return false, false
+	}
+	delete(cs.conns, c.ID())
+	return true, wc.goingAway
 }
 
-// closeAll closes all registered connections with a "going away" status and
-// makes add reject new ones.
+// closeAll makes add reject new connections and closes the registered ones
+// with a "going away" status. It does not wait: each close runs in its own
+// goroutine, as queueing the close frame blocks while the outbound queue of
+// the connection is full. Only the first call does anything.
 func (cs *wsConns) closeAll() {
 	cs.mu.Lock()
-	cs.closed = true
-	conns := make([]*websocket.Conn, 0, len(cs.conns))
-	for _, wc := range cs.conns {
-		if wc.conn != nil {
-			conns = append(conns, wc.conn)
-		}
+	defer cs.mu.Unlock()
+	if cs.closed {
+		return
 	}
-	cs.mu.Unlock()
-	for _, c := range conns {
-		closeGoingAway(c)
+	cs.closed = true
+	for _, wc := range cs.conns {
+		if wc.conn == nil {
+			continue
+		}
+		wc.goingAway = true
+		go closeConn(wc.conn, wc.nc, websocket.StatusGoAway, errWsShutdown.Error())
 	}
 }
 
-// closeGoingAway closes c with a "going away" status: the server shuts down.
-func closeGoingAway(c *websocket.Conn) {
-	c.CloseDetail(websocket.StatusGoAway, "server shutdown")
+// closeConn starts the closing handshake of the connection c, whose network
+// connection is nc: it queues a close frame with status and reason, after
+// which the writer of c stops. The client's answering close frame ends the
+// connection; nc reads and writes fail after wsCloseTimeout, so a client that
+// does not answer, or does not read, does not hold the connection open.
+//
+// The websocket library's Conn.Close and Conn.CloseDetail are not safe to call
+// outside the goroutine of the connection: they close a channel that the
+// library closes too when the client close frame arrives. closeConn does not
+// close it and may run in any goroutine. It blocks while the outbound queue of
+// c is full; the write deadline frees a writer stalled on the network.
+func closeConn(c *websocket.Conn, nc net.Conn, status websocket.StatusCode, reason string) {
+	if nc != nil {
+		nc.SetDeadline(time.Now().Add(wsCloseTimeout)) //nolint:errcheck
+	}
+	fr := websocket.AcquireFrame()
+	fr.SetClose()
+	fr.SetStatus(status)
+	fr.SetFin()
+	fr.Write([]byte(reason)) //nolint:errcheck
+	c.WriteFrame(fr)
 }
 
 // WebsocketVatel manages WebSocket endpoint registration and message routing.
@@ -209,9 +256,12 @@ func (wv *WebsocketVatel) compileWS(v *Vatel, e *Endpoint, l *zerolog.Logger) er
 		return fmt.Errorf("endpoint %s %s: WithWsAuthFunc() must be set for endpoints declaring Perms", methodWS, e.Path)
 	}
 
-	c := e.WebsocketController()
-	if c == nil {
+	if e.WebsocketController == nil {
 		return fmt.Errorf("endpoint %s %s: missing WebsocketController", methodWS, e.Path)
+	}
+	c := e.WebsocketController()
+	if isNilResult(c) {
+		return fmt.Errorf("endpoint %s %s: WebsocketController returned nil", methodWS, e.Path)
 	}
 
 	_, hasRespBody := c.(Resulter)
@@ -240,11 +290,27 @@ func (wv *WebsocketVatel) OnTokenUpdate(f func(cid uint64, tp AuthPayload) error
 	wv.callbackOnTokenUpdate = f
 }
 
-// onOpen registers the connection c. A connection opened after Shutdown is
-// closed at once, without the OnOpen and OnClose callbacks.
+// wsNetConnKey is the user value under which Upgrade passes the network
+// connection to onOpen (the websocket library copies string-keyed user values
+// of the request to the connection).
+const wsNetConnKey = "vatel.wsNetConn"
+
+// onOpen registers the connection c. A connection opened after Shutdown, or
+// with the ID of a live connection (UpgradeWithID), is closed at once, without
+// the OnOpen and OnClose callbacks, and its messages are not served.
 func (wv *WebsocketVatel) onOpen(c *websocket.Conn) {
-	if !wv.conns.add(c) {
-		closeGoingAway(c)
+	nc, _ := c.UserValue(wsNetConnKey).(net.Conn)
+	switch err := wv.conns.add(c, nc); err {
+	case nil:
+	case errWsShutdown:
+		closeConn(c, nc, websocket.StatusGoAway, err.Error())
+		return
+	default:
+		if wv.log != nil {
+			wv.log.Warn().Uint64("connectionId", c.ID()).Str("client", c.RemoteAddr().String()).
+				Msg("ws connection rejected: duplicate connection id")
+		}
+		closeConn(c, nc, websocket.StatusViolation, err.Error())
 		return
 	}
 	if wv.callbackOnOpen != nil {
@@ -253,8 +319,12 @@ func (wv *WebsocketVatel) onOpen(c *websocket.Conn) {
 }
 
 func (wv *WebsocketVatel) onClose(c *websocket.Conn, err error) {
-	if !wv.conns.remove(c.ID()) {
+	registered, goingAway := wv.conns.remove(c)
+	if !registered {
 		return
+	}
+	if goingAway {
+		err = nil // closed by Shutdown: err is the client's answer or a timeout
 	}
 	if wv.callbackOnClose != nil {
 		wv.callbackOnClose(c, err)
@@ -262,19 +332,26 @@ func (wv *WebsocketVatel) onClose(c *websocket.Conn, err error) {
 }
 
 // Shutdown closes all active WebSocket connections with a "going away" status,
-// so clients can reconnect to another instance; a connection opened later is
-// closed at once. Vatel.Shutdown calls it.
+// so clients can reconnect to another instance; their further messages are
+// not served, and a connection opened later is closed at once. It does not
+// wait for the connections to close: a client that does not answer the close
+// frame (or does not read) is disconnected after about one second.
+// Vatel.Shutdown calls it; calling it again does nothing.
 func (wv *WebsocketVatel) Shutdown() {
 	wv.conns.closeAll()
 }
 
 // Upgrade upgrades an HTTP connection to WebSocket.
 func (wv *WebsocketVatel) Upgrade(ctx *fasthttp.RequestCtx) {
+	ctx.SetUserValue(wsNetConnKey, ctx.Conn())
 	wv.ws.Upgrade(ctx)
 }
 
-// UpgradeWithID upgrades an HTTP connection to WebSocket with a caller-supplied ID.
+// UpgradeWithID upgrades an HTTP connection to WebSocket with a caller-supplied
+// ID. The ID must not be the ID of a live connection: such a connection is
+// closed at once with a "policy violation" status (1008).
 func (wv *WebsocketVatel) UpgradeWithID(ctx *fasthttp.RequestCtx, id uint64) {
+	ctx.SetUserValue(wsNetConnKey, ctx.Conn())
 	wv.ws.UpgradeWithID(ctx, id)
 }
 
@@ -301,12 +378,16 @@ func ToClientJSON(err error) []byte {
 }
 
 func (wv *WebsocketVatel) onMessage(c *websocket.Conn, _ bool, data []byte) {
+	tp, ok := wv.conns.serving(c)
+	if !ok {
+		return // rejected by onOpen or closed by Shutdown
+	}
 	msg, e, err := wv.route(data)
 	if err != nil {
 		wv.writeEnvelopeError(c, msg.Path, err)
 		return
 	}
-	wv.serveMessage(c, e, msg)
+	wv.serveMessage(c, e, msg, tp)
 }
 
 // route decodes the message envelope data and returns it with the endpoint
@@ -330,8 +411,8 @@ func (wv *WebsocketVatel) route(data []byte) (WebsocketRequest, *Endpoint, error
 
 // serveMessage serves the message msg of connection c with the endpoint e:
 // authorization, input decoding, the handler, the reply, the exit log line
-// and the metric.
-func (wv *WebsocketVatel) serveMessage(c *websocket.Conn, e *Endpoint, msg WebsocketRequest) {
+// and the metric. tp is the token payload of c, if any.
+func (wv *WebsocketVatel) serveMessage(c *websocket.Conn, e *Endpoint, msg WebsocketRequest, tp AuthPayload) {
 	ctx := NewWsContext(c)
 	verbose := e.v.cfg.verboseError
 	lo := effectiveLogLevel(e.LogOptions)
@@ -343,7 +424,7 @@ func (wv *WebsocketVatel) serveMessage(c *websocket.Conn, e *Endpoint, msg Webso
 	zc := zco
 
 	// Restore token payload from the connection table (set by UpdateAccessToken).
-	if tp, ok := wv.conns.payload(c.ID()); ok {
+	if tp != nil {
 		ctx.SetTokenPayload(tp)
 	}
 

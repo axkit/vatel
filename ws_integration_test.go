@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	stderrors "errors"
+	"fmt"
+	"net"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -13,6 +15,7 @@ import (
 	"github.com/fasthttp/router"
 	"github.com/regorov/websocket"
 	"github.com/rs/zerolog"
+	"github.com/valyala/fasthttp"
 	"github.com/valyala/fasthttp/fasthttputil"
 )
 
@@ -97,6 +100,24 @@ type wsFailHandler struct{}
 
 func (wsFailHandler) Handle(WebsocketContext) error { return stderrors.New("SECRET dsn") }
 
+// wsSlowHandler holds the connection busy for a while.
+type wsSlowHandler struct{}
+
+func (wsSlowHandler) Handle(WebsocketContext) error {
+	time.Sleep(150 * time.Millisecond)
+	return nil
+}
+
+// wsFloodHandler writes more messages than the outbound queue holds.
+type wsFloodHandler struct{}
+
+func (wsFloodHandler) Handle(ctx WebsocketContext) error {
+	for range 1000 {
+		ctx.BodyWriter().Write([]byte(`{"flood":true}`)) //nolint:errcheck
+	}
+	return nil
+}
+
 type wsHarness struct {
 	t       *testing.T
 	client  *websocket.Client
@@ -138,10 +159,13 @@ func newWSHarness(t *testing.T) *wsHarness {
 		WS("perm", func() WebsocketHandler { return &wsSecretHandler{} }, Perms("orders:read"), WithLogOption(LogExit)),
 		WS("fail", func() WebsocketHandler { return wsFailHandler{} }, WithLogOption(LogExit)),
 		WS("pin", func() WebsocketHandler { return &wsPINHandler{} }, WithLogOption(LogExit)),
+		WS("slow", func() WebsocketHandler { return wsSlowHandler{} }),
+		WS("flood", func() WebsocketHandler { return wsFloodHandler{} }),
 	})
 
 	mux := router.New()
 	mux.GET("/ws", wv.Upgrade)
+	mux.GET("/ws7", func(ctx *fasthttp.RequestCtx) { wv.UpgradeWithID(ctx, 7) })
 	l := zerolog.New(h.log)
 	if err := v.BuildHandlers(mux, &l); err != nil {
 		t.Fatalf("BuildHandlers: %v", err)
@@ -165,30 +189,57 @@ func newWSHarness(t *testing.T) *wsHarness {
 // dial opens a new WebSocket connection to the harness server.
 func (h *wsHarness) dial() *websocket.Client {
 	h.t.Helper()
+	c, _ := h.dialPath("/ws")
+	return c
+}
+
+// dialPath opens a new WebSocket connection to path and returns it with its
+// network connection.
+func (h *wsHarness) dialPath(path string) (*websocket.Client, net.Conn) {
+	h.t.Helper()
 	conn, err := h.ln.Dial()
 	if err != nil {
 		h.t.Fatalf("dial: %v", err)
 	}
 	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
-	c, err := websocket.MakeClient(conn, "http://test/ws")
+	c, err := websocket.MakeClient(conn, "http://test"+path)
 	if err != nil {
 		h.t.Fatalf("websocket client: %v", err)
 	}
-	return c
+	return c, conn
 }
 
 // send writes a message and returns the reply.
 func (h *wsHarness) send(msg string) string {
 	h.t.Helper()
-	if _, err := h.client.Write([]byte(msg)); err != nil {
+	return h.sendOn(h.client, msg)
+}
+
+// sendOn writes a message to c and returns the reply.
+func (h *wsHarness) sendOn(c *websocket.Client, msg string) string {
+	h.t.Helper()
+	if _, err := c.Write([]byte(msg)); err != nil {
 		h.t.Fatalf("write: %v", err)
 	}
 	fr := websocket.AcquireFrame()
 	defer websocket.ReleaseFrame(fr)
-	if _, err := h.client.ReadFrame(fr); err != nil {
+	if _, err := c.ReadFrame(fr); err != nil {
 		h.t.Fatalf("read: %v", err)
 	}
 	return string(fr.Payload())
+}
+
+// waitFor waits until cond holds.
+func (h *wsHarness) waitFor(what string, cond func() bool) {
+	h.t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	h.t.Fatalf("timeout waiting for %s", what)
 }
 
 // waitLog waits until the log contains s.
@@ -358,4 +409,140 @@ func TestWS_ConnectionAfterShutdownClosed(t *testing.T) {
 	if n > 1 {
 		t.Errorf("connections registered after Shutdown: %d", n)
 	}
+}
+
+// A second connection upgraded with the ID of a live connection is closed at
+// once, without OnOpen/OnClose and without serving its messages: it must not
+// inherit the token payload of the first connection, nor unregister it.
+func TestWS_DuplicateIDRejected(t *testing.T) {
+	h := newWSHarness(t)
+	a, _ := h.dialPath("/ws7")
+	if got := h.sendOn(a, `{"path":"updateAccessToken","data":{"mid":"6ba7b810-9dad-11d1-80b4-00c04fd430c8","at":"tok"}}`); !strings.Contains(got, `"Ok"`) {
+		t.Fatalf("updateAccessToken reply = %s", got)
+	}
+
+	b, _ := h.dialPath("/ws7")
+	_, _ = b.Write([]byte(`{"path":"perm"}`))
+	fr := websocket.AcquireFrame()
+	defer websocket.ReleaseFrame(fr)
+	for {
+		if _, err := b.ReadFrame(fr); err != nil || fr.IsClose() {
+			break
+		}
+		t.Errorf("the duplicate connection got a reply: %s", fr.Payload())
+	}
+
+	h.mu.Lock()
+	for i, p := range h.authPaths {
+		if p == "perm" {
+			t.Errorf("the duplicate connection was served (token payload %v)", h.authTP[i])
+		}
+	}
+	h.mu.Unlock()
+	if got := h.opened.Load(); got != 2 {
+		t.Errorf("OnOpen calls = %d, want 2 (the duplicate is not reported)", got)
+	}
+	if got := h.closed.Load(); got != 0 {
+		t.Errorf("OnClose calls = %d, want 0", got)
+	}
+
+	// The first connection is still registered and keeps its payload.
+	if got := h.sendOn(a, `{"path":"perm","data":{"name":"a"}}`); !strings.Contains(got, `"name":"a"`) {
+		t.Fatalf("first connection reply = %s", got)
+	}
+	h.mu.Lock()
+	last := h.authTP[len(h.authTP)-1]
+	h.mu.Unlock()
+	if last == nil {
+		t.Error("the first connection lost its token payload")
+	}
+}
+
+// Shutdown racing a client close frame (and another Shutdown) must not close
+// the connection twice: the websocket library panics on that.
+func TestWS_ShutdownRacesClientClose(t *testing.T) {
+	for range 10 {
+		h := newWSHarness(t)
+		// Keep the connection busy, then queue a close frame behind the message.
+		if _, err := h.client.Write([]byte(`{"path":"slow"}`)); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(20 * time.Millisecond)
+		fr := websocket.AcquireFrame()
+		fr.SetClose()
+		fr.SetFin()
+		fr.SetStatus(websocket.StatusNone)
+		fr.Mask()
+		if _, err := h.client.WriteFrame(fr); err != nil {
+			t.Fatal(err)
+		}
+		websocket.ReleaseFrame(fr)
+		time.Sleep(20 * time.Millisecond)
+
+		var wg sync.WaitGroup
+		for range 2 {
+			wg.Go(h.wv.Shutdown)
+		}
+		wg.Wait()
+		h.waitFor("OnClose", func() bool { return h.closed.Load() == 1 })
+	}
+}
+
+// Shutdown must not block on a connection whose outbound queue is full.
+func TestWS_ShutdownFullOutboundQueue(t *testing.T) {
+	h := newWSHarness(t)
+	c, conn := h.dialPath("/ws")
+	defer conn.Close()
+	if _, err := c.Write([]byte(`{"path":"flood"}`)); err != nil {
+		t.Fatal(err)
+	}
+	// The client does not read: the handler fills the queue and blocks.
+	time.Sleep(100 * time.Millisecond)
+
+	done := make(chan struct{})
+	go func() {
+		h.wv.Shutdown()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		conn.Close() // unblock the server
+		t.Fatal("Shutdown blocked on a full outbound queue")
+	}
+}
+
+// Shutdown closes an open connection with a "going away" close frame, after
+// the message being handled, and reports it to OnClose without an error.
+func TestWS_ShutdownGoingAway(t *testing.T) {
+	h := newWSHarness(t)
+	var closeErr atomic.Value
+	h.wv.OnClose(func(_ *websocket.Conn, err error) {
+		closeErr.Store(fmt.Sprint(err))
+		h.closed.Add(1)
+	})
+	if _, err := h.client.Write([]byte(`{"path":"slow"}`)); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	h.wv.Shutdown()
+
+	fr := websocket.AcquireFrame()
+	defer websocket.ReleaseFrame(fr)
+	for {
+		if _, err := h.client.ReadFrame(fr); err != nil {
+			t.Fatalf("read: %v (want a close frame)", err)
+		}
+		if fr.IsClose() {
+			break
+		}
+	}
+	if fr.Status() != websocket.StatusGoAway {
+		t.Errorf("close status = %v, want going away", fr.Status())
+	}
+	h.waitFor("OnClose", func() bool { return h.closed.Load() == 1 })
+	if got := closeErr.Load(); got != "<nil>" {
+		t.Errorf("OnClose error = %v, want nil", got)
+	}
+	h.waitMetric("slow", 1) // the message being handled was finished
 }

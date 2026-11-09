@@ -736,7 +736,16 @@ func (e *Endpoint) compile(v *Vatel) error {
 		e.responseContentType = []byte(jsonContentType)
 	}
 
+	if e.Controller == nil {
+		return fmt.Errorf("endpoint %s %s: missing Controller", e.Method, origPath)
+	}
 	c := e.Controller()
+	if isNilResult(c) {
+		return fmt.Errorf("endpoint %s %s: Controller returned nil", e.Method, origPath)
+	}
+	if fh, ok := c.(*funcHandler); ok && fh.f == nil {
+		return fmt.Errorf("endpoint %s %s: Func(nil)", e.Method, origPath)
+	}
 
 	// Validate path param / Paramer consistency.
 	e.pathParamKeys = parsePathParamKeys(e.Path)

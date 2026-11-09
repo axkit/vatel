@@ -787,8 +787,14 @@ mux.GET("/ws", wv.Upgrade) // the HTTP route that upgrades to WebSocket
 - `vatel.WithLogger(l)` sets the logger of WS endpoints (lines get `"layer":"ws"`);
   without it they log to the logger passed to `BuildHandlers`.
 - `OnOpen` and `OnClose` register connection callbacks. `v.Shutdown` closes all WebSocket
-  connections with a "going away" status first; a connection opened after that is closed
-  at once, without the callbacks.
+  connections with a "going away" status first, without waiting for them: their further
+  messages are not served, and a client that does not answer the close frame is
+  disconnected after about one second (`OnClose` gets a nil error). A connection opened
+  after that is closed at once, without the callbacks.
+- `UpgradeWithID(ctx, id)`: the ID must be unique among live connections. A connection
+  with the ID of a live one is closed at once with status 1008 (policy violation),
+  without the callbacks; its messages are not served and it does not share the token
+  payload of the live connection.
 
 ## Other options
 

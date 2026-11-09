@@ -10,8 +10,20 @@ import (
 
 	"github.com/axkit/errors"
 	"github.com/fasthttp/router"
+	"github.com/regorov/websocket"
 	"github.com/rs/zerolog"
 )
+
+// payload returns the token payload stored for the connection cid, if any.
+// Tests only: requests read the payload of their connection via serving.
+func (cs *wsConns) payload(cid uint64) (AuthPayload, bool) {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	if wc, ok := cs.conns[cid]; ok && wc.tp != nil {
+		return wc.tp, true
+	}
+	return nil, false
+}
 
 func TestDecodeWSInput_Invalid(t *testing.T) {
 	type input struct {
@@ -266,8 +278,25 @@ func TestWsConns_SetGetRemove(t *testing.T) {
 		t.Fatalf("payload after set = %v, %v", got, ok)
 	}
 
-	cs.remove(1)
-	if _, ok := cs.payload(1); ok {
+	// A payload stored before the connection opened becomes its payload.
+	c := &websocket.Conn{} // ID 0
+	cs.setPayload(c.ID(), tp)
+	if err := cs.add(c, nil); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if got, ok := cs.serving(c); !ok || got != AuthPayload(tp) {
+		t.Fatalf("serving after add = %v, %v", got, ok)
+	}
+	if err := cs.add(&websocket.Conn{}, nil); err != errWsDuplicateID {
+		t.Errorf("add of a duplicate ID = %v, want errWsDuplicateID", err)
+	}
+	if registered, _ := cs.remove(&websocket.Conn{}); registered {
+		t.Error("remove of another connection with the same ID must not unregister it")
+	}
+	if registered, _ := cs.remove(c); !registered {
+		t.Error("remove: want registered")
+	}
+	if _, ok := cs.payload(c.ID()); ok {
 		t.Error("expected not found after remove")
 	}
 }
