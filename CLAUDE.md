@@ -30,8 +30,9 @@ go mod tidy
 ## Architecture Overview
 
 Vatel is a REST framework built on [fasthttp](https://github.com/valyala/fasthttp) and
-fasthttp/router. Requires Go 1.24 (`strings.SplitSeq`, range-over-func); CI reads the version from
-`go.mod`. User docs: `README.md`; v0.14 → v1.25 changes: `MIGRATION.md`. Plans live in
+fasthttp/router. Requires Go 1.26 (fasthttp v1.77.0 needs it), fasthttp v1.77.0+ and fasthttp/router
+v1.5.4+ (`Shutdown` relies on fasthttp's `ShutdownWithContext`, see Core types); CI reads the version
+from `go.mod`. User docs: `README.md`; v0.14 → v1.25 changes: `MIGRATION.md`. Plans live in
 `docs/plans/`, deferred work in `docs/backlog/`.
 
 ### Files
@@ -57,14 +58,21 @@ fasthttp/router. Requires Go 1.24 (`strings.SplitSeq`, range-over-func); CI read
 (duplicate/conflicting route, own `GET /`) are returned as errors. It may be called once and copies the
 middleware; after a failed build the `Vatel` is unusable ("previous build failed"), registration is not
 transactional. `ListenAndServe` builds if needed and serves on a `fasthttp.Server` (`IdleTimeout` =
-`DefaultIdleTimeout`, `CloseOnShutdown`, then `WithServerConfig`). `srv`/`ln`/`served`/`closed` are guarded
-by `v.mu`; `inflight` counts running HTTP handlers.
+`DefaultIdleTimeout`, `CloseOnShutdown`, then `WithServerConfig`; vatel uses no `ConnState` hook, the
+user's is left as is). `srv`/`ln`/`closed`/`stopped` are guarded by `v.mu`. `ln` is a `serverListener`
+whose `Close` is idempotent.
 
 `Shutdown(ctx)`: mark closed (a later `ListenAndServe` returns `ErrServerClosed`), close WS connections,
-close the listener (idempotent `serverListener`) and start `srv.Shutdown` in the background, wait until
-the listener is closed and `inflight == 0` (idle keep-alive connections are not waited for), cancel the
-base context, return nil. If `ctx` is done first: cancel the base context at once, wait up to
-`shutdownGrace` (1 s) for the cancelled requests, return `ctx.Err()`.
+then `stopServer` once: close the listener (fasthttp's shutdown does nothing if `Serve` has not
+registered it yet) and run `srv.ShutdownWithContext(context.Background())` in a goroutine that closes
+`stopped`. fasthttp closes idle connections at once and new ones that sent nothing after 5 s, sets
+`Connection: close` and waits until no connection is open; a connection is not idle from the first
+byte of a request until its response is written (so requests still being received, pipelined requests
+and `MaxConnsPerIP`-wrapped connections are covered). It is not given `ctx`: on expiry fasthttp resets its stop flag and forgets the
+listeners, so leftover connections would keep serving and a second call would not wait. `Shutdown`
+waits for `stopped` or `ctx`: stopped → cancel the base context, return nil; `ctx` done → cancel the
+base context at once, wait up to `shutdownGrace` (1 s) for `stopped`, return `ctx.Err()`. Concurrent
+calls share `stopped`, each with its own `ctx`.
 
 **`Endpoint`** — embeds `EndpointMeta` (`Method`, `Path`, `Perms`, `LogOptions`) plus public config
 (`Compress`, `ManualStatusCode`, `SuccessStatusCode`, `ResponseContentType`, `OptionalBody`, `Timeout`) and
@@ -73,7 +81,7 @@ a controller factory (`Controller func() Handler` or `WebsocketController`). Bui
 `WithSuccessStatusCode`, `WithManualStatusCode`, `WithContentType`, `WithOptionalBody`, `WithTimeout`).
 `compile()` validates config (path begins with `/`, Paramer vs `{params}` in path, `OptionalBody` only on
 POST/PUT/PATCH, known method) and precomputes reflection data and masking rules. `compileCommon` links the
-endpoint to its `*Vatel` (`e.v`: shared config, base context, in-flight counter) and resolves per-endpoint
+endpoint to its `*Vatel` (`e.v`: shared config, base context) and resolves per-endpoint
 defaults (`Timeout`, `LogOptions`, `jm`, a copy of the middleware set). The factory is called once at compile time to
 inspect the controller, then once per request.
 
@@ -90,7 +98,8 @@ type Validator interface { Validate() error }        // on input types; called a
 
 Carriers implement them via embedding: `PathParams[T]` (`Params`), `QueryParams[T]` (`Query`, a `Querier`,
 not an `Inputer`), `Body[T]` (`In`), `Output[T]` (`Out`), `OptionalOutput[T]` (`Out *T`, nil = no body),
-`Upload` (multipart, call `BindFile`), `Func(f)` (plain function as factory).
+`Upload` (multipart, call `BindFile`), `Func(f)` (plain function as factory; the only handler allowed on a
+path with `{params}` without being a `Paramer`, it reads them with `ctx.PathValue`).
 
 ### Request pipeline (`Endpoint.handler`)
 
@@ -183,6 +192,7 @@ context. `e.wsWriteErrorResponse` uses the HTTP `errorResponse` (status mapping,
 - Tests: pipeline tests call `run(v, GET(...), fctx)` (`handler_test.go`; mocks in `testutil_test.go`); tests that
   depend on router user values (path params, logging) use `router.New()` + `BuildHandlers` + `mux.Handler`
   (see `logging_test.go`, `auth/auth_test.go`). Logs are checked with `zerolog.New(&buf)`. Server/shutdown
-  tests use `v.serve` on a `fasthttputil` in-memory listener (`shutdown_test.go`); WS end-to-end tests use a
+  tests use `v.serve` on a real TCP listener (`startServer`; `startServerOn` also runs a `fasthttputil`
+  in-memory one) in `shutdown_test.go` — fasthttp wraps only TCP connections for `MaxConnsPerIP`; WS end-to-end tests use a
   websocket client over it (`ws_integration_test.go`). Auth is tested only through the real `auth` package.
 - Every behaviour change visible to users goes into `MIGRATION.md`.

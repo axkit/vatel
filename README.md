@@ -12,7 +12,9 @@ the controller, calls it, serializes the result to JSON and handles errors, logg
 go get github.com/axkit/vatel@latest
 ```
 
-Requires Go 1.24. Errors are built with [github.com/axkit/errors](https://github.com/axkit/errors) v1.1.0+.
+Requires Go 1.26, [fasthttp](https://github.com/valyala/fasthttp) v1.77.0+ and
+[fasthttp/router](https://github.com/fasthttp/router) v1.5.4+ (Go modules raise them in your
+project automatically). Errors are built with [github.com/axkit/errors](https://github.com/axkit/errors) v1.1.0+.
 Upgrading from v0.14? See [MIGRATION.md](MIGRATION.md).
 
 ## Contents
@@ -213,7 +215,9 @@ per-endpoint middleware with `e.AddMiddleware(pos, f)`.
 
 `v.BuildHandlers(mux, &log)` validates every endpoint and registers it with the router.
 It returns an error for, among others: a path with `{params}` and a controller that is not
-a `Paramer` (or the reverse), a path that does not begin with `/`, a route the router
+a `Paramer` (or the reverse; a `vatel.Func` handler may have `{params}` and reads them with
+`ctx.PathValue`), a `Param()`, `QueryInput()` or GET/DELETE/HEAD/OPTIONS `Input()` that
+does not return a pointer to a struct, a path that does not begin with `/`, a route the router
 rejects (a duplicate or conflicting path, your own `GET /`), `WithOptionalBody` on
 GET/DELETE/HEAD/OPTIONS, an unknown method, a WS endpoint without `WithWebsocketSupport`,
 a duplicate WS path, WS `Perms` without `WithWsAuthFunc`. `MustBuildHandlers` panics
@@ -230,7 +234,8 @@ build the router may hold part of the routes, so the `Vatel` is unusable; furthe
 `v.ListenAndServe(addr, mux, &log)` builds the handlers if that has not been done yet and
 starts a `fasthttp.Server` with `IdleTimeout` = `vatel.DefaultIdleTimeout` (90 s) and
 `CloseOnShutdown`. `vatel.WithServerConfig(func(*fasthttp.Server))` changes it (e.g.
-`ReadTimeout`, `MaxRequestBodySize`). After `Shutdown` it returns nil; called after
+`ReadTimeout`, `MaxRequestBodySize`, `MaxConnsPerIP`, a `ConnState` hook; do not replace
+`Handler`). After `Shutdown` it returns nil; called after
 `Shutdown`, it returns `vatel.ErrServerClosed`. You can also serve `mux.Handler` with your
 own server; then `Shutdown` only cancels request contexts and closes WebSocket
 connections.
@@ -330,13 +335,18 @@ Order of steps for a request: path parameters (`Paramer`), query (`Querier`), qu
 body (`Inputer`), then validation: `Validate()` of the `Querier` input, then `Validate()`
 of the `Inputer` input. The first error rejects the request with 400.
 
-- Path parameters: `int*`, `uint*`, `string`, `bool`, `float*` fields; the struct is flat.
-- Query: the same types, pointers to them, `github.com/axkit/date.Date`; fields of nested
-  structs (embedded or untagged) are flattened. A missing variable leaves the field as is.
+- Path parameters and query: `int*`, `uint*`, `string`, `bool`, `float*` fields, pointers
+  to them, `github.com/axkit/date.Date` and `*date.Date`; fields of nested structs
+  (embedded or untagged) are flattened. A nested struct of a type already being flattened
+  (a cycle such as `Parent *Filter`) is skipped. A missing query variable leaves the field
+  as is.
 - A value that cannot be parsed gives 400 `VTL-0006` (`ErrValidationFailed`) with field `param`.
 - Body: `encoding/json` into the `Inputer` value. An empty or whitespace-only body gives
   400 `VTL-0007` "empty request body, JSON expected"; invalid JSON gives 400 `VTL-0007`
-  "request body is not valid JSON".
+  "request body is not valid JSON". For an input type with `mask` tags the
+  `encoding/json` error is not wrapped, because it may quote a value (a number that does
+  not fit the field, a `time.Time`); the error carries only the fields `field`, `type` and
+  `offset`.
 - A request body on DELETE is not supported (RFC 9110 leaves its semantics undefined); use
   query parameters (`QueryParams`).
 
@@ -611,7 +621,8 @@ type LoginInput struct {
   non-empty `mask` logs `"***"`. Masking functions are not applied to parameters. A `mask`
   tag on a nested struct of a query input applies to its fields without their own tag.
   An invalid value of a masked parameter gives 400 without the value in the error (not
-  even in verbose responses).
+  even in verbose responses). The same holds for a JSON body (HTTP or WS `data`) of an
+  input type with `mask` tags that cannot be decoded.
 
 ```go
 type ResetPassword struct {
@@ -632,16 +643,20 @@ Types without `mask` tags are logged unchanged.
 
 - It is a child of a base context owned by the `Vatel`. `v.Shutdown(ctx)`:
   1. closes WebSocket connections and stops accepting new connections;
-  2. waits until no request is in flight. Idle keep-alive connections do not hold it up:
-     the server closes them on their next request (the response carries
-     `Connection: close`) or after the idle timeout;
+  2. waits until no request is in flight: requests being handled and requests still
+     being received (headers or body) finish normally, and their responses carry
+     `Connection: close`. Idle keep-alive connections do not hold it up: they are closed.
+     A new connection that has sent nothing yet gets about 5 seconds to start its request
+     (as in net/http), then it is closed too;
   3. cancels the base context and returns nil.
 
   When `ctx` is done first, the base context is cancelled at once, so handlers still
   running get `context.Canceled` (503); `Shutdown` waits up to one more second for them
-  to finish and returns `ctx.Err()`. Requests that start after `Shutdown` get a cancelled
-  context. Without a server started by `ListenAndServe`, the base context is cancelled at
-  once. Calling `Shutdown` again is safe.
+  to finish and returns `ctx.Err()`; requests still running after that are not
+  interrupted, and their connections are closed when they finish. Requests that start
+  after `Shutdown` get a cancelled context. Without a server started by `ListenAndServe`,
+  the base context is cancelled at once. Calling `Shutdown` again, also concurrently, is
+  safe: each call waits for the server with its own `ctx`.
 - `vatel.WithTimeout(d)` (endpoint) and `vatel.WithDefaultTimeout(d)` (`Vatel`, for
   endpoints without their own timeout) add a deadline. Such a context is also cancelled
   when the request ends.

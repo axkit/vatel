@@ -10,6 +10,9 @@ Version notes:
   or later.
 - `github.com/axkit/errors` v1.1.0 is required (see [section 3](#3-upgrading-from-v013v014-and-axkiterrors-v0x--v10x)).
 - `github.com/axkit/bitset` is a regular dependency, v1.0.4 (no `replace` directive).
+- Go 1.26, `github.com/valyala/fasthttp` v1.77.0 and `github.com/fasthttp/router` v1.5.4
+  are the new minimums (v0.14: Go 1.24, fasthttp v1.31.0, router v1.4.4); see
+  [Module](#module).
 
 Contents:
 
@@ -140,7 +143,10 @@ Per-endpoint middleware: `e.AddMiddleware(pos, f...)` inside an `EndpointOption`
 - `BuildHandlers` returns errors where v0.14 panicked (`MustBuildHandlers` still panics):
   a WS endpoint without `WithWebsocketSupport`, a duplicate WS path (both name the path),
   a route the router rejects (a duplicate or conflicting path, your own `GET /`, which is
-  taken by the built-in endpoint list) and a path that does not begin with `/`.
+  taken by the built-in endpoint list), a path that does not begin with `/`, and a
+  `Param()`, `QueryInput()` or GET/DELETE/HEAD/OPTIONS `Input()` that does not return a
+  pointer to a struct. A nested struct of a type already being flattened in a query or
+  path input (a cycle such as `Parent *Filter`) is skipped instead of recursing forever.
 - Middleware and endpoints added after `BuildHandlers` have no effect: it copies them.
 - Removed: `NoInputLog`, `NoResultLog`, `LanguageLabel`.
 - The `?description=true` query parameter no longer returns an endpoint description page;
@@ -198,6 +204,11 @@ Per-endpoint middleware: `e.AddMiddleware(pos, f...)` inside an `EndpointOption`
 ### Input decoding
 
 - A request body on DELETE is not supported; use the query string (`QueryParams`).
+- A body (or WS `data`) of an input type with `mask` tags that cannot be decoded gives
+  `ErrInvalidRequestBody` without the `encoding/json` error wrapped, since it may quote a
+  value (a number that does not fit the field, a `time.Time`, a custom `UnmarshalJSON`
+  error); only the fields `field`, `type` and `offset` are set. Types without `mask` tags
+  keep the wrapped error.
 - New: `WithOptionalBody()` (field `Endpoint.OptionalBody`) for POST/PUT/PATCH. An empty
   or whitespace-only body is accepted, the input stays zero and `Validate()` is not called.
   On GET/DELETE it is a `BuildHandlers` error. Without the option a whitespace-only body
@@ -280,14 +291,18 @@ Per-endpoint middleware: `e.AddMiddleware(pos, f...)` inside an `EndpointOption`
 ### Request context
 
 - New: `ctx.Context()` is a child of the `Vatel` base context. `Shutdown(ctx)` stops
-  accepting connections, waits until no request is in flight (idle keep-alive connections
-  do not hold it up), cancels the base context and returns nil. When `ctx` is done first,
+  accepting connections, waits until no request is in flight, including requests whose
+  headers or body are still being received, closes idle keep-alive connections (a new
+  connection that has sent nothing gets about 5 s to start its request), cancels the base
+  context and returns nil. When `ctx` is done first,
   it cancels the base context at once, waits up to one more second for the cancelled
-  requests and returns `ctx.Err()`. Without a server started by `ListenAndServe` it
-  cancels at once; a repeated `Shutdown` is safe. `ListenAndServe` returns nil after
+  requests and returns `ctx.Err()`; requests still running then are not interrupted and
+  their connections close when they finish. Without a server started by `ListenAndServe`
+  it cancels at once; a repeated or concurrent `Shutdown` is safe (each call waits with
+  its own `ctx`). `ListenAndServe` returns nil after
   `Shutdown` and `ErrServerClosed` when called after it. The server it starts has
   `IdleTimeout` = `DefaultIdleTimeout` (90 s) and `CloseOnShutdown`; change it with
-  `WithServerConfig`. There is no cancellation on client disconnect (fasthttp does not
+  `WithServerConfig` (any field but `Handler`, including `MaxConnsPerIP` and `ConnState`). There is no cancellation on client disconnect (fasthttp does not
   detect it). Timeout: `vatel.WithTimeout(d)` (field
   `Endpoint.Timeout`) per endpoint and `vatel.WithDefaultTimeout(d)` on `Vatel`; a context
   with a timeout is also cancelled at the end of the request. The timeout does not
@@ -321,6 +336,12 @@ Per-endpoint middleware: `e.AddMiddleware(pos, f...)` inside an `EndpointOption`
 - Version v1.24.2 is retracted (`retract` in `go.mod`; it was published by mistake, move to
   v1.25.0 or later). `github.com/axkit/bitset` is a regular v1.0.4 dependency (no
   `replace`).
+- Minimum versions: Go 1.26 (required by fasthttp v1.77.0), `github.com/valyala/fasthttp`
+  v1.77.0 (v0.14: v1.31.0) and `github.com/fasthttp/router` v1.5.4 (v0.14: v1.4.4).
+  `Shutdown` relies on fasthttp's `ShutdownWithContext` of these versions. Go's minimal
+  version selection moves your project to them when you upgrade vatel; code that uses
+  fasthttp or fasthttp/router directly should be checked against their changelogs
+  between these versions.
 
 ## 3. Upgrading from v0.13/v0.14 and axkit/errors v0.x / v1.0.x
 
@@ -368,3 +389,5 @@ written against it may need these changes:
   field).
 - `ListenAndServe` after a failed `BuildHandlers` returns "previous build failed" (v1.24.2
   started the server with part of the routes).
+- Go 1.26, fasthttp v1.77.0 and fasthttp/router v1.5.4 are required (v1.24.2: Go 1.24,
+  fasthttp v1.31.0, router v1.4.4).

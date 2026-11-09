@@ -186,9 +186,6 @@ func parseLogLevelHeader(raw []byte) LogOption {
 // handler returns the fasthttp handler closure for this endpoint.
 func (e *Endpoint) handler(l *zerolog.Logger) func(*fasthttp.RequestCtx) {
 	return func(fctx *fasthttp.RequestCtx) {
-		e.v.inflight.Add(1)
-		defer e.v.inflight.Add(-1)
-
 		verbose := e.v.cfg.verboseError
 		lo := e.resolveLogLevel(fctx)
 

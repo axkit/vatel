@@ -8,7 +8,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/axkit/vatel/jsonmask"
@@ -78,14 +77,11 @@ type Vatel struct {
 	baseCtx context.Context
 	cancel  context.CancelFunc
 
-	// inflight counts HTTP requests being processed by vatel endpoints.
-	inflight atomic.Int64
-
-	mu     sync.Mutex       // guards the fields below
-	srv    *fasthttp.Server // server started by ListenAndServe
-	ln     net.Listener     // its listener
-	served chan struct{}    // closed when the server stops accepting connections
-	closed bool             // Shutdown was called
+	mu      sync.Mutex       // guards the fields below
+	srv     *fasthttp.Server // server started by ListenAndServe
+	ln      net.Listener     // its listener
+	closed  bool             // Shutdown was called
+	stopped chan struct{}    // closed when srv has stopped; set by Shutdown
 }
 
 // DefaultIdleTimeout is the IdleTimeout of the server started by
@@ -131,7 +127,8 @@ type Option struct {
 // WithServerConfig sets a function that configures the fasthttp.Server
 // started by ListenAndServe, e.g. its ReadTimeout or MaxRequestBodySize. It is
 // called after vatel has set Handler, IdleTimeout (DefaultIdleTimeout) and
-// CloseOnShutdown (true). Do not replace Handler.
+// CloseOnShutdown (true). Do not replace Handler. Hooks such as ConnState are
+// free for the application: Shutdown does not use them.
 func WithServerConfig(f func(*fasthttp.Server)) func(*Option) {
 	return func(o *Option) { o.serverConfig = f }
 }
@@ -333,7 +330,7 @@ func (v *Vatel) serve(ln net.Listener, mux *router.Router) error {
 	if v.cfg.serverConfig != nil {
 		v.cfg.serverConfig(srv)
 	}
-	sl := &serverListener{Listener: ln, srv: srv}
+	sl := &serverListener{Listener: ln}
 
 	v.mu.Lock()
 	if v.closed || v.srv != nil {
@@ -345,12 +342,10 @@ func (v *Vatel) serve(ln net.Listener, mux *router.Router) error {
 		}
 		return ErrServerClosed
 	}
-	served := make(chan struct{})
-	v.srv, v.ln, v.served = srv, sl, served
+	v.srv, v.ln = srv, sl
 	v.mu.Unlock()
 
 	err := srv.Serve(sl)
-	close(served)
 
 	v.mu.Lock()
 	closed := v.closed
@@ -364,28 +359,12 @@ func (v *Vatel) serve(ln net.Listener, mux *router.Router) error {
 }
 
 // serverListener is the listener of the server started by ListenAndServe.
-// Close is idempotent, so both Shutdown and fasthttp's Server.Shutdown can
-// close it. Accepted TCP connections get the keep-alive settings of the
-// server, as fasthttp's own ListenAndServe does.
+// Close is idempotent, so both Shutdown and fasthttp's ShutdownWithContext
+// can close it.
 type serverListener struct {
 	net.Listener
-	srv  *fasthttp.Server
 	once sync.Once
 	err  error
-}
-
-func (l *serverListener) Accept() (net.Conn, error) {
-	c, err := l.Listener.Accept()
-	if err != nil {
-		return nil, err
-	}
-	if tc, ok := c.(*net.TCPConn); ok && l.srv.TCPKeepalive {
-		tc.SetKeepAlive(true) //nolint:errcheck
-		if p := l.srv.TCPKeepalivePeriod; p > 0 {
-			tc.SetKeepAlivePeriod(p) //nolint:errcheck
-		}
-	}
-	return c, nil
 }
 
 func (l *serverListener) Close() error {
@@ -398,20 +377,25 @@ func (l *serverListener) Close() error {
 //  1. It closes all active WebSocket connections (clients receive a "going
 //     away" frame and can reconnect) and stops accepting new connections.
 //     ListenAndServe returns nil; called later, it returns ErrServerClosed.
-//  2. It waits until no HTTP request is in flight. Idle keep-alive
-//     connections do not hold it up; the server closes them when they send
-//     a request (the response carries "Connection: close") or after the
-//     IdleTimeout.
+//  2. It waits until no HTTP request is in flight: requests being handled
+//     and requests still being received (headers or body being read) finish
+//     normally, and their responses carry "Connection: close". Idle
+//     keep-alive connections do not hold it up: they are closed. A new
+//     connection that has sent nothing yet gets about 5 seconds to start its
+//     request (as in net/http), then it is closed too.
 //  3. It cancels the request contexts (Context.Context()) and returns nil.
 //
 // When ctx is done before step 2 ends, the request contexts of requests still
 // in flight are cancelled at once, so handlers listening to them can stop
 // (a context.Canceled error gives 503). Shutdown then waits up to one more
-// second for them to finish and returns ctx.Err().
+// second for them to finish and returns ctx.Err(); requests still running
+// after that are not interrupted, and their responses carry
+// "Connection: close".
 //
 // Without a server started by ListenAndServe the request contexts are
 // cancelled at once. Requests that start after Shutdown get a cancelled
-// context. Calling Shutdown again is safe.
+// context. Calling Shutdown again, also concurrently, is safe: each call
+// waits for the server with its own ctx.
 //
 // Pass a context with a deadline to bound the graceful phase:
 //
@@ -421,7 +405,7 @@ func (l *serverListener) Close() error {
 func (v *Vatel) Shutdown(ctx context.Context) error {
 	v.mu.Lock()
 	v.closed = true
-	srv, ln, served := v.srv, v.ln, v.served
+	srv := v.srv
 	v.mu.Unlock()
 
 	if v.cfg.wv != nil {
@@ -432,45 +416,47 @@ func (v *Vatel) Shutdown(ctx context.Context) error {
 		return nil
 	}
 
-	// fasthttp's Shutdown does nothing when it runs before Serve has
-	// registered the listener, so the listener is closed here as well.
-	ln.Close() //nolint:errcheck
-	srvDone := make(chan error, 1)
-	go func() { srvDone <- srv.Shutdown() }()
-
-	done, err := v.waitRequests(ctx, served, srvDone)
-	v.cancel()
-	if done {
-		return err
+	stopped := v.stopServer()
+	select {
+	case <-stopped:
+		v.cancel()
+		return nil
+	case <-ctx.Done():
 	}
 
-	grace, cancel := context.WithTimeout(context.Background(), shutdownGrace)
-	defer cancel()
-	v.waitRequests(grace, served, srvDone) //nolint:errcheck
+	v.cancel()
+	t := time.NewTimer(shutdownGrace)
+	defer t.Stop()
+	select {
+	case <-stopped:
+	case <-t.C:
+	}
 	return ctx.Err()
 }
 
-// waitRequests waits until the server has stopped accepting connections and
-// no request is in flight, or until srvDone delivers the result of the
-// server's Shutdown (all connections are closed). done is false when ctx is
-// done first.
-func (v *Vatel) waitRequests(ctx context.Context, served <-chan struct{}, srvDone <-chan error) (done bool, err error) {
-	t := time.NewTicker(10 * time.Millisecond)
-	defer t.Stop()
-	for {
-		select {
-		case <-served:
-			if v.inflight.Load() == 0 {
-				return true, nil
-			}
-		default:
-		}
-		select {
-		case err := <-srvDone:
-			return true, err
-		case <-ctx.Done():
-			return false, ctx.Err()
-		case <-t.C:
-		}
+// stopServer starts stopping the server started by ListenAndServe, once, and
+// returns a channel closed when it has stopped.
+//
+// fasthttp's ShutdownWithContext closes the listeners and the idle
+// connections, makes responses carry "Connection: close" (CloseOnShutdown)
+// and waits until no connection is open. It runs without a deadline: when
+// its context expires it resets the server's stop flag and forgets the
+// listeners, so the connections still open would go on serving requests and
+// a second call would not wait for them. Shutdown applies its own ctx while
+// waiting for the returned channel.
+func (v *Vatel) stopServer() <-chan struct{} {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.stopped == nil {
+		v.stopped = make(chan struct{})
+		srv, ln, stopped := v.srv, v.ln, v.stopped
+		// ShutdownWithContext does nothing when it runs before Serve has
+		// registered the listener, so the listener is closed here as well.
+		ln.Close() //nolint:errcheck
+		go func() {
+			srv.ShutdownWithContext(context.Background()) //nolint:errcheck
+			close(stopped)
+		}()
 	}
+	return v.stopped
 }

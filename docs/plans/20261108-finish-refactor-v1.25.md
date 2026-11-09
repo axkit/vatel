@@ -76,7 +76,8 @@
 - `Endpoint`: поля `OptionalBody bool`, `Timeout time.Duration`; внутренние `pathParamKeys []string`, `querierFields []fieldInfo`, `queryMaskFields jsonmask.Fields`, `isQuerier bool`.
   - ➕ отклонение: полей `inputHasMask`, `resultHasMask`, `queryHasMask` нет — их заменяет `jsonmask.Fields.HasRules()` на предвычисленных правилах.
   - ➕ ревью фазы 1: копии настроек `Vatel` в `Endpoint` (`baseCtx`, `verboseError`, `logRequestID`, `clientErrorFields`, `staticLoggingLevel`, `ala`, `mr`) заменены указателем `e.v *Vatel`; `resultPrototyper` убран — правила результата неизвестного при компиляции типа строятся по типу и кэшируются (`resultFieldsByType`).
-- ➕ `Vatel`: `mu`, `srv`, `ln`, `served`, `closed`, `inflight`; `DefaultIdleTimeout`, `ErrServerClosed`, `WithServerConfig`; внутренний `serve(ln, mux)` для тестов на in-memory listener.
+- ➕ `Vatel`: `mu`, `srv`, `ln`, `served`, `closed`, `conns` (учёт соединений, `conntrack.go`; заменил счётчик `inflight`); `DefaultIdleTimeout`, `ErrServerClosed`, `WithServerConfig`; внутренний `serve(ln, mux)` для тестов на in-memory listener.
+  - ➕ ревью фазы 1, итерация 3 (решение пользователя): самописный учёт соединений давал ошибки на внутренностях fasthttp v1.31 (`MaxConnsPerIP` оборачивает соединение в `perIPConn` — хук `ConnState` его не узнавал, утечка и `Shutdown` до дедлайна; конвейерный запрос из буфера считался простаивающим). fasthttp обновлён v1.31.0 → v1.77.0, fasthttp/router v1.4.4 → v1.5.4 (fasthttp v1.77.0 требует Go 1.26 — `go 1.26.0` в go.mod). `conntrack.go` удалён; поля `Vatel`: `mu`, `srv`, `ln`, `closed`, `stopped`. `Shutdown` — поверх `srv.ShutdownWithContext`: один раз (`stopServer`) закрывает listener и запускает `ShutdownWithContext(context.Background())` в горутине, закрывающей `stopped`; каждый вызов ждёт `stopped` или свой `ctx`, по дедлайну отменяет базовый контекст, ждёт до 1 с и возвращает `ctx.Err()`. `ctx` в fasthttp не передаётся: по его истечении fasthttp сбрасывает флаг остановки и забывает listener'ы — оставшиеся соединения продолжили бы обслуживать запросы, а повторный вызов не ждал бы. Цепочка `ConnState` не нужна — хук пользователя остаётся как есть. Тесты сервера — на реальном TCP (и in-memory): keep-alive, приём тела, конвейер, `MaxConnsPerIP`, конкурентные `Shutdown`, запрос после дедлайна.
 - `decodeBody(body, dest, optional bool)` без вызова `Validate`; `validate(in any) error` вызывается из `buildHandler`.
 - `fieldInfo.mask string` — значение тега `mask`.
 - `compileCommon`: `if e.jm == nil { e.jm = defaultMasker }`, `defaultMasker = jsonmask.New()`.
@@ -123,6 +124,13 @@
   - WS: `OnTokenUpdate` вызывается до сохранения payload, ошибка отвергает токен; ошибка декодирования токена → `ErrUnauthorized`; `WithLogger` теперь используется; `AuthMessageData` и `ErrAuthorizationHeaderMissed` помечены `Deprecated`.
   - auth: nil `Decoder` и ошибка `RevokeCheck` → 500 `VTL-0005` на защищённых эндпоинтах; `Disabled` задаётся до начала обслуживания (гонка данных при изменении во время работы).
   - метрики: размер ответа HEAD — 0.
+- ➕ ревью фазы 1, итерация 2:
+  - `Shutdown` ждёт и запросы, которые ещё принимаются (заголовки или тело читаются): соединение считается занятым с первого прочитанного байта запроса до `StateIdle` fasthttp; простаивающие keep-alive соединения закрываются, новое соединение без единого байта получает 5 с (как в net/http); пользовательский `ConnState` из `WithServerConfig` вызывается после хука vatel.
+  - ошибка разбора тела (и WS `data`) типа с тегами `mask` не оборачивает ошибку `encoding/json` (она может цитировать значение); в ошибке только поля `field`, `type`, `offset`.
+  - `BuildHandlers`: `Param()`, `QueryInput()` и `Input()` на GET/DELETE/HEAD/OPTIONS, возвращающие не указатель на структуру, — ошибка вместо panic; вложенная структура уже обходимого типа (цикл) пропускается.
+  - `vatel.Func` допускается на пути с `{params}` (читает их через `ctx.PathValue`); `*date.Date` в path/query-параметрах больше не вызывает panic.
+- ➕ ревью фазы 1, итерация 3:
+  - модуль: минимальные версии — Go 1.26, `github.com/valyala/fasthttp` v1.77.0 (было v1.31.0), `github.com/fasthttp/router` v1.5.4 (было v1.4.4); зависимые проекты получают их через MVS при обновлении vatel. `Shutdown` построен на `ShutdownWithContext` fasthttp: новое соединение без запроса — около 5 с; запрос, переживший дедлайн и 1 с ожидания, не прерывается, его соединение закрывается после ответа; конкурентные `Shutdown` ждут каждый со своим `ctx`; `WithServerConfig` — любые поля, кроме `Handler` (в том числе `MaxConnsPerIP`, `ConnState`).
 
 ## What Goes Where
 - **Implementation Steps**: код, тесты, документация в этом репозитории, коммиты на ветке `refactor`.
