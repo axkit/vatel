@@ -15,6 +15,9 @@
 //	TOKEN=$(go run ./example token)
 //	curl -H "Authorization: Bearer $TOKEN" localhost:8080/orders
 //
+// The order endpoints serve only the orders of the organization of the token:
+// an order of another organization is not found.
+//
 // WebSocket clients connect to /ws, send the token within 10 seconds and
 // then watch orders of their organization:
 //

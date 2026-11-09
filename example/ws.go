@@ -91,8 +91,8 @@ func (c *WatchOrderController) Handle(ctx vatel.WebsocketContext) error {
 	if claims == nil {
 		return vatel.ErrUnauthorized.New()
 	}
-	o, ok := orderStore.Get(c.In.ID)
-	if !ok || o.OrgID != claims.OrgID {
+	o, ok := orderStore.Get(claims.OrgID, c.In.ID)
+	if !ok {
 		return errOrderNotFound.New().Set("id", c.In.ID)
 	}
 	c.Out = o

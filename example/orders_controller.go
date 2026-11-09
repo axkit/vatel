@@ -14,7 +14,7 @@ import (
 // Order is the domain model returned by order endpoints.
 type Order struct {
 	ID         int       `json:"id"`
-	OrgID      int       `json:"orgId"` // the organization; the WS subscription (orders.watch) checks it
+	OrgID      int       `json:"orgId"` // the organization; only its tokens reach the order
 	CustomerID int       `json:"customerId"`
 	Product    string    `json:"product"`
 	Quantity   int       `json:"quantity"`
@@ -26,7 +26,9 @@ var errOrderNotFound = errors.Template("order not found").StatusCode(404)
 
 // OrderStore is an in-memory order repository for example purposes; replace
 // it with a real one. Handlers run concurrently, so every method takes the
-// lock, and IDs come from a counter, never reused after a delete.
+// lock, and IDs come from a counter, never reused after a delete. Every
+// method but Create takes the organization of the caller (from its token): an
+// order of another organization is not found.
 type OrderStore struct {
 	mu     sync.Mutex
 	orders []Order
@@ -43,32 +45,33 @@ func NewOrderStore(orders ...Order) *OrderStore {
 	return s
 }
 
-// List returns a copy of the orders with the status, or all orders if status
-// is empty.
-func (s *OrderStore) List(status string) []Order {
+// List returns a copy of the orders of the organization org with the status,
+// or with any status if status is empty.
+func (s *OrderStore) List(org int, status string) []Order {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	result := make([]Order, 0, len(s.orders))
 	for _, o := range s.orders {
-		if status == "" || o.Status == status {
+		if o.OrgID == org && (status == "" || o.Status == status) {
 			result = append(result, o)
 		}
 	}
 	return result
 }
 
-// Get returns the order with id.
-func (s *OrderStore) Get(id int) (Order, bool) {
+// Get returns the order with id of the organization org.
+func (s *OrderStore) Get(org, id int) (Order, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	i := s.index(id)
+	i := s.index(org, id)
 	if i < 0 {
 		return Order{}, false
 	}
 	return s.orders[i], true
 }
 
-// Create assigns o a new ID, stores it and returns it.
+// Create assigns o a new ID, stores it and returns it. The caller sets
+// o.OrgID from its token.
 func (s *OrderStore) Create(o Order) Order {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -78,11 +81,12 @@ func (s *OrderStore) Create(o Order) Order {
 	return o
 }
 
-// Update calls f on the order with id and returns the updated order.
-func (s *OrderStore) Update(id int, f func(*Order)) (Order, bool) {
+// Update calls f on the order with id of the organization org and returns
+// the updated order.
+func (s *OrderStore) Update(org, id int, f func(*Order)) (Order, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	i := s.index(id)
+	i := s.index(org, id)
 	if i < 0 {
 		return Order{}, false
 	}
@@ -90,11 +94,12 @@ func (s *OrderStore) Update(id int, f func(*Order)) (Order, bool) {
 	return s.orders[i], true
 }
 
-// Delete removes the order with id and reports whether it existed.
-func (s *OrderStore) Delete(id int) bool {
+// Delete removes the order with id of the organization org and reports
+// whether it existed.
+func (s *OrderStore) Delete(org, id int) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	i := s.index(id)
+	i := s.index(org, id)
 	if i < 0 {
 		return false
 	}
@@ -102,9 +107,25 @@ func (s *OrderStore) Delete(id int) bool {
 	return true
 }
 
-// index returns the position of the order with id, or -1. s.mu must be held.
-func (s *OrderStore) index(id int) int {
-	return slices.IndexFunc(s.orders, func(o Order) bool { return o.ID == id })
+// index returns the position of the order with id of the organization org,
+// or -1. s.mu must be held.
+func (s *OrderStore) index(org, id int) int {
+	return slices.IndexFunc(s.orders, func(o Order) bool { return o.ID == id && o.OrgID == org })
+}
+
+// tokenOrg returns the organization of the token of the request. The
+// organization is taken only from the token, never from the request data.
+// The order routes require a token (RequirePerms); without one (e.g.
+// auth.Config.Disabled) it returns ErrUnauthorized.
+func tokenOrg(ctx vatel.Context) (int, error) {
+	var claims *Claims
+	if ctx != nil {
+		claims, _ = ctx.TokenPayload().(*Claims)
+	}
+	if claims == nil {
+		return 0, vatel.ErrUnauthorized.New()
+	}
+	return claims.OrgID, nil
 }
 
 var orderStore = NewOrderStore(
@@ -124,13 +145,18 @@ type ListOrdersController struct {
 	vatel.Output[[]Order]
 }
 
-func (c *ListOrdersController) Handle(_ vatel.Context) error {
-	c.Out = orderStore.List(c.Query.Status)
+func (c *ListOrdersController) Handle(ctx vatel.Context) error {
+	org, err := tokenOrg(ctx)
+	if err != nil {
+		return err
+	}
+	c.Out = orderStore.List(org, c.Query.Status)
 	return nil
 }
 
 // ── Get Order ─────────────────────────────────────────────────────────────────
-// GET /orders/{id}
+// GET /orders/{id}   — an order of another organization is not found (404),
+// so its existence is not disclosed
 
 type GetOrderController struct {
 	vatel.PathParams[struct {
@@ -139,8 +165,12 @@ type GetOrderController struct {
 	vatel.Output[Order]
 }
 
-func (c *GetOrderController) Handle(_ vatel.Context) error {
-	o, ok := orderStore.Get(c.Params.ID)
+func (c *GetOrderController) Handle(ctx vatel.Context) error {
+	org, err := tokenOrg(ctx)
+	if err != nil {
+		return err
+	}
+	o, ok := orderStore.Get(org, c.Params.ID)
 	if !ok {
 		return errOrderNotFound.New().Set("id", c.Params.ID)
 	}
@@ -149,7 +179,7 @@ func (c *GetOrderController) Handle(_ vatel.Context) error {
 }
 
 // ── Create Order ──────────────────────────────────────────────────────────────
-// POST /orders
+// POST /orders   — the order belongs to the organization of the token
 
 type CreateOrderController struct {
 	vatel.Body[struct {
@@ -160,8 +190,13 @@ type CreateOrderController struct {
 	vatel.Output[Order]
 }
 
-func (c *CreateOrderController) Handle(vatel.Context) error {
+func (c *CreateOrderController) Handle(ctx vatel.Context) error {
+	org, err := tokenOrg(ctx)
+	if err != nil {
+		return err
+	}
 	c.Out = orderStore.Create(Order{
+		OrgID:      org,
 		CustomerID: c.In.CustomerID,
 		Product:    c.In.Product,
 		Quantity:   c.In.Quantity,
@@ -186,8 +221,13 @@ type UpdateOrderController struct {
 	vatel.Output[Order]
 }
 
-func (c *UpdateOrderController) Handle(_ vatel.Context) error {
-	o, ok := orderStore.Update(c.Params.ID, func(o *Order) {
+func (c *UpdateOrderController) Handle(ctx vatel.Context) error {
+	org, err := tokenOrg(ctx)
+	if err != nil {
+		return err
+	}
+	// The organization is checked before the order is changed.
+	o, ok := orderStore.Update(org, c.Params.ID, func(o *Order) {
 		o.Product = c.In.Product
 		o.Quantity = c.In.Quantity
 		o.Status = c.In.Status
@@ -208,8 +248,12 @@ type DeleteOrderController struct {
 	}]
 }
 
-func (c *DeleteOrderController) Handle(_ vatel.Context) error {
-	if !orderStore.Delete(c.Params.ID) {
+func (c *DeleteOrderController) Handle(ctx vatel.Context) error {
+	org, err := tokenOrg(ctx)
+	if err != nil {
+		return err
+	}
+	if !orderStore.Delete(org, c.Params.ID) {
 		return errOrderNotFound.New().Set("id", c.Params.ID)
 	}
 	return nil

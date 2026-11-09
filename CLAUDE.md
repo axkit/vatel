@@ -55,8 +55,10 @@ from `go.mod`. User docs: `README.md`; v0.14 → v1.25 changes: `MIGRATION.md`. 
 - `vatel_c_toc.go` — `GET /` table of contents, registered automatically by `NewVatel`.
 - `example/` — runnable app: auth (HS256 JWT verified with the standard library, `JWT_SECRET`), carriers,
   CORS, upload, graceful shutdown, WebSocket on `/ws` (`ws.go`: one user + organization per connection,
-  `orders.watch` checks the order's org against the token); its in-memory `OrderStore` is mutex-guarded
-  (handlers run concurrently).
+  `orders.watch` checks the order's org against the token); the HTTP order endpoints isolate organizations too
+  (org only from the token payload: `List` filtered, another org's order → 404 before any change, `Create` sets
+  `OrgID` from the token). Its in-memory `OrderStore` is mutex-guarded (handlers run concurrently) and takes
+  the org on every lookup.
 
 ### Core types
 

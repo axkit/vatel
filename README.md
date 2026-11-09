@@ -47,8 +47,11 @@ TOKEN=$(go run ./example token)
 curl -H "Authorization: Bearer $TOKEN" localhost:18080/orders
 ```
 
-`go run ./example token 2` mints the token for organization 2 (default 1). The example also
-serves WebSocket on `/ws`: send `{"path":"updateAccessToken","data":{"mid":"<uuid>","at":"<token>"}}`
+`go run ./example token 2` mints the token for organization 2 (default 1). The order
+endpoints serve only the orders of the token's organization: `GET /orders` lists them,
+`GET`, `PUT` and `DELETE` of `/orders/{id}` give 404 for an order of another
+organization, and `POST /orders` creates the order in the token's organization. The
+example also serves WebSocket on `/ws`: send `{"path":"updateAccessToken","data":{"mid":"<uuid>","at":"<token>"}}`
 within 10 seconds, then `{"path":"orders.watch","data":{"id":1}}` (see
 [Security context and closing connections](#security-context-and-closing-connections)).
 
@@ -961,7 +964,10 @@ Close codes (vatel uses the first three; applications may add their own in 4000â
 of the connection (`ctx.TokenPayload()`), never from the message data. A subscription
 handler checks that the organization of the resource matches the organization of the
 token (the example reports a resource of another organization as not found, so its
-existence is not disclosed). The context belongs to the connection, not to the user:
+existence is not disclosed). The same holds for HTTP: the example's order endpoints take
+the organization from `ctx.TokenPayload()` only, filter lists by it, check it before
+reading, changing or deleting an order, and set it on created orders. The context
+belongs to the connection, not to the user:
 browser tabs working in different organizations use different connections.
 
 **Client contract.** Send the token (`updateAccessToken`) right after connecting, and a
