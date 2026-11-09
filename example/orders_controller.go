@@ -1,6 +1,8 @@
 package main
 
 import (
+	"slices"
+	"sync"
 	"time"
 
 	"github.com/axkit/errors"
@@ -21,11 +23,93 @@ type Order struct {
 
 var errOrderNotFound = errors.Template("order not found").StatusCode(404)
 
-// in-memory store for example purposes — replace with a real repository.
-var orderStore = []Order{
-	{ID: 1, CustomerID: 100, Product: "Widget A", Quantity: 5, Status: "pending", CreatedAt: time.Now()},
-	{ID: 2, CustomerID: 101, Product: "Widget B", Quantity: 3, Status: "shipped", CreatedAt: time.Now()},
+// OrderStore is an in-memory order repository for example purposes; replace
+// it with a real one. Handlers run concurrently, so every method takes the
+// lock, and IDs come from a counter, never reused after a delete.
+type OrderStore struct {
+	mu     sync.Mutex
+	orders []Order
+	lastID int
 }
+
+// NewOrderStore returns a store holding orders; the next ID follows the
+// largest of theirs.
+func NewOrderStore(orders ...Order) *OrderStore {
+	s := &OrderStore{orders: orders}
+	for _, o := range orders {
+		s.lastID = max(s.lastID, o.ID)
+	}
+	return s
+}
+
+// List returns a copy of the orders with the status, or all orders if status
+// is empty.
+func (s *OrderStore) List(status string) []Order {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	result := make([]Order, 0, len(s.orders))
+	for _, o := range s.orders {
+		if status == "" || o.Status == status {
+			result = append(result, o)
+		}
+	}
+	return result
+}
+
+// Get returns the order with id.
+func (s *OrderStore) Get(id int) (Order, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	i := s.index(id)
+	if i < 0 {
+		return Order{}, false
+	}
+	return s.orders[i], true
+}
+
+// Create assigns o a new ID, stores it and returns it.
+func (s *OrderStore) Create(o Order) Order {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lastID++
+	o.ID = s.lastID
+	s.orders = append(s.orders, o)
+	return o
+}
+
+// Update calls f on the order with id and returns the updated order.
+func (s *OrderStore) Update(id int, f func(*Order)) (Order, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	i := s.index(id)
+	if i < 0 {
+		return Order{}, false
+	}
+	f(&s.orders[i])
+	return s.orders[i], true
+}
+
+// Delete removes the order with id and reports whether it existed.
+func (s *OrderStore) Delete(id int) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	i := s.index(id)
+	if i < 0 {
+		return false
+	}
+	s.orders = slices.Delete(s.orders, i, i+1)
+	return true
+}
+
+// index returns the position of the order with id, or -1. s.mu must be held.
+func (s *OrderStore) index(id int) int {
+	return slices.IndexFunc(s.orders, func(o Order) bool { return o.ID == id })
+}
+
+var orderStore = NewOrderStore(
+	Order{ID: 1, CustomerID: 100, Product: "Widget A", Quantity: 5, Status: "pending", CreatedAt: time.Now()},
+	Order{ID: 2, CustomerID: 101, Product: "Widget B", Quantity: 3, Status: "shipped", CreatedAt: time.Now()},
+)
 
 // ── List Orders ───────────────────────────────────────────────────────────────
 // GET /orders?status=pending&page=1&limit=20
@@ -40,13 +124,7 @@ type ListOrdersController struct {
 }
 
 func (c *ListOrdersController) Handle(_ vatel.Context) error {
-	result := make([]Order, 0, len(orderStore))
-	for _, o := range orderStore {
-		if c.Query.Status == "" || o.Status == c.Query.Status {
-			result = append(result, o)
-		}
-	}
-	c.Out = result
+	c.Out = orderStore.List(c.Query.Status)
 	return nil
 }
 
@@ -61,13 +139,12 @@ type GetOrderController struct {
 }
 
 func (c *GetOrderController) Handle(_ vatel.Context) error {
-	for _, o := range orderStore {
-		if o.ID == c.Params.ID {
-			c.Out = o
-			return nil
-		}
+	o, ok := orderStore.Get(c.Params.ID)
+	if !ok {
+		return errOrderNotFound.New().Set("id", c.Params.ID)
 	}
-	return errOrderNotFound.New().Set("id", c.Params.ID)
+	c.Out = o
+	return nil
 }
 
 // ── Create Order ──────────────────────────────────────────────────────────────
@@ -83,16 +160,13 @@ type CreateOrderController struct {
 }
 
 func (c *CreateOrderController) Handle(vatel.Context) error {
-	o := Order{
-		ID:         len(orderStore) + 1,
+	c.Out = orderStore.Create(Order{
 		CustomerID: c.In.CustomerID,
 		Product:    c.In.Product,
 		Quantity:   c.In.Quantity,
 		Status:     "pending",
 		CreatedAt:  time.Now(),
-	}
-	orderStore = append(orderStore, o)
-	c.Out = o
+	})
 	return nil
 }
 
@@ -112,16 +186,16 @@ type UpdateOrderController struct {
 }
 
 func (c *UpdateOrderController) Handle(_ vatel.Context) error {
-	for i := range orderStore {
-		if orderStore[i].ID == c.Params.ID {
-			orderStore[i].Product = c.In.Product
-			orderStore[i].Quantity = c.In.Quantity
-			orderStore[i].Status = c.In.Status
-			c.Out = orderStore[i]
-			return nil
-		}
+	o, ok := orderStore.Update(c.Params.ID, func(o *Order) {
+		o.Product = c.In.Product
+		o.Quantity = c.In.Quantity
+		o.Status = c.In.Status
+	})
+	if !ok {
+		return errOrderNotFound.New().Set("id", c.Params.ID)
 	}
-	return errOrderNotFound.New().Set("id", c.Params.ID)
+	c.Out = o
+	return nil
 }
 
 // ── Delete Order ──────────────────────────────────────────────────────────────
@@ -134,13 +208,10 @@ type DeleteOrderController struct {
 }
 
 func (c *DeleteOrderController) Handle(_ vatel.Context) error {
-	for i, o := range orderStore {
-		if o.ID == c.Params.ID {
-			orderStore = append(orderStore[:i], orderStore[i+1:]...)
-			return nil
-		}
+	if !orderStore.Delete(c.Params.ID) {
+		return errOrderNotFound.New().Set("id", c.Params.ID)
 	}
-	return errOrderNotFound.New().Set("id", c.Params.ID)
+	return nil
 }
 
 // ── Endpoint Registration ─────────────────────────────────────────────────────

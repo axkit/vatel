@@ -22,6 +22,8 @@ go test -v ./auth/...
 
 # Run the example server (port 8080 may be taken on the dev machine)
 ADDR=:18080 go run ./example
+# Mint a dev token for it (HS256, key from JWT_SECRET, public dev key if unset)
+TOKEN=$(go run ./example token); curl -H "Authorization: Bearer $TOKEN" localhost:18080/orders
 
 # Tidy dependencies
 go mod tidy
@@ -49,7 +51,8 @@ from `go.mod`. User docs: `README.md`; v0.14 → v1.25 changes: `MIGRATION.md`. 
 - `auth/` — JWT-style authentication/authorization middleware.
 - `jsonmask/` — masking of JSON by `mask` struct tags.
 - `vatel_c_toc.go` — `GET /` table of contents, registered automatically by `NewVatel`.
-- `example/` — runnable app: auth, carriers, CORS, upload, graceful shutdown.
+- `example/` — runnable app: auth (HS256 JWT verified with the standard library, `JWT_SECRET`), carriers,
+  CORS, upload, graceful shutdown; its in-memory `OrderStore` is mutex-guarded (handlers run concurrently).
 
 ### Core types
 

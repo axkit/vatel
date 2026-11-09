@@ -4,12 +4,20 @@
 // graceful shutdown.
 //
 // The listen address is taken from the ADDR environment variable
-// (default ":8080").
+// (default ":8080"). Tokens are HS256 JWTs signed with the JWT_SECRET
+// environment variable; without it a public development key is used.
+//
+// "go run ./example token" prints a development token for user 100 (alice)
+// with every permission, valid for 24 hours:
+//
+//	TOKEN=$(go run ./example token)
+//	curl -H "Authorization: Bearer $TOKEN" localhost:8080/orders
 package main
 
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
@@ -22,11 +30,23 @@ import (
 )
 
 func main() {
+	secret, devSecret := jwtSecret()
+	if len(os.Args) > 1 && os.Args[1] == "token" {
+		if err := printDevToken(secret); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	log := zerolog.New(zerolog.ConsoleWriter{Out: os.Stdout}).
 		With().Timestamp().Logger()
+	if devSecret {
+		log.Warn().Msg(jwtSecretEnv + " is not set: tokens are signed with the public development key")
+	}
 
 	authCfg := &auth.Config{
-		Decoder:    &JWTDecoder{},
+		Decoder:    &JWTDecoder{Secret: secret},
 		Authorizer: &BitsetAuthorizer{},
 	}
 
@@ -79,4 +99,20 @@ func main() {
 		log.Error().Err(err).Msg("shutdown error")
 	}
 	log.Info().Msg("server stopped")
+}
+
+// printDevToken prints a token for user 100 (alice) with every permission,
+// valid for 24 hours, signed with secret.
+func printDevToken(secret []byte) error {
+	tok, err := SignToken(secret, Claims{
+		UserID:    100,
+		Login:     "alice",
+		PermBytes: AllPerms(),
+		Exp:       time.Now().Add(24 * time.Hour).Unix(),
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Println(tok)
+	return nil
 }

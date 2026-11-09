@@ -36,6 +36,16 @@ Upgrading from v0.14? See [MIGRATION.md](MIGRATION.md).
 ## Quick start
 
 A complete runnable application is in [`example/`](example/) (`ADDR=:18080 go run ./example`).
+It verifies HS256 JWTs signed with the `JWT_SECRET` environment variable (without it, a
+public development key is used and a warning is logged). To call the protected
+endpoints, mint a development token (user 100, every permission, valid 24 hours) with the
+same `JWT_SECRET`:
+
+```sh
+TOKEN=$(go run ./example token)
+curl -H "Authorization: Bearer $TOKEN" localhost:18080/orders
+```
+
 The minimal version:
 
 ```go
@@ -120,8 +130,8 @@ func main() {
 	log := zerolog.New(os.Stdout).With().Timestamp().Logger()
 
 	authCfg := &auth.Config{
-		Decoder:    &JWTDecoder{},       // your vatel.TokenDecoder
-		Authorizer: &BitsetAuthorizer{}, // your auth.Authorizer
+		Decoder:    &JWTDecoder{Secret: []byte(os.Getenv("JWT_SECRET"))}, // your vatel.TokenDecoder
+		Authorizer: &BitsetAuthorizer{},                                  // your auth.Authorizer
 	}
 
 	v := vatel.NewVatel(
@@ -157,7 +167,9 @@ func main() {
 ```
 
 `JWTDecoder` and `BitsetAuthorizer` are application types; see
-[`example/claims.go`](example/claims.go) for a sample implementation.
+[`example/claims.go`](example/claims.go) for a sample implementation (HS256 signature
+and `exp` check with the standard library; a JWT library such as
+`github.com/golang-jwt/jwt/v5` adds key rotation and other algorithms).
 
 Responses:
 
