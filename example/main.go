@@ -1,17 +1,25 @@
 // Package main demonstrates a complete vatel API server setup.
 // It shows JWT-based auth via vatel/auth, permission-gated endpoints,
-// struct-based controllers with carrier embedding, CORS preflight and
-// graceful shutdown.
+// struct-based controllers with carrier embedding, a WebSocket endpoint with
+// one security context (user, organization) per connection, CORS preflight
+// and graceful shutdown.
 //
 // The listen address is taken from the ADDR environment variable
 // (default ":8080"). Tokens are HS256 JWTs signed with the JWT_SECRET
 // environment variable; without it a public development key is used.
 //
-// "go run ./example token" prints a development token for user 100 (alice)
-// with every permission, valid for 24 hours:
+// "go run ./example token [org]" prints a development token for user 100
+// (alice) in organization org (default 1) with every permission, valid for
+// 24 hours:
 //
 //	TOKEN=$(go run ./example token)
 //	curl -H "Authorization: Bearer $TOKEN" localhost:8080/orders
+//
+// WebSocket clients connect to /ws, send the token within 10 seconds and
+// then watch orders of their organization:
+//
+//	{"path": "updateAccessToken", "data": {"mid": "<uuid>", "at": "<token>"}}
+//	{"path": "orders.watch", "data": {"id": 1}}
 package main
 
 import (
@@ -20,6 +28,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -32,7 +41,7 @@ import (
 func main() {
 	secret, devSecret := jwtSecret()
 	if len(os.Args) > 1 && os.Args[1] == "token" {
-		if err := printDevToken(secret); err != nil {
+		if err := printDevToken(secret, os.Args[2:]); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
@@ -50,9 +59,14 @@ func main() {
 		Authorizer: &BitsetAuthorizer{},
 	}
 
+	// WebSocket messages do not pass HTTP middleware: the token comes with
+	// the updateAccessToken message and is checked by the WS gateway.
+	wv := newWebsocketVatel(authCfg.Decoder)
+
 	v := vatel.NewVatel(
 		vatel.WithDefaultLogOption(vatel.LogFullOnExit),
 		vatel.WithRequestID(),
+		vatel.WithWebsocketSupport(wv),
 	)
 
 	// Decode the Authorization header and store the payload on every request.
@@ -65,10 +79,12 @@ func main() {
 		OrderEndpoints(authCfg),
 		UserEndpoints(authCfg),
 		ImportEndpoints(authCfg),
+		WsEndpoints(),
 	)
 
 	mux := router.New()
 	mux.GlobalOPTIONS = corsPreflight
+	mux.GET("/ws", wv.Upgrade)
 	v.MustBuildHandlers(mux, &log)
 
 	addr := os.Getenv("ADDR")
@@ -102,10 +118,19 @@ func main() {
 }
 
 // printDevToken prints a token for user 100 (alice) with every permission,
-// valid for 24 hours, signed with secret.
-func printDevToken(secret []byte) error {
+// valid for 24 hours, signed with secret, in the organization given by
+// args[0] (default 1).
+func printDevToken(secret []byte, args []string) error {
+	org := 1
+	if len(args) > 0 {
+		var err error
+		if org, err = strconv.Atoi(args[0]); err != nil {
+			return fmt.Errorf("organization %q: %w", args[0], err)
+		}
+	}
 	tok, err := SignToken(secret, Claims{
 		UserID:    100,
+		OrgID:     org,
 		Login:     "alice",
 		PermBytes: AllPerms(),
 		Exp:       time.Now().Add(24 * time.Hour).Unix(),

@@ -20,6 +20,7 @@ import (
 // ctx.TokenPayload().(*Claims) after the auth middleware runs.
 type Claims struct {
 	UserID    int    `json:"sub"`
+	OrgID     int    `json:"org"` // the organization the token acts in
 	Login     string `json:"login"`
 	Role      int    `json:"role"`
 	PermBytes []byte `json:"perms"` // bitset-encoded permission mask
@@ -31,6 +32,15 @@ type Claims struct {
 // RequirePerms and Debug to turn on verbose errors for the request.
 func (c *Claims) Perms() []byte { return c.PermBytes }
 func (c *Claims) Debug() bool   { return c.IsDebug }
+
+// ExpiresAt satisfies vatel.Expirer: a WebSocket connection is closed with
+// 4001 when its token expires, unless the client sends a new one before.
+func (c *Claims) ExpiresAt() time.Time {
+	if c.Exp == 0 {
+		return time.Time{}
+	}
+	return time.Unix(c.Exp, 0)
+}
 
 // jwtTokener wraps decoded claims and satisfies vatel.Tokener.
 type jwtTokener struct{ claims *Claims }

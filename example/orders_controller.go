@@ -14,6 +14,7 @@ import (
 // Order is the domain model returned by order endpoints.
 type Order struct {
 	ID         int       `json:"id"`
+	OrgID      int       `json:"orgId"` // the organization; the WS subscription (orders.watch) checks it
 	CustomerID int       `json:"customerId"`
 	Product    string    `json:"product"`
 	Quantity   int       `json:"quantity"`
@@ -107,8 +108,8 @@ func (s *OrderStore) index(id int) int {
 }
 
 var orderStore = NewOrderStore(
-	Order{ID: 1, CustomerID: 100, Product: "Widget A", Quantity: 5, Status: "pending", CreatedAt: time.Now()},
-	Order{ID: 2, CustomerID: 101, Product: "Widget B", Quantity: 3, Status: "shipped", CreatedAt: time.Now()},
+	Order{ID: 1, OrgID: 1, CustomerID: 100, Product: "Widget A", Quantity: 5, Status: "pending", CreatedAt: time.Now()},
+	Order{ID: 2, OrgID: 2, CustomerID: 101, Product: "Widget B", Quantity: 3, Status: "shipped", CreatedAt: time.Now()},
 )
 
 // ── List Orders ───────────────────────────────────────────────────────────────

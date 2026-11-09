@@ -144,7 +144,7 @@ func TestAuthFlow_SignedVsForged(t *testing.T) {
 }
 
 func TestPrintDevToken(t *testing.T) {
-	if err := printDevToken(nil); err == nil {
+	if err := printDevToken(nil, nil); err == nil {
 		t.Error("printDevToken without a secret = nil, want an error")
 	}
 }
