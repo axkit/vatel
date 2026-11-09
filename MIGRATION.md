@@ -489,8 +489,9 @@ Per-endpoint middleware: `e.AddMiddleware(pos, f...)` inside an `EndpointOption`
   `replace`).
 - Minimum versions: Go 1.26 (required by fasthttp v1.77.0), `github.com/valyala/fasthttp`
   v1.77.0 (v0.14: v1.31.0), `github.com/fasthttp/router` v1.5.4 (v0.14: v1.4.4) and
-  `github.com/regorov/websocket` v0.1.4 (thread-safe `Conn.CloseDetail`, writes after a
-  close fail with `websocket.ErrConnClosed` instead of blocking).
+  `github.com/regorov/websocket` v0.1.5 (same code as v0.1.4: thread-safe
+  `Conn.CloseDetail`, writes after a close fail with `websocket.ErrConnClosed` instead of
+  blocking; vatel v1.25.0 required v0.1.4, v1.25.1 requires v0.1.5).
   `Shutdown` relies on fasthttp's `ShutdownWithContext` of these versions. Go's minimal
   version selection moves your project to them when you upgrade vatel; code that uses
   fasthttp or fasthttp/router directly should be checked against their changelogs

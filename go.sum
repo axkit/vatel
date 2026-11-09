@@ -32,8 +32,8 @@ github.com/klauspost/cpuid v1.2.1/go.mod h1:Pj4uuM528wm8OyEC2QMXAi2YiTZ96dNQPGgo
 github.com/molecule-man/go-brrr v1.3.0 h1:KEGPkUk9PYFw5+Sv/evCOSU5OmMDXCGFqQ9YjRB7GeU=
 github.com/molecule-man/go-brrr v1.3.0/go.mod h1:7ybW6/7gA3oKY45jOfVNjSJDtrr6ea4tzbsTkjmQDC4=
 github.com/pkg/errors v0.9.1/go.mod h1:bwawxfHBFNV+L2hUp1rHADufV3IMtnDRdf1r5NINEl0=
-github.com/regorov/websocket v0.1.4 h1:9ufX8z95DobIYTX45X8W+1o17DLnEjjys7RyB9X/Zt0=
-github.com/regorov/websocket v0.1.4/go.mod h1:TRmfVoEa3R1JPvk8KLxqWZ0ZhAYj51D9SSX9k8tfdQQ=
+github.com/regorov/websocket v0.1.5 h1:Vyhhlg16ATa/MlsSvgujEh4G3d/8dmpzB4eXqoXrWXk=
+github.com/regorov/websocket v0.1.5/go.mod h1:TRmfVoEa3R1JPvk8KLxqWZ0ZhAYj51D9SSX9k8tfdQQ=
 github.com/rs/xid v1.3.0/go.mod h1:trrq9SKmegXys3aeAKXMUTdJsYXVwGY3RLcfgqegfbg=
 github.com/rs/zerolog v1.26.0 h1:ORM4ibhEZeTeQlCojCK2kPz1ogAY4bGs4tD+SaAdGaE=
 github.com/rs/zerolog v1.26.0/go.mod h1:yBiM87lvSqX8h0Ww4sdzNSkVYZ8dL2xjZJG1lAuGZEo=
