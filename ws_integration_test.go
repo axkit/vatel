@@ -159,6 +159,9 @@ type wsHarness struct {
 	served  atomic.Int32 // wsValidatedHandler calls
 	closed  atomic.Int32 // OnClose calls
 
+	openHook  atomic.Pointer[func()] // called by OnOpen, if set
+	closeHook atomic.Pointer[func()] // called by OnClose, if set
+
 	mu        sync.Mutex
 	conns     []net.Conn // client connections, closed before the cleanup Shutdown
 	authPaths []string
@@ -181,8 +184,18 @@ func newWSHarness(t *testing.T, opts ...func(*WsOption)) *wsHarness {
 			return nil
 		}),
 	}, opts...)...)
-	wv.OnOpen(func(*websocket.Conn) { h.opened.Add(1) })
-	wv.OnClose(func(*websocket.Conn, error) { h.closed.Add(1) })
+	wv.OnOpen(func(*websocket.Conn) {
+		h.opened.Add(1)
+		if f := h.openHook.Load(); f != nil {
+			(*f)()
+		}
+	})
+	wv.OnClose(func(*websocket.Conn, error) {
+		h.closed.Add(1)
+		if f := h.closeHook.Load(); f != nil {
+			(*f)()
+		}
+	})
 	h.wv = wv
 	v := NewVatel(WithWebsocketSupport(wv), WithMetricReporter(h.metrics), WithAlarmer(h.metrics))
 	h.v = v
@@ -638,6 +651,79 @@ func TestWS_HandlerPanic(t *testing.T) {
 	// The connection is still usable.
 	if got := h.send(`{"path":"secret","data":{"name":"a"}}`); got != `{"name":"a","password":"p1"}` {
 		t.Errorf("reply after a panic = %s", got)
+	}
+}
+
+// alarms returns the number of Alarmer calls.
+func (m *syncMetrics) alarms() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.alarmed)
+}
+
+// A panic in the OnOpen callback is recovered: it is logged with the stack,
+// the Alarmer is called, the new connection is closed with 1011 and the
+// server keeps serving other connections.
+func TestWS_OnOpenPanic(t *testing.T) {
+	h := newWSHarness(t)
+	// OnOpen of the harness client may run after newWSHarness returns.
+	h.waitFor("OnOpen", func() bool { return h.opened.Load() == 1 })
+	panicking := func() { panic("SECRET open panic") }
+	h.openHook.Store(&panicking)
+	alarms := h.metrics.alarms()
+
+	c, _ := h.dialPath("/ws")
+	fr := websocket.AcquireFrame()
+	defer websocket.ReleaseFrame(fr)
+	if _, err := c.ReadFrame(fr); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !fr.IsClose() || fr.Status() != websocket.StatusUnexpected {
+		t.Errorf("frame = close %v status %v, want close 1011", fr.IsClose(), fr.Status())
+	}
+	out := h.waitLog(`"panic":"SECRET open panic"`)
+	if !strings.Contains(out, `"stack":"goroutine`) || !strings.Contains(out, `"callback":"OnOpen"`) {
+		t.Errorf("panic not logged with callback and stack: %s", out)
+	}
+	h.waitFor("alarm", func() bool { return h.metrics.alarms() >= alarms+1 })
+	if n := h.metrics.alarms(); n != alarms+1 {
+		h.metrics.mu.Lock()
+		t.Errorf("alarms = %d, want %d: %v", n, alarms+1, h.metrics.alarmed)
+		h.metrics.mu.Unlock()
+	}
+
+	h.openHook.Store(nil)
+	if got := h.send(`{"path":"secret","data":{"name":"a"}}`); got != `{"name":"a","password":"p1"}` {
+		t.Errorf("reply after an OnOpen panic = %s", got)
+	}
+}
+
+// A panic in the OnClose callback is recovered: it is logged with the stack,
+// the Alarmer is called and the server keeps serving other connections.
+func TestWS_OnClosePanic(t *testing.T) {
+	h := newWSHarness(t)
+	h.waitFor("OnOpen", func() bool { return h.opened.Load() == 1 })
+	panicking := func() { panic("SECRET close panic") }
+	h.closeHook.Store(&panicking)
+	alarms := h.metrics.alarms()
+
+	_, conn := h.dialPath("/ws")
+	h.waitFor("OnOpen", func() bool { return h.opened.Load() == 2 })
+	conn.Close()
+	out := h.waitLog(`"panic":"SECRET close panic"`)
+	if !strings.Contains(out, `"stack":"goroutine`) || !strings.Contains(out, `"callback":"OnClose"`) {
+		t.Errorf("panic not logged with callback and stack: %s", out)
+	}
+	h.waitFor("alarm", func() bool { return h.metrics.alarms() >= alarms+1 })
+	if n := h.metrics.alarms(); n != alarms+1 {
+		h.metrics.mu.Lock()
+		t.Errorf("alarms = %d, want %d: %v", n, alarms+1, h.metrics.alarmed)
+		h.metrics.mu.Unlock()
+	}
+
+	h.closeHook.Store(nil)
+	if got := h.send(`{"path":"secret","data":{"name":"a"}}`); got != `{"name":"a","password":"p1"}` {
+		t.Errorf("reply after an OnClose panic = %s", got)
 	}
 }
 

@@ -125,7 +125,9 @@ A panic anywhere in the closure (middleware, decoding, handler, serialization, h
 deferred `recoverPanic`: `Response.Reset()`, then `ErrInternalError` (500, VTL-0005; the panic value reaches
 the client only if verbose) with `panic` and `stack` log fields, `Alarmer`; the metric and `OnErrorResponse`
 only if `VatelContext.reported` is not set yet (a hook after the response panicked). A panic inside the
-recovery is logged and dropped. WS: `serveMessage` defers `wsRecoverPanic` (error frame, connection stays).
+recovery is logged and dropped. WS: `serveMessage` defers `wsRecoverPanic` (error frame, connection stays);
+`OnOpen`/`OnClose` callbacks run through `WebsocketVatel.runCallback` (log + Alarmer; an `OnOpen` panic closes
+the connection with 1011).
 
 ### Middleware
 

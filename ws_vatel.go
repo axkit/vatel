@@ -329,7 +329,9 @@ const wsNetConnKey = "vatel.wsNetConn"
 
 // onOpen registers the connection c. A connection opened after Shutdown, or
 // with the ID of a live connection (UpgradeWithID), is closed at once, without
-// the OnOpen and OnClose callbacks, and its messages are not served.
+// the OnOpen and OnClose callbacks, and its messages are not served. A panic
+// in the OnOpen callback is recovered (see runCallback) and closes c with
+// status 1011; OnClose is still called for it.
 func (wv *WebsocketVatel) onOpen(c *websocket.Conn) {
 	// No frame is written before onOpen returns, so setting the timeout here
 	// does not race with the writer of c.
@@ -349,7 +351,9 @@ func (wv *WebsocketVatel) onOpen(c *websocket.Conn) {
 		return
 	}
 	if wv.callbackOnOpen != nil {
-		wv.callbackOnOpen(c)
+		if wv.runCallback("OnOpen", c, func() { wv.callbackOnOpen(c) }) {
+			closeConn(c, nc, websocket.StatusUnexpected, "internal error")
+		}
 	}
 }
 
@@ -362,8 +366,33 @@ func (wv *WebsocketVatel) onClose(c *websocket.Conn, err error) {
 		err = nil // closed by Shutdown: err is the client's answer or a timeout
 	}
 	if wv.callbackOnClose != nil {
-		wv.callbackOnClose(c, err)
+		wv.runCallback("OnClose", c, func() { wv.callbackOnClose(c, err) })
 	}
+}
+
+// runCallback calls f, the OnOpen or OnClose callback named name for the
+// connection c, and recovers its panic: the panic value and the stack are
+// logged, the Alarmer is called, and runCallback reports true. A panic during
+// the recovery itself is dropped.
+func (wv *WebsocketVatel) runCallback(name string, c *websocket.Conn, f func()) (panicked bool) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			return
+		}
+		panicked = true
+		defer func() { recover() }() //nolint:errcheck // a panic while reporting is dropped
+		if wv.log != nil {
+			zc := wv.log.With().Str("callback", name).Uint64("connectionId", c.ID())
+			zl := withPanic(zc, r).Logger()
+			zl.Error().Msg("ws callback panicked")
+		}
+		if wv.v != nil && wv.v.cfg.ala != nil {
+			wv.v.cfg.ala.Alarm(panicError(r))
+		}
+	}()
+	f()
+	return false
 }
 
 // Shutdown closes all active WebSocket connections with a "going away" status,

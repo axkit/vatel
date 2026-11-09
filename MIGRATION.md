@@ -206,7 +206,9 @@ Per-endpoint middleware: `e.AddMiddleware(pos, f...)` inside an `EndpointOption`
   (`stack`) are logged, the request is reported to the metrics once, the `Alarmer` is
   called and `OnErrorResponse` middleware runs (not for a panic of a middleware that runs
   after the response is written). A WebSocket connection keeps serving messages after the
-  error frame.
+  error frame. A panic in the WebSocket `OnOpen`/`OnClose` callback is recovered as well:
+  logged with `panic`, `stack` and `callback`, the `Alarmer` is called, and after an
+  `OnOpen` panic the connection is closed with status 1011 (`OnClose` is still called).
 - A middleware at `OnErrorResponse` receives the endpoint metadata (`Method`, `Path`,
   `Perms`, `LogOptions`), whatever the pipeline position of the error.
 - An error returned by an `OnSuccessResponse` middleware is ignored: the response, its

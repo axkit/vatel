@@ -577,7 +577,10 @@ verbose errors). The panic value is logged under `panic` and the stack under `st
 whatever the log level; the request is reported to the metrics once, the `Alarmer` is
 called and `OnErrorResponse` middleware runs (not when the panic came from a middleware
 that runs after the response is written). A WebSocket client gets the error frame and its
-connection keeps serving messages.
+connection keeps serving messages. A panic in the WebSocket `OnOpen` or `OnClose` callback
+is recovered too: it is logged (`panic`, `stack`, `callback`) and the `Alarmer` is called;
+after an `OnOpen` panic the connection is closed with status 1011 (`OnClose` is still
+called for it).
 
 Predefined errors:
 
@@ -862,7 +865,9 @@ mux.GET("/ws", wv.Upgrade) // the HTTP route that upgrades to WebSocket
   `OnClose` gets the client's close status as a `websocket.Error` when the client closed
   the connection.
 - A panic in a WS handler is recovered (see [Panics](#panics)): the client gets a 500
-  `VTL-0005` error frame and the connection keeps serving messages.
+  `VTL-0005` error frame and the connection keeps serving messages. A panic in the
+  `OnOpen`/`OnClose` callback is logged and alarmed; after an `OnOpen` panic the
+  connection is closed with status 1011.
 - `UpgradeWithID(ctx, id)`: the ID must be unique among live connections. A connection
   with the ID of a live one is closed at once with status 1008 (policy violation),
   without the callbacks; its messages are not served and it does not share the token
