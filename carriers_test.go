@@ -349,6 +349,7 @@ func (c *uploadMockCtx) VerboseError() bool                { return false }
 func (c *uploadMockCtx) SetVerboseError(bool)              {}
 func (c *uploadMockCtx) Set(string, any) Context           { return c }
 func (c *uploadMockCtx) Get(string) any                    { return nil }
+func (c *uploadMockCtx) SetValue(any, any) Context         { return c }
 func (c *uploadMockCtx) VisitUserValues(func([]byte, any)) {}
 func (c *uploadMockCtx) Context() context.Context          { return context.Background() }
 

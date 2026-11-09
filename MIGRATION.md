@@ -96,10 +96,11 @@ Endpoints that need a valid token but no permission: `cfg.RequireAuth()`.
 |---|---|
 | `ctx.TokenPayload() TokenPayloader` | `ctx.TokenPayload() any`: type-assert, `ctx.TokenPayload().(*Claims)` |
 | `ctx.SetTokenPayload(TokenPayloader)` | `ctx.SetTokenPayload(any)` |
-| `ctx.RequestCtx() *fasthttp.RequestCtx` | removed. Use `Header`, `RequestBody`, `PathValue`, `QueryValue`, `FormFile`, `FormValue`, `RemoteAddr` (real IP), `RequestTime`, `SetHeader`; the request ID is `ctx.Get("reqId")` with `WithRequestID()` |
+| `ctx.RequestCtx() *fasthttp.RequestCtx` | removed. Use `Header`, `RequestBody`, `PathValue`, `QueryValue`, `FormFile`, `FormValue`, `RemoteAddr` (real IP), `RequestTime`, `SetHeader`; the request ID is `ctx.Get("reqId")` with `WithRequestID()`. Code that passed `ctx.RequestCtx()` as a `context.Context` passes `ctx.Context()`: its `Value(key)` returns the request values (`Set`, `SetValue`, path params, `reqId`), as `RequestCtx.Value` did, then the values of the parent context |
+| `ctx.RequestCtx().SetUserValue(key, v)` (typed key, read back with `goctx.Value(key)`) | `ctx.SetValue(key, v)`; `ctx.Context().Value(key)` returns it (see [Request context](#request-context)) |
 | `VatelContext.Log`, `LogValues` | removed; values stored with `ctx.Set` are written to the request log |
-| — | new: `ctx.Context()` (Go context), `VerboseError`/`SetVerboseError` |
-| custom implementations of `vatel.Context` (test mocks) | must add the new methods: `Context`, `PathValue`, `QueryValue`, `RemoteAddr`, `RequestTime`, `RequestBody`, `VerboseError`, `SetVerboseError` |
+| — | new: `ctx.Context()` (Go context), `ctx.SetValue(key, val any)` (any comparable key), `VerboseError`/`SetVerboseError` |
+| custom implementations of `vatel.Context` (test mocks) | must add the new methods: `Context`, `SetValue`, `PathValue`, `QueryValue`, `RemoteAddr`, `RequestTime`, `RequestBody`, `VerboseError`, `SetVerboseError` |
 | `WebsocketContext.TokenPayload() TokenPayloader` | `TokenPayload() any`, `SetTokenPayload(any)` |
 
 ### Middleware
@@ -228,6 +229,11 @@ Per-endpoint middleware: `e.AddMiddleware(pos, f...)` inside an `EndpointOption`
 - Path parameters support the same field types as query parameters (pointers,
   `date.Date`, nested structs); a `float32` path parameter is parsed with 32-bit
   precision.
+- `Validate() error` of an input type is called automatically: v0.14 never called it. An
+  `Inputer`/`Querier` input (HTTP and WS) that already has a `Validate()` method, written
+  for another purpose or called by the handler itself, now runs it before `Handle`, and an
+  error stops the request with 400. Check such methods before upgrading; a handler that
+  called `Validate()` itself can drop the call.
 - A `Validate()` error gives `ErrValidationFailed` (400, code `VTL-0006`, severity tiny)
   wrapping it; the code of a returned `*errors.Error`, if it has one, replaces `VTL-0006`
   and its fields are kept. Before, a plain error from `Validate()` gave 400 without a code.
@@ -349,6 +355,18 @@ Per-endpoint middleware: `e.AddMiddleware(pos, f...)` inside an `EndpointOption`
   interrupt the handler by itself, only code that listens to the context. The 504/503
   mapping is described under [Errors](#errors). `NewContext(fctx)` still uses
   `context.Background()`.
+- `ctx.Context().Value(key)` returns the request values, as `RequestCtx.Value` did in
+  v0.14: values stored with `ctx.Set` or `ctx.SetValue`, path params and `reqId`, then the
+  values of the parent context. The lookup is made at call time, so a context obtained
+  before a value is stored sees it. `ctx.SetValue(key, val)` takes any comparable key, so
+  the typed-key pattern of v0.14 (`ctx.RequestCtx().SetUserValue(myKey{}, v)` in
+  middleware, `goctx.Value(myKey{})` in business code) becomes `ctx.SetValue(myKey{}, v)`
+  and keeps working with `ctx.Context()`. A value under a non-string key is not returned
+  by `Get` and is not written to the request log. After the request has ended (a
+  goroutine that keeps the context) `Value` returns the parent values only, never the
+  values of the next request on the reused fasthttp `RequestCtx`; reading `Value` from
+  another goroutine during the request is safe. There is no API to replace the request
+  context with a `context.WithValue` child: middleware stores values with `SetValue`.
 
 ### WebSocket
 

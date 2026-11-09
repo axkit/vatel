@@ -157,6 +157,10 @@
   - новый тайм-аут записи кадра WS по умолчанию `DefaultWsWriteTimeout` = 10 с (`WithWsWriteTimeout(d)`, 0 — без ограничения): клиент, который не читает, больше не блокирует пишущий обработчик навсегда при полной очереди — запись завершается ошибкой, соединение закрывается.
 - ➕ ревью фазы 3, итерация 5 (перенесено в MIGRATION.md):
   - path-параметр с именем `message` больше не заменяет сообщение строки выхода (`processed`/`completed`): раньше его сырое значение становилось сообщением журнала в обход тега `mask` (`mask:"-"`, `mask:"secret"`). Параметр пишется, как и другие path-параметры, по тегу `mask`; значение `ctx.Set("message", v)` по-прежнему заменяет сообщение.
+- ➕ ревью фазы 4 (перенесено в MIGRATION.md):
+  - `ctx.Context().Value(key)` возвращает значения запроса (`Set`, новый `SetValue`, path-параметры, `reqId`) в момент вызова, затем значения родительского контекста — как `RequestCtx.Value` в v0.14, который передавали как `context.Context`. Раньше в v1.25 `ctx.Context()` их не видел, и замена `ctx.RequestCtx()` → `ctx.Context()` молча ломала поиск по типизированному ключу (проверка области PAT в Gostly). После завершения запроса возвращаются только значения родителя (fasthttp переиспользует `RequestCtx`); чтение из другой горутины во время запроса безопасно.
+  - новый метод `Context.SetValue(key, val any) Context` — значение под любым сравнимым ключом (замена `ctx.RequestCtx().SetUserValue(typedKey, v)`); строковый ключ — то же, что `Set`; значение под нестроковым ключом не возвращается `Get` и не пишется в журнал. Собственные реализации `vatel.Context` должны добавить `SetValue`.
+  - явно: `Validate() error` входного типа теперь вызывается автоматически (v0.14 его не вызывал) — существующий метод `Validate()` начнёт останавливать запрос с 400.
 
 ## What Goes Where
 - **Implementation Steps**: код, тесты, документация в этом репозитории, коммиты на ветке `refactor`.
@@ -361,4 +365,4 @@
 - GitHub release с текстом из MIGRATION.md
 
 **Внешние проекты:**
-- сообщить сессии Гостли (app-fa) версию и ссылку на MIGRATION.md: что закрыто, какие обходы можно убрать (`core.InstallBodyDecodeCheck`, ручная запись `suggestedName`, CORS вне vatel), что им нужно сделать (переход на errors v1.1.0 — их backlog `vatel-upgrade-errors-v1.md`, `WithClientErrorFields("reason", "suggestedName")`, `WithOptionalBody()` для POST …/ticket)
+- сообщить сессии Гостли (app-fa) версию и ссылку на MIGRATION.md: что закрыто, какие обходы можно убрать (`core.InstallBodyDecodeCheck`, ручная запись `suggestedName`, CORS вне vatel), что им нужно сделать (переход на errors v1.1.0 — их backlog `vatel-upgrade-errors-v1.md`, `WithClientErrorFields("reason", "suggestedName")`, `WithOptionalBody()` для POST …/ticket; `ctx.RequestCtx()` как `context.Context` → `ctx.Context()`, а `ctx.RequestCtx().SetUserValue(bl.PersonalAccessTokenActorKey, patID)` (`internal/aaa/rest/pat_scope.go`) → `ctx.SetValue(bl.PersonalAccessTokenActorKey, patID)` — иначе `ViaPersonalAccessToken` не увидит значение и ограничение области PAT молча пропадёт; проверить существующие методы `Validate()` входных типов — теперь вызываются автоматически)

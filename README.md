@@ -339,6 +339,21 @@ fasthttp: `Header`, `RequestBody`, `PathValue`, `QueryValue`, `FormFile`, `FormV
 `BodyWriter`, `TokenPayload`, `Context` (Go context), and a per-request key-value store
 `Set`/`Get`. Values stored with `Set` are written to the request log.
 
+`SetValue(key, val any)` stores a value under any comparable key, typically an unexported
+typed key, for code that only gets the Go context: `ctx.Context().Value(key)` returns it.
+A string key is the same as `Set`; a value under a non-string key is not returned by
+`Get` and is not written to the log.
+
+```go
+type patKey struct{}
+
+// middleware (OnAuthorization, OnHandle, ...)
+ctx.SetValue(patKey{}, patID)
+
+// business code that receives ctx.Context()
+func viaPAT(ctx context.Context) bool { _, ok := ctx.Value(patKey{}).(int64); return ok }
+```
+
 The token payload set by the auth middleware is type-asserted to your claims type:
 
 ```go
@@ -710,6 +725,11 @@ Types without `mask` tags are logged unchanged.
   `context.Canceled` gives 503, unless the error carries its own status.
 - fasthttp does not report a client disconnect, so the context is not cancelled when the
   client goes away.
+- `Value(key)` returns the request values first (`Set`, `SetValue`, path params,
+  `reqId`), then the values of the parent context, looked up at call time: a context
+  obtained before a value is stored sees it. It is safe to call from another goroutine.
+  After the request has ended it returns the parent values only (fasthttp reuses the
+  request object for the next request).
 - `vatel.NewContext(fctx)` (for tests) returns a `Context` with `context.Background()`.
 
 ```go

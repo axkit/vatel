@@ -208,6 +208,9 @@ func (e *Endpoint) handler(l *zerolog.Logger) func(*fasthttp.RequestCtx) {
 		reqCtx, cancel := e.requestContext()
 		defer cancel()
 		ctx := newContext(fctx, reqCtx)
+		// Runs after the panic recovery below: ctx.Context().Value stops
+		// reading fctx before fasthttp reuses it.
+		defer ctx.end()
 		zco := l.With().Str("client", realip.FromRequest(fctx))
 		zc := zco
 		// A panic of middleware, decoding, the handler, response writing or a

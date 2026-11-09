@@ -43,7 +43,7 @@ from `go.mod`. User docs: `README.md`; v0.14 → v1.25 changes: `MIGRATION.md`. 
 - `vatel.go` — `Vatel` (registry, `Option`s, `BuildHandlers`, `ListenAndServe`, `Shutdown`), DI interfaces.
 - `options.go` — `EndpointOption`s and builders `GET/POST/PUT/PATCH/DELETE/HEAD/OPTIONS/WS`, `Endpoints`.
 - `endpoint.go` — `Endpoint`, handler interfaces, request pipeline (`handler`, `buildHandler`), logging,
-  error responses, `compile`, `LogOption` bits, sentinel errors (`VTL-0001`..`VTL-0007`).
+  error responses, `compile`, `LogOption` bits, sentinel errors (`VTL-0001`..`VTL-0008`).
 - `decode.go` — path/query/body decoding with precomputed `fieldInfo`, `validate`, `Validator`.
 - `carriers.go` — generic carriers `PathParams`, `QueryParams`, `Body`, `Output`, `OptionalOutput`, `Upload`, `Func`.
 - `middleware.go` — `MiddlewarePos`, `EndpointMeta`.
@@ -184,7 +184,13 @@ logged only by `decodeParams`; their user-value keys (`pathParamKeys`) are skipp
 `Vatel` owns `baseCtx` (cancelled by `Shutdown`, see Core types). `ctx.Context()` is the base context or
 `context.WithTimeout(base, Timeout)` (`WithTimeout` / `WithDefaultTimeout`), cancelled at the end of the
 request. Timeouts do not interrupt handlers by themselves. fasthttp `RequestCtx.Done()` is not used.
-`NewContext(fctx)` (public, for tests) uses `context.Background()`.
+`NewContext(fctx)` (public, for tests) uses `context.Background()`. The returned context is a
+`valueContext` (embedded in `VatelContext`) wrapping that parent: `Value(key)` returns the fasthttp user
+value (`Set`, `SetValue` with any key, path params, `reqId`) at call time, then the parent's value — v0.14
+code passed `RequestCtx` (whose `Value` = `UserValue`) as a `context.Context`. `VatelContext.mu` guards
+user-value writes and `Value` reads (other goroutines); `end()` (deferred in `Endpoint.handler`, runs after
+panic recovery) detaches it so a kept context never reads the reused `RequestCtx`. Non-string keys are not
+visited by `VisitUserValues`, so they are not logged.
 
 ### WebSocket
 

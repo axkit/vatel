@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"mime/multipart"
+	"sync"
 	"time"
 
 	realip "github.com/axkit/fasthttp-realip"
@@ -43,15 +44,25 @@ type Context interface {
 	VerboseError() bool
 	SetVerboseError(bool)
 
-	// Per-request key-value store (for middleware ↔ handler communication)
+	// Per-request key-value store (for middleware ↔ handler communication).
+	// Values stored with Set are written to the request log.
 	Set(key string, val any) Context
 	Get(key string) any
+	// SetValue stores val under an arbitrary comparable key, e.g. an unexported
+	// typed key of the application, so that Context().Value(key) returns it.
+	// A string key is the same as Set; a value under a non-string key is not
+	// returned by Get and is not written to the request log.
+	SetValue(key, val any) Context
 	VisitUserValues(func(key []byte, val any))
 
 	// Context returns the request context. It is cancelled by Vatel.Shutdown
 	// and, when the endpoint has a timeout (WithTimeout, WithDefaultTimeout),
 	// when the timeout expires or the request ends. fasthttp cannot detect a
 	// client disconnect, so it is not cancelled when the client goes away.
+	//
+	// Its Value(key) returns the request values (Set, SetValue, path params,
+	// "reqId"), looked up at call time, and then the values of the parent
+	// context. After the request has ended it returns the parent values only.
 	Context() context.Context
 }
 
@@ -60,9 +71,31 @@ type VatelContext struct {
 	fh         *fasthttp.RequestCtx
 	tp         any
 	verboseErr bool
-	ctx        context.Context
+	vctx       valueContext
 	reported   bool // the request was reported to the MetricReporter
+
+	// mu guards the user values of fh against Context().Value calls from other
+	// goroutines, and ended, set when the request ends: fasthttp then resets
+	// and reuses fh for another request.
+	mu    sync.RWMutex
+	ended bool
 }
+
+// valueContext is the Go context of a request: its parent's deadline and
+// cancellation, and the request values before the parent's values.
+type valueContext struct {
+	context.Context
+	c *VatelContext
+}
+
+func (v *valueContext) Value(key any) any {
+	if val := v.c.userValue(key); val != nil {
+		return val
+	}
+	return v.Context.Value(key)
+}
+
+func (v *valueContext) String() string { return "vatel.RequestContext" }
 
 // NewContext creates a Context wrapping the given fasthttp request context.
 // Its Context() is context.Background().
@@ -72,10 +105,27 @@ func NewContext(fctx *fasthttp.RequestCtx) Context {
 
 // newContext creates a Context wrapping fctx with ctx as its Go context.
 func newContext(fctx *fasthttp.RequestCtx, ctx context.Context) *VatelContext {
-	return &VatelContext{
-		fh:  fctx,
-		ctx: ctx,
+	c := &VatelContext{fh: fctx}
+	c.vctx = valueContext{Context: ctx, c: c}
+	return c
+}
+
+// userValue returns the request value under key, nil after the request ended.
+func (c *VatelContext) userValue(key any) any {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.ended {
+		return nil
 	}
+	return c.fh.UserValue(key)
+}
+
+// end detaches Context().Value from the request values; called when the
+// request ends, before fasthttp reuses the RequestCtx.
+func (c *VatelContext) end() {
+	c.mu.Lock()
+	c.ended = true
+	c.mu.Unlock()
 }
 
 func (c *VatelContext) BodyWriter() io.Writer {
@@ -144,7 +194,13 @@ func (c *VatelContext) VerboseError() bool     { return c.verboseErr }
 func (c *VatelContext) SetVerboseError(v bool) { c.verboseErr = v }
 
 func (c *VatelContext) Set(key string, val any) Context {
+	return c.SetValue(key, val)
+}
+
+func (c *VatelContext) SetValue(key, val any) Context {
+	c.mu.Lock()
 	c.fh.SetUserValue(key, val)
+	c.mu.Unlock()
 	return c
 }
 
@@ -157,5 +213,5 @@ func (c *VatelContext) VisitUserValues(f func(key []byte, val any)) {
 }
 
 func (c *VatelContext) Context() context.Context {
-	return c.ctx
+	return &c.vctx
 }
