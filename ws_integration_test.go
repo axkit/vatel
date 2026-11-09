@@ -96,6 +96,30 @@ type wsPINHandler struct {
 
 func (h *wsPINHandler) Handle(WebsocketContext) error { return nil }
 
+type wsValidatedInput struct {
+	Name string `json:"name"`
+}
+
+func (in *wsValidatedInput) Validate() error {
+	if in.Name == "" {
+		return ErrValidationFailed.New().Set("reason", "name is required")
+	}
+	return nil
+}
+
+// wsValidatedHandler counts its calls in served.
+type wsValidatedHandler struct {
+	Body[wsValidatedInput]
+	Output[wsValidatedInput]
+	served *atomic.Int32
+}
+
+func (h *wsValidatedHandler) Handle(WebsocketContext) error {
+	h.served.Add(1)
+	h.Out = h.In
+	return nil
+}
+
 type wsFailHandler struct{}
 
 func (wsFailHandler) Handle(WebsocketContext) error { return stderrors.New("SECRET dsn") }
@@ -126,6 +150,7 @@ type wsHarness struct {
 	wv      *WebsocketVatel
 	ln      *fasthttputil.InmemoryListener
 	opened  atomic.Int32 // OnOpen calls
+	served  atomic.Int32 // wsValidatedHandler calls
 	closed  atomic.Int32 // OnClose calls
 
 	mu        sync.Mutex
@@ -161,6 +186,7 @@ func newWSHarness(t *testing.T) *wsHarness {
 		WS("pin", func() WebsocketHandler { return &wsPINHandler{} }, WithLogOption(LogExit)),
 		WS("slow", func() WebsocketHandler { return wsSlowHandler{} }),
 		WS("flood", func() WebsocketHandler { return wsFloodHandler{} }),
+		WS("validated", func() WebsocketHandler { return &wsValidatedHandler{served: &h.served} }, WithLogOption(LogExit)),
 	})
 
 	mux := router.New()
@@ -342,6 +368,31 @@ func TestWS_Integration(t *testing.T) {
 	st, alarms := h.waitMetric("fail", 1)
 	if st[0] != 500 || alarms != 1 {
 		t.Errorf("fail: metric status %v, alarms %d; want 500 and 1", st, alarms)
+	}
+}
+
+// The Validate() of a WS Inputer input runs after decoding, before Handle: an
+// error rejects the message with ErrValidationFailed, as in HTTP.
+func TestWS_InputValidated(t *testing.T) {
+	h := newWSHarness(t)
+
+	got := h.send(`{"path":"validated","data":{"name":""}}`)
+	if !strings.Contains(got, `"code":"VTL-0006","statusCode":400`) {
+		t.Errorf("reply to an invalid input = %s, want 400 VTL-0006", got)
+	}
+	h.waitLog(`"reason":"name is required"`)
+	if n := h.served.Load(); n != 0 {
+		t.Errorf("handler called %d times for an invalid input, want 0", n)
+	}
+	if st, _ := h.waitMetric("validated", 1); st[0] != 400 {
+		t.Errorf("metric status = %v, want 400", st)
+	}
+
+	if got := h.send(`{"path":"validated","data":{"name":"a"}}`); got != `{"name":"a"}` {
+		t.Errorf("reply to a valid input = %s", got)
+	}
+	if n := h.served.Load(); n != 1 {
+		t.Errorf("handler called %d times for a valid input, want 1", n)
 	}
 }
 

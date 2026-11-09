@@ -343,7 +343,13 @@ of the `Inputer` input. The first error rejects the request with 400.
   (embedded or untagged) are flattened. A nested struct of a type already being flattened
   (a cycle such as `Parent *Filter`) is skipped. A missing query variable leaves the field
   as is.
-- A value that cannot be parsed gives 400 `VTL-0006` (`ErrValidationFailed`) with field `param`.
+- A value that cannot be parsed gives 400 `VTL-0006` (`ErrValidationFailed`) with field `param`,
+  and so does an empty date (`?from=`).
+  So does an integer that does not fit the field (`300` for a `uint8`, `2147483648` for an
+  `int32`): integers are parsed at the size of the field, never truncated.
+- `Param()`, `QueryInput()` and the GET/DELETE/HEAD/OPTIONS `Input()` must return a
+  non-nil pointer to a struct; anything else, a typed nil included, is a `BuildHandlers`
+  error.
 - Body: `encoding/json` into the `Inputer` value. An empty or whitespace-only body gives
   400 `VTL-0007` "empty request body, JSON expected"; invalid JSON gives 400 `VTL-0007`
   "request body is not valid JSON". For an input type with `mask` tags the
@@ -380,7 +386,8 @@ are kept. A plain `errors.New("...")` text from `Validate()` reaches the client 
 verbose errors; to
 show a reason, set an error field and list it in `WithClientErrorFields` (see
 [Errors](#errors)). `Validate()` is called on `Querier` and `Inputer` input only, not on a
-`PathParams` struct.
+`PathParams` struct. On a WebSocket endpoint it is called on the `Inputer` input after the
+message `data` is decoded.
 
 ### Optional request body
 
@@ -774,7 +781,9 @@ mux.GET("/ws", wv.Upgrade) // the HTTP route that upgrades to WebSocket
   as `ctx.TokenPayload()` in later messages.
 - `WithWsAuthFunc` is called for every message with the endpoint's `Perms`; WS endpoints
   with `Perms` require it. HTTP middleware does not run for WS messages.
-- Invalid `data` gives a 400 `VTL-0007` error message. Errors are sent, logged and
+- Invalid `data` gives a 400 `VTL-0007` error message. If the `Inputer` input implements
+  `Validator`, `Validate()` is called after decoding, before `Handle`; an error gives
+  `ErrValidationFailed` (400, `VTL-0006`) as in HTTP. Errors are sent, logged and
   reported to metrics and the `Alarmer` like HTTP errors.
 - A message that is not valid JSON or has no `path` gives 400 `VTL-0007`, an unknown
   `path` gives 404 `VTL-0008` (`ErrUnknownPath`). These errors are sent and logged like

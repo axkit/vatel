@@ -116,6 +116,33 @@ func TestHandler_QueryParams_InvalidType(t *testing.T) {
 
 // ── path param decoding ───────────────────────────────────────────────────────
 
+type uint8PathHandler struct {
+	param struct {
+		ID uint8 `param:"id"`
+	}
+	called bool
+}
+
+func (h *uint8PathHandler) Param() any           { return &h.param }
+func (h *uint8PathHandler) Handle(Context) error { h.called = true; return nil }
+
+// A path param that does not fit the field's size gives 400 instead of a
+// truncated value.
+func TestHandler_PathParams_IntOutOfRange(t *testing.T) {
+	h := &uint8PathHandler{}
+	fctx := newGETCtx("/items/300")
+	fctx.SetUserValue("id", "300")
+
+	run(NewVatel(), GET("/items/{id}", func() Handler { return h }), fctx)
+
+	if got := responseStatus(fctx); got != 400 {
+		t.Errorf("status = %d, want 400 (param.ID = %d)", got, h.param.ID)
+	}
+	if h.called {
+		t.Error("handler must not be called")
+	}
+}
+
 func TestHandler_PathParams(t *testing.T) {
 	h := &pathHandler{}
 	v := NewVatel()
@@ -2376,6 +2403,40 @@ func TestHandler_PtrDateParams(t *testing.T) {
 	}
 	if ph.got == nil || *ph.got != want {
 		t.Errorf("path: Day = %v, want %v", ph.got, want)
+	}
+}
+
+type dateQueryHandler struct {
+	QueryParams[struct {
+		From date.Date `param:"from"`
+	}]
+	called bool
+}
+
+func (h *dateQueryHandler) Handle(Context) error { h.called = true; return nil }
+
+// A present-but-empty date param gives 400; it used to panic in date.Parse
+// and crash the server (fasthttp does not recover panics).
+func TestHandler_EmptyDateParams(t *testing.T) {
+	for _, uri := range []string{"/q?from=", "/q?from"} {
+		qh := &dateQueryHandler{}
+		fctx, _, _ := serveLogged(t, NewVatel(), Endpoints{
+			GET("/q", func() Handler { return qh }, WithLogOption(LogExit)),
+		}, "GET", uri)
+		if got := responseStatus(fctx); got != 400 {
+			t.Errorf("%s: status = %d, want 400: %s", uri, got, fctx.Response.Body())
+		}
+		if qh.called {
+			t.Errorf("%s: handler must not be called", uri)
+		}
+	}
+
+	pqh := &ptrDateQueryHandler{}
+	fctx, _, _ := serveLogged(t, NewVatel(), Endpoints{
+		GET("/q", func() Handler { return pqh }, WithLogOption(LogExit)),
+	}, "GET", "/q?from=")
+	if got := responseStatus(fctx); got != 400 {
+		t.Errorf("*date.Date query: status = %d, want 400: %s", got, fctx.Response.Body())
 	}
 }
 

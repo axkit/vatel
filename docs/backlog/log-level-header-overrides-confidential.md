@@ -18,3 +18,5 @@ Unknown that settles it: how the header is used in practice (dev only, or prod d
 - keep the default, but the header cannot add `req-body`/`req-input` where `LogOptions` are set explicitly
   (does not stop log flooding);
 - docs only: recommend `WithStaticLoggingLevel` in production.
+
+Also flagged as MAJOR on 2026-11-09 by the external codex review (phase 3, iteration 3, endpoint.go resolveLogLevel); left as is by user decision, still to be discussed.

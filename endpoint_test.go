@@ -57,6 +57,47 @@ func TestDecodeURLQuery_BasicTypes(t *testing.T) {
 	}
 }
 
+// An empty date value (?day=) is a 400, not a panic of date.Parse, for a
+// date.Date and a *date.Date field, in the query and in path params.
+func TestSetParam_EmptyDate(t *testing.T) {
+	type in struct {
+		Day  date.Date  `param:"day"`
+		PDay *date.Date `param:"pday"`
+	}
+	for _, key := range []string{"day", "pday"} {
+		t.Run("query "+key, func(t *testing.T) {
+			ctx := fasthttp.RequestCtx{}
+			ctx.QueryArgs().Add(key, "")
+			var a in
+			l := zerolog.New(io.Discard)
+			_, err := decodeURLQuery(&ctx, &a, mustFields(t, &a), l.With())
+			if err == nil {
+				t.Fatalf("decodeURLQuery = nil, want an error (a = %+v)", a)
+			}
+			if got := errors.Serialize(err, errors.WithAttributes(errors.ServerOutputFormat)).StatusCode; got != 400 {
+				t.Errorf("status = %d, want 400", got)
+			}
+		})
+		t.Run("path "+key, func(t *testing.T) {
+			ctx := fasthttp.RequestCtx{}
+			var a in
+			fields := mustFields(t, &a)
+			for i := range fields {
+				ctx.SetUserValue(fields[i].tag, "2024-01-02")
+			}
+			ctx.SetUserValue(key, "")
+			l := zerolog.New(io.Discard)
+			_, err := decodeParams(&ctx, &a, fields, l.With())
+			if err == nil {
+				t.Fatalf("decodeParams = nil, want an error (a = %+v)", a)
+			}
+			if got := errors.Serialize(err, errors.WithAttributes(errors.ServerOutputFormat)).StatusCode; got != 400 {
+				t.Errorf("status = %d, want 400", got)
+			}
+		})
+	}
+}
+
 func TestDecodeURLQuery_MissingParam(t *testing.T) {
 	ctx := fasthttp.RequestCtx{}
 
@@ -88,6 +129,56 @@ func TestDecodeURLQuery_InvalidInt(t *testing.T) {
 	_, err := decodeURLQuery(&ctx, &a, fields, l.With())
 	if err == nil {
 		t.Error("expected error for invalid int")
+	}
+}
+
+// An integer that does not fit the field's size is rejected, not truncated.
+func TestDecodeURLQuery_IntRange(t *testing.T) {
+	type in struct {
+		I8  int8   `param:"i8"`
+		I16 int16  `param:"i16"`
+		I32 int32  `param:"i32"`
+		U8  uint8  `param:"u8"`
+		U16 uint16 `param:"u16"`
+		U32 uint32 `param:"u32"`
+		P8  *int8  `param:"p8"`
+	}
+	tests := []struct {
+		key, val string
+		ok       bool
+	}{
+		{"i8", "127", true},
+		{"i8", "-128", true},
+		{"i8", "128", false},
+		{"i8", "-129", false},
+		{"i16", "32768", false},
+		{"i32", "2147483647", true},
+		{"i32", "2147483648", false},
+		{"u8", "255", true},
+		{"u8", "256", false},
+		{"u16", "65536", false},
+		{"u32", "4294967296", false},
+		{"p8", "300", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.key+"="+tt.val, func(t *testing.T) {
+			ctx := fasthttp.RequestCtx{}
+			ctx.QueryArgs().Add(tt.key, tt.val)
+			var a in
+			l := zerolog.New(io.Discard)
+			_, err := decodeURLQuery(&ctx, &a, mustFields(t, &a), l.With())
+			if tt.ok && err != nil {
+				t.Fatalf("decodeURLQuery = %v, want nil", err)
+			}
+			if !tt.ok {
+				if err == nil {
+					t.Fatalf("decodeURLQuery = nil, want a range error (a = %+v)", a)
+				}
+				if got := errors.Serialize(err, errors.WithAttributes(errors.ServerOutputFormat)).StatusCode; got != 400 {
+					t.Errorf("status = %d, want 400", got)
+				}
+			}
+		})
 	}
 }
 
@@ -573,12 +664,36 @@ type nilParamHandler struct{}
 func (h *nilParamHandler) Param() any           { return nil }
 func (h *nilParamHandler) Handle(Context) error { return nil }
 
+type idParam struct {
+	ID int `param:"id"`
+}
+
+// typedNilParamHandler returns a typed nil *struct from Param, QueryInput and
+// Input: it passes the type check but has no struct to decode into.
+type typedNilParamHandler struct{}
+
+func (h *typedNilParamHandler) Param() any           { return (*idParam)(nil) }
+func (h *typedNilParamHandler) Handle(Context) error { return nil }
+
+type typedNilQueryHandler struct{}
+
+func (h *typedNilQueryHandler) QueryInput() any      { return (*idParam)(nil) }
+func (h *typedNilQueryHandler) Handle(Context) error { return nil }
+
+type typedNilGetInputHandler struct{}
+
+func (h *typedNilGetInputHandler) Input() any           { return (*idParam)(nil) }
+func (h *typedNilGetInputHandler) Handle(Context) error { return nil }
+
 func TestBuildHandlers_NonStructParamInput_ReturnsError(t *testing.T) {
 	cases := map[string]Endpoint{
 		"QueryParams of a map": GET("/q", func() Handler { return &mapQueryHandler{} }),
 		"GET Body of a map":    GET("/q", func() Handler { return &mapGetInputHandler{} }),
 		"Param of an int":      GET("/p/{id}", func() Handler { return &intParamHandler{} }),
 		"nil Param":            GET("/p/{id}", func() Handler { return &nilParamHandler{} }),
+		"typed nil Param":      GET("/p/{id}", func() Handler { return &typedNilParamHandler{} }),
+		"typed nil QueryInput": GET("/q", func() Handler { return &typedNilQueryHandler{} }),
+		"typed nil GET Input":  GET("/q", func() Handler { return &typedNilGetInputHandler{} }),
 	}
 	for name, e := range cases {
 		t.Run(name, func(t *testing.T) {

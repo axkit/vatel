@@ -93,7 +93,7 @@ type Paramer interface   { Param() any }       // path params, fields tagged `pa
 type Querier interface   { QueryInput() any }  // query string, every method
 type Inputer interface   { Input() any }       // GET/DELETE/HEAD/OPTIONS: query; POST/PUT/PATCH: JSON body
 type Resulter interface  { Result() any }      // JSON response; nil => no body
-type Validator interface { Validate() error }  // on input types; called after all decoding
+type Validator interface { Validate() error }  // on input types; called after all decoding (HTTP and WS)
 ```
 
 Carriers implement them via embedding: `PathParams[T]` (`Params`), `QueryParams[T]` (`Query`, a `Querier`,
@@ -179,7 +179,7 @@ request. Timeouts do not interrupt handlers by themselves. fasthttp `RequestCtx.
 `NewWebsocketVatel(WithLogger, WithTokenDecoder, WithWsAuthFunc)` + `vatel.WithWebsocketSupport(wv)`
 (`WithLogger` replaces the `BuildHandlers` logger for WS endpoints); the
 app routes an HTTP path to `wv.Upgrade`. Messages are `{"path": ..., "data": ...}`; `vatel.WS(path, ctrl)`
-endpoints use `Inputer`/`Resulter` (no middleware, no Paramer/Querier). WS `Perms` require `WithWsAuthFunc`.
+endpoints use `Inputer` (+ `Validator`)/`Resulter` (no middleware, no Paramer/Querier). WS `Perms` require `WithWsAuthFunc`.
 Built-in `updateAccessToken` endpoint calls `OnTokenUpdate`, then stores the payload per connection (`wsConns`:
 one table of live connections and payloads); a callback error rejects the token. WS handlers have no Go
 context. `e.wsWriteErrorResponse` uses the HTTP `errorResponse` (status mapping, `LogSilent`, metrics,

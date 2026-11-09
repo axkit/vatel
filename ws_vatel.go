@@ -442,7 +442,12 @@ func (wv *WebsocketVatel) serveMessage(c *websocket.Conn, e *Endpoint, msg Webso
 
 	h := e.WebsocketController()
 	if input, ok := h.(Inputer); ok {
-		if err := decodeWSInput(msg.Data, input.Input(), e.inputFields.HasRules()); err != nil {
+		in := input.Input()
+		if err := decodeWSInput(msg.Data, in, e.inputFields.HasRules()); err != nil {
+			e.wsWriteErrorResponse(c, lo, verbose, zc, ctx.Created(), err)
+			return
+		}
+		if err := validate(in); err != nil {
 			e.wsWriteErrorResponse(c, lo, verbose, zc, ctx.Created(), err)
 			return
 		}

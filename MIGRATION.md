@@ -148,7 +148,9 @@ Per-endpoint middleware: `e.AddMiddleware(pos, f...)` inside an `EndpointOption`
   a route the router rejects (a duplicate or conflicting path, your own `GET /`, which is
   taken by the built-in endpoint list), a path that does not begin with `/`, and a
   `Param()`, `QueryInput()` or GET/DELETE/HEAD/OPTIONS `Input()` that does not return a
-  pointer to a struct. A nested struct of a type already being flattened in a query or
+  pointer to a struct. A typed nil pointer (`(*T)(nil)`) from them is also a
+  `BuildHandlers` error (before: it built and the first request with a value for one of
+  its params panicked). A nested struct of a type already being flattened in a query or
   path input (a cycle such as `Parent *Filter`) is skipped instead of recursing forever.
 - `BuildHandlers` errors name the endpoint as "endpoint <METHOD> <path>: <reason>"
   (`WS` for WS endpoints).
@@ -202,6 +204,12 @@ Per-endpoint middleware: `e.AddMiddleware(pos, f...)` inside an `EndpointOption`
   `VTL-0006` with field `param`; v0.14 returned the raw parse error, i.e. 500. For a path
   or query parameter with a `mask` tag the error does not wrap the parse error, which
   quotes the value.
+- An integer path or query parameter that does not fit its field (`300` for a `uint8`,
+  `2147483648` for an `int32`) gives 400 `VTL-0006` with field `param`; before, the value
+  was parsed at 64 bits and silently truncated (`300` became `44`).
+- An empty `date.Date` or `*date.Date` path or query parameter (`?from=`, `?from`) gives
+  400 `VTL-0006` with field `param`; before, `date.Parse("")` panicked, and as fasthttp
+  does not recover panics, a single request crashed the server.
 - Path parameters support the same field types as query parameters (pointers,
   `date.Date`, nested structs); a `float32` path parameter is parsed with 32-bit
   precision.
@@ -327,6 +335,9 @@ Per-endpoint middleware: `e.AddMiddleware(pos, f...)` inside an `EndpointOption`
   `ErrInvalidRequestBody` (400, code `VTL-0007`, message "ws message data is not valid
   JSON"); before, the unwrapped `json.Unmarshal` error with status 500 (in the log, the
   metrics and `Alarm`).
+- `Validate()` of the `Inputer` input (`Validator`) is called after the message `data` is
+  decoded, before `Handle`; an error is sent as `ErrValidationFailed` (400, `VTL-0006`), as
+  in HTTP. Before, it was not called for WebSocket messages.
 - An error without a status (not an `*errors.Error`, or an `*errors.Error` with status 0)
   counts as 500 in the log, metrics and `Alarm`, as in HTTP (`context.DeadlineExceeded` →
   504, `context.Canceled` → 503); before, an `*errors.Error` without a status was reported

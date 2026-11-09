@@ -61,7 +61,7 @@ func setParam(sf reflect.Value, fi *fieldInfo, val, source string) error {
 	}
 
 	if fi.isDate {
-		d, err := date.Parse(val)
+		d, err := parseDate(val)
 		if err != nil {
 			return paramError(fi, err)
 		}
@@ -69,15 +69,17 @@ func setParam(sf reflect.Value, fi *fieldInfo, val, source string) error {
 		return nil
 	}
 
+	// Integers are parsed at the size of the field, so a value that does not
+	// fit is a range error, not a truncated value.
 	switch fi.kind {
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		n, err := strconv.ParseInt(val, 10, 64)
+		n, err := strconv.ParseInt(val, 10, sf.Type().Bits())
 		if err != nil {
 			return paramError(fi, err)
 		}
 		sf.SetInt(n)
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		n, err := strconv.ParseUint(val, 10, 64)
+		n, err := strconv.ParseUint(val, 10, sf.Type().Bits())
 		if err != nil {
 			return paramError(fi, err)
 		}
@@ -111,6 +113,24 @@ func setParam(sf reflect.Value, fi *fieldInfo, val, source string) error {
 	return nil
 }
 
+var errEmptyDate = stderrors.New("empty date, YYYY-MM-DD expected")
+
+// parseDate parses a "YYYY-MM-DD" path or query param value. date.Parse
+// panics on an empty string, and fasthttp does not recover panics, so an
+// empty value is rejected before it is called, and a panic of date.Parse on
+// any other value is returned as an error.
+func parseDate(val string) (d date.Date, err error) {
+	if val == "" {
+		return 0, errEmptyDate
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			d, err = 0, fmt.Errorf("invalid date: %v", r)
+		}
+	}()
+	return date.Parse(val)
+}
+
 // buildParamFields reflects on the value returned by Param() and returns
 // precomputed field metadata. It uses the query layout, so path params support
 // the same field types as query params (pointers, date.Date, nested structs).
@@ -122,12 +142,16 @@ func buildParamFields(param any) ([]fieldInfo, error) {
 // Input() (named by getter in errors), and returns precomputed field metadata,
 // flattening nested structs. A mask tag on a nested struct applies to its
 // fields that have no mask tag of their own. in must be a non-nil pointer to a
-// struct. A nested struct whose type is already being flattened (a cycle such
-// as a Parent *Filter field) is skipped.
+// struct: a typed nil has no struct to decode into. A nested struct whose
+// type is already being flattened (a cycle such as a Parent *Filter field) is
+// skipped.
 func buildQueryFields(in any, getter string) ([]fieldInfo, error) {
 	t := reflect.TypeOf(in)
 	if t == nil || t.Kind() != reflect.Pointer || t.Elem().Kind() != reflect.Struct {
 		return nil, fmt.Errorf("%s must return a pointer to a struct, got %v", getter, t)
+	}
+	if reflect.ValueOf(in).IsNil() {
+		return nil, fmt.Errorf("%s must return a non-nil pointer to a struct, got a nil %v", getter, t)
 	}
 	var fields []fieldInfo
 	flattenQueryFields(t.Elem(), nil, "", map[reflect.Type]bool{}, &fields)
@@ -329,6 +353,10 @@ func validate(in any) error {
 // VTL-0006) wrapping it; the code of a returned *errors.Error, if it has one,
 // replaces VTL-0006. Declare
 // Validate() on a named type: an anonymous struct cannot have methods.
+//
+// For a WebSocket endpoint, Validate() of the Inputer input is called after
+// the message data is decoded, before Handle(); an error is sent to the client
+// the same way.
 //
 // Validate() is not called when the endpoint uses WithOptionalBody and the
 // request body is empty: the input stays zero, so a Validate() that fills in
