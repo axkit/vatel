@@ -302,7 +302,9 @@ Per-endpoint middleware: `e.AddMiddleware(pos, f...)` inside an `EndpointOption`
   written once, under `respBody`. `LogRespOutput` alone writes `result`.
 - With `WithRequestID()` and `LogEnter` or `LogExit`, `reqId` is written once per line
   (it was duplicated). A non-string `message` context value no longer panics; it is
-  formatted with `fmt.Sprint`. When `json.Marshal` of the response fails, the response object is not logged
+  formatted with `fmt.Sprint`. A path parameter named `message` no longer replaces the
+  exit line message (its raw value bypassed the `mask` tag); it is logged like other path
+  parameters. When `json.Marshal` of the response fails, the response object is not logged
   (before, it was logged as `result`). Types without `mask` tags are logged as before.
 - Path and query parameters with a `mask` tag are masked: `mask:"-"` is not logged, any
   other non-empty `mask` logs `"***"` (jsonmask functions are not applied to parameters). A

@@ -606,7 +606,8 @@ Presets: `LogFull` (enter, exit, request body and input, response body), `LogFul
 - Errors are logged at error level with the full error (fields, wrapped errors, stack),
   the path and query parameters decoded so far and context values. With `LogSilent` only 5xx errors are logged.
 - Path and query parameters are logged by name; values stored with `ctx.Set` are logged
-  as well. A value stored under the key `message` replaces the exit line message.
+  as well. A value stored with `ctx.Set("message", v)` replaces the exit line message
+  (a path parameter named `message` does not).
 - The `X-Set-Log-Level` request header (`X-Set-Log-Level: exit,req-body`) replaces the
   endpoint level for that one request. It cannot switch off `LogSilent` of an endpoint;
   `silent` in the header silences the request. `vatel.WithStaticLoggingLevel()` ignores

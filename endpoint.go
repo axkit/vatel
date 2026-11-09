@@ -417,7 +417,8 @@ func (e *Endpoint) logEnter(ctx Context, zc zerolog.Context) {
 // logExit logs the exit line ("processed", or "completed" with LogEnter) of an
 // HTTP request or a WS message with its duration and the values visit yields,
 // except keys for which skip returns true. A "message" value replaces the
-// message.
+// message unless skip returns true for it (a path param named "message" is
+// logged masked by decodeParams, never as the raw message).
 func logExit(zc zerolog.Context, lo LogOption, visit func(func([]byte, any)), skip func([]byte) bool, dur time.Duration) {
 	msg := "completed"
 	if lo&LogEnter != LogEnter {
@@ -425,6 +426,9 @@ func logExit(zc zerolog.Context, lo LogOption, visit func(func([]byte, any)), sk
 	}
 	withoutMessage := func(f func([]byte, any)) {
 		visit(func(key []byte, v any) {
+			if skip != nil && skip(key) {
+				return
+			}
 			if string(key) == "message" {
 				msg = fmt.Sprint(v)
 				return
@@ -432,7 +436,7 @@ func logExit(zc zerolog.Context, lo LogOption, visit func(func([]byte, any)), sk
 			f(key, v)
 		})
 	}
-	zl := withUserValues(zc, withoutMessage, skip).Logger()
+	zl := withUserValues(zc, withoutMessage, nil).Logger()
 	zl.Debug().Str("dur", dur.String()).Msg(msg)
 }
 

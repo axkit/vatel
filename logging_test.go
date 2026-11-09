@@ -712,3 +712,54 @@ func TestLog_UnmaskedBodyDecodeError_KeepsCause(t *testing.T) {
 		t.Errorf("the decode error of a body without mask rules should keep its cause: %s", buf.String())
 	}
 }
+
+// A path param named "message" is a path param first: the exit line must not
+// take its raw value as the log message (it would bypass the mask tag).
+type messagePathHandler struct {
+	PathParams[struct {
+		Secret string `param:"message" mask:"secret"`
+	}]
+}
+
+func (h *messagePathHandler) Handle(Context) error { return nil }
+
+type messageHiddenPathHandler struct {
+	PathParams[struct {
+		Hidden string `param:"message" mask:"-"`
+	}]
+}
+
+func (h *messageHiddenPathHandler) Handle(Context) error { return nil }
+
+func TestLog_MessagePathParamMasked(t *testing.T) {
+	cases := []struct {
+		name string
+		ctrl func() Handler
+		lo   LogOption
+		msg  string
+	}{
+		{"secret exit", func() Handler { return &messagePathHandler{} }, LogExit, "processed"},
+		{"secret enter and exit", func() Handler { return &messagePathHandler{} }, LogEnter | LogExit, "completed"},
+		{"hidden exit", func() Handler { return &messageHiddenPathHandler{} }, LogExit, "processed"},
+		{"hidden enter and exit", func() Handler { return &messageHiddenPathHandler{} }, LogEnter | LogExit, "completed"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fctx, lines, raw := serveLogged(t, NewVatel(), Endpoints{
+				GET("/notes/{message}", tc.ctrl, WithLogOption(tc.lo)),
+			}, "GET", "/notes/msg-path-secret")
+
+			if got := responseStatus(fctx); got != 200 {
+				t.Fatalf("status = %d, want 200: %s", got, fctx.Response.Body())
+			}
+			if strings.Contains(raw, "msg-path-secret") {
+				t.Errorf("masked path param leaked to log: %s", raw)
+			}
+			// The exit line is the last one; with duplicate keys the decoder
+			// keeps the last "message", which zerolog writes with Msg.
+			if got := lines[len(lines)-1]["message"]; got != tc.msg {
+				t.Errorf("exit message = %v, want %q: %s", got, tc.msg, raw)
+			}
+		})
+	}
+}
