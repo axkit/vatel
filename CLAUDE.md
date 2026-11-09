@@ -30,7 +30,8 @@ go mod tidy
 ## Architecture Overview
 
 Vatel is a REST framework built on [fasthttp](https://github.com/valyala/fasthttp) and
-fasthttp/router. User docs: `README.md`; v0.14 → v1.25 changes: `MIGRATION.md`. Plans live in
+fasthttp/router. Requires Go 1.24 (`strings.SplitSeq`, range-over-func); CI reads the version from
+`go.mod`. User docs: `README.md`; v0.14 → v1.25 changes: `MIGRATION.md`. Plans live in
 `docs/plans/`, deferred work in `docs/backlog/`.
 
 ### Files
@@ -52,18 +53,28 @@ fasthttp/router. User docs: `README.md`; v0.14 → v1.25 changes: `MIGRATION.md`
 ### Core types
 
 **`Vatel`** — created by `NewVatel(opts...)`. `Add(Endpointer...)` collects endpoints;
-`BuildHandlers(mux, logger)` compiles each endpoint and registers it with the router. It may be called
-once; after a failed build the `Vatel` is unusable ("previous build failed"), registration is not
-transactional. `ListenAndServe` builds if needed and starts `fasthttp.Server`; `Shutdown(ctx)` closes WS
-connections, waits for the server, then cancels the base request context.
+`BuildHandlers(mux, logger)` compiles each endpoint and registers it with the router; router panics
+(duplicate/conflicting route, own `GET /`) are returned as errors. It may be called once and copies the
+middleware; after a failed build the `Vatel` is unusable ("previous build failed"), registration is not
+transactional. `ListenAndServe` builds if needed and serves on a `fasthttp.Server` (`IdleTimeout` =
+`DefaultIdleTimeout`, `CloseOnShutdown`, then `WithServerConfig`). `srv`/`ln`/`served`/`closed` are guarded
+by `v.mu`; `inflight` counts running HTTP handlers.
+
+`Shutdown(ctx)`: mark closed (a later `ListenAndServe` returns `ErrServerClosed`), close WS connections,
+close the listener (idempotent `serverListener`) and start `srv.Shutdown` in the background, wait until
+the listener is closed and `inflight == 0` (idle keep-alive connections are not waited for), cancel the
+base context, return nil. If `ctx` is done first: cancel the base context at once, wait up to
+`shutdownGrace` (1 s) for the cancelled requests, return `ctx.Err()`.
 
 **`Endpoint`** — embeds `EndpointMeta` (`Method`, `Path`, `Perms`, `LogOptions`) plus public config
 (`Compress`, `ManualStatusCode`, `SuccessStatusCode`, `ResponseContentType`, `OptionalBody`, `Timeout`) and
 a controller factory (`Controller func() Handler` or `WebsocketController`). Built with builders
 (`vatel.GET(path, ctrl, opts...)`) and `EndpointOption`s (`Perms`, `WithLogOption`, `WithCompress`,
 `WithSuccessStatusCode`, `WithManualStatusCode`, `WithContentType`, `WithOptionalBody`, `WithTimeout`).
-`compile()` validates config (Paramer vs `{params}` in path, `OptionalBody` only on POST/PUT/PATCH, known
-method) and precomputes reflection data and masking rules. The factory is called once at compile time to
+`compile()` validates config (path begins with `/`, Paramer vs `{params}` in path, `OptionalBody` only on
+POST/PUT/PATCH, known method) and precomputes reflection data and masking rules. `compileCommon` links the
+endpoint to its `*Vatel` (`e.v`: shared config, base context, in-flight counter) and resolves per-endpoint
+defaults (`Timeout`, `LogOptions`, `jm`, a copy of the middleware set). The factory is called once at compile time to
 inspect the controller, then once per request.
 
 ### Handler interfaces and carriers
@@ -90,11 +101,11 @@ resolve log level (endpoint LogOptions, X-Set-Log-Level header, LogSilent preced
 → buildHandler: Paramer → Querier → Inputer (query or body) → Validate(Querier input) → Validate(Inputer input)
 → LogEnter line → OnHandle middleware → Handle
 → success status (WithSuccessStatusCode unless ManualStatusCode) → Result serialization (+ masked log)
-→ LogExit line → metrics → OnSuccessResponse
+→ LogExit line → metrics → OnSuccessResponse (errors ignored, `runHooks`)
 ```
 
-Any error goes to `writeErrorResponse`: log (unless `LogSilent` and < 500), JSON error body, metrics,
-`Alarmer` for >= 500, `OnErrorResponse` middleware with `e.EndpointMeta`.
+Any error goes to `writeErrorResponse`: log (unless `LogSilent` and < 500), JSON error body from
+`errorResponse`, metrics, `Alarmer` for >= 500, `OnErrorResponse` middleware with `e.EndpointMeta`.
 
 ### Middleware
 
@@ -115,9 +126,11 @@ Token payload is `AuthPayload` (`Perms() []byte`, `Debug() bool`); handlers type
 
 ### Errors
 
-`github.com/axkit/errors` v1.1.0. Status/code come from `*errors.Error`; an error without a status maps to
-504 (`context.DeadlineExceeded`), 503 (`context.Canceled`) or 500. The client gets msg/severity/code/status
-only; fields listed in `WithClientErrorFields` are written at the JSON root; `WithVerboseError` or a debug
+`github.com/axkit/errors` v1.1.0. `errorResponse` (shared by HTTP and WS) takes the status and the client
+error from the first `*errors.Error`/`*errors.ErrorTemplate` in the chain (`stderrors.As`); an error without
+a status maps to 504 (`context.DeadlineExceeded`), 503 (`context.Canceled`) or 500. A chain without
+`*errors.Error` sends a generic error (`ErrInternalError` for 500) unless verbose: plain error text never
+reaches the client. The client gets msg/severity/code/status only; fields listed in `WithClientErrorFields` are written at the JSON root; `WithVerboseError` or a debug
 token adds stack, fields and wrapped errors. Validation errors are wrapped as 400.
 
 ### Logging
@@ -127,31 +140,38 @@ zerolog. `LogOption` bits: `LogSilent`, `LogEnter`, `LogExit`, `LogReqBody`, `Lo
 logged** — unless `WithDefaultLogOption` is set; `WithLogOption` overrides per endpoint. `LogSilent` logs only
 5xx and overrides every other bit, including the header. `X-Set-Log-Level` applies to one request
 (ignored with `WithStaticLoggingLevel`; see `docs/backlog/log-level-header-overrides-confidential.md`).
-Log keys: `requestBody`, `reqInput`, `reqQuery`, `respBody`, `result`; `ctx.Set` values are logged too.
+Log keys: `requestBody`, `reqInput`, `reqQuery`, `respBody` (`result` only with `LogRespOutput` without
+`LogRespBody`); `ctx.Set` values are logged too, `reqId` is one of them. `logExit` is shared by HTTP and WS.
 
 ### Masking
 
 Struct tag `mask`: `"-"` removes the field, a name applies a function registered with
 `jsonmask.RawJsonMask.AddFunc` (unregistered → `"***"`). A default `jsonmask.New()` is used when
 `WithJsonMasker` is not set, so tagged fields are always masked in the log; the client response is never
-masked. Rules are computed at compile time (`inputFields`, `queryMaskFields`, `resultFields`); masking runs
-only when a type has tags. Path/query params: `mask:"-"` omits, any other value logs `"***"`. Path params are
+masked. Rules are computed at compile time (`inputFields`, `queryMaskFields`, `resultFields`; a result type
+unknown at compile, e.g. `OptionalOutput`, gets rules per type in `resultFieldsByType`); masking runs only
+when a type has tags. The request body of an input type with tags is logged from the decoded input, never
+raw (gjson paths are case-sensitive and see only the first duplicate key). A masked param that fails to
+parse gives an error without the parse error (it quotes the value). Path/query params: `mask:"-"` omits, any other value logs `"***"`. Path params are
 logged only by `decodeParams`; their user-value keys (`pathParamKeys`) are skipped elsewhere.
 
 ### Request context
 
-`Vatel` owns `baseCtx` (cancelled by `Shutdown`). `ctx.Context()` is the base context or
+`Vatel` owns `baseCtx` (cancelled by `Shutdown`, see Core types). `ctx.Context()` is the base context or
 `context.WithTimeout(base, Timeout)` (`WithTimeout` / `WithDefaultTimeout`), cancelled at the end of the
 request. Timeouts do not interrupt handlers by themselves. fasthttp `RequestCtx.Done()` is not used.
 `NewContext(fctx)` (public, for tests) uses `context.Background()`.
 
 ### WebSocket
 
-`NewWebsocketVatel(WithLogger, WithTokenDecoder, WithWsAuthFunc)` + `vatel.WithWebsocketSupport(wv)`; the
+`NewWebsocketVatel(WithLogger, WithTokenDecoder, WithWsAuthFunc)` + `vatel.WithWebsocketSupport(wv)`
+(`WithLogger` replaces the `BuildHandlers` logger for WS endpoints); the
 app routes an HTTP path to `wv.Upgrade`. Messages are `{"path": ..., "data": ...}`; `vatel.WS(path, ctrl)`
 endpoints use `Inputer`/`Resulter` (no middleware, no Paramer/Querier). WS `Perms` require `WithWsAuthFunc`.
-Built-in `updateAccessToken` endpoint stores the payload per connection and calls `OnTokenUpdate`.
-`wsWriteErrorResponse` mirrors HTTP error handling (status mapping, `LogSilent`, metrics, `Alarmer`).
+Built-in `updateAccessToken` endpoint calls `OnTokenUpdate`, then stores the payload per connection (`wsConns`:
+one table of live connections and payloads); a callback error rejects the token. WS handlers have no Go
+context. `e.wsWriteErrorResponse` uses the HTTP `errorResponse` (status mapping, `LogSilent`, metrics,
+`Alarmer`).
 
 ### DI interfaces (`vatel.go`)
 
@@ -162,5 +182,7 @@ Built-in `updateAccessToken` endpoint stores the payload per connection and call
 
 - Tests: pipeline tests call `run(v, GET(...), fctx)` (`handler_test.go`; mocks in `testutil_test.go`); tests that
   depend on router user values (path params, logging) use `router.New()` + `BuildHandlers` + `mux.Handler`
-  (see `logging_test.go`, `auth/auth_test.go`). Logs are checked with `zerolog.New(&buf)`.
+  (see `logging_test.go`, `auth/auth_test.go`). Logs are checked with `zerolog.New(&buf)`. Server/shutdown
+  tests use `v.serve` on a `fasthttputil` in-memory listener (`shutdown_test.go`); WS end-to-end tests use a
+  websocket client over it (`ws_integration_test.go`). Auth is tested only through the real `auth` package.
 - Every behaviour change visible to users goes into `MIGRATION.md`.

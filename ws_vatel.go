@@ -1,7 +1,6 @@
 package vatel
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,61 +13,72 @@ import (
 	"github.com/valyala/fasthttp"
 )
 
-// connStore is a thread-safe map from WebSocket connection ID to its token payload.
-// It persists authentication state across messages on the same connection.
-type connStore struct {
+// wsConns is the thread-safe table of live WebSocket connections: the
+// connection, to close it on shutdown, and its token payload, which persists
+// authentication state across messages on the same connection.
+type wsConns struct {
 	mu    sync.RWMutex
-	conns map[uint64]AuthPayload
+	conns map[uint64]*wsConn
 }
 
-// wsConnRegistry is a thread-safe map from connection ID to the live Conn,
-// used to enumerate and close all connections during shutdown.
-type wsConnRegistry struct {
-	mu    sync.RWMutex
-	conns map[uint64]*websocket.Conn
+type wsConn struct {
+	conn *websocket.Conn // nil when a payload is set for an unknown connection
+	tp   AuthPayload
 }
 
-func (r *wsConnRegistry) add(c *websocket.Conn) {
-	r.mu.Lock()
-	r.conns[c.ID()] = c
-	r.mu.Unlock()
+func newWsConns() wsConns {
+	return wsConns{conns: make(map[uint64]*wsConn)}
 }
 
-func (r *wsConnRegistry) remove(cid uint64) {
-	r.mu.Lock()
-	delete(r.conns, cid)
-	r.mu.Unlock()
-}
-
-func (r *wsConnRegistry) closeAll() {
-	r.mu.RLock()
-	conns := make([]*websocket.Conn, 0, len(r.conns))
-	for _, c := range r.conns {
-		conns = append(conns, c)
-	}
-	r.mu.RUnlock()
-	for _, c := range conns {
-		c.CloseDetail(websocket.StatusGoAway, "server shutdown")
-	}
-}
-
-func (cs *connStore) set(cid uint64, tp AuthPayload) {
+func (cs *wsConns) add(c *websocket.Conn) {
 	cs.mu.Lock()
-	cs.conns[cid] = tp
+	if wc, ok := cs.conns[c.ID()]; ok {
+		wc.conn = c
+	} else {
+		cs.conns[c.ID()] = &wsConn{conn: c}
+	}
 	cs.mu.Unlock()
 }
 
-func (cs *connStore) get(cid uint64) (AuthPayload, bool) {
-	cs.mu.RLock()
-	tp, ok := cs.conns[cid]
-	cs.mu.RUnlock()
-	return tp, ok
+// setPayload stores the token payload of the connection cid.
+func (cs *wsConns) setPayload(cid uint64, tp AuthPayload) {
+	cs.mu.Lock()
+	if wc, ok := cs.conns[cid]; ok {
+		wc.tp = tp
+	} else {
+		cs.conns[cid] = &wsConn{tp: tp}
+	}
+	cs.mu.Unlock()
 }
 
-func (cs *connStore) delete(cid uint64) {
+// payload returns the token payload of the connection cid, if one is stored.
+func (cs *wsConns) payload(cid uint64) (AuthPayload, bool) {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	if wc, ok := cs.conns[cid]; ok && wc.tp != nil {
+		return wc.tp, true
+	}
+	return nil, false
+}
+
+func (cs *wsConns) remove(cid uint64) {
 	cs.mu.Lock()
 	delete(cs.conns, cid)
 	cs.mu.Unlock()
+}
+
+func (cs *wsConns) closeAll() {
+	cs.mu.RLock()
+	conns := make([]*websocket.Conn, 0, len(cs.conns))
+	for _, wc := range cs.conns {
+		if wc.conn != nil {
+			conns = append(conns, wc.conn)
+		}
+	}
+	cs.mu.RUnlock()
+	for _, c := range conns {
+		c.CloseDetail(websocket.StatusGoAway, "server shutdown")
+	}
 }
 
 // WebsocketVatel manages WebSocket endpoint registration and message routing.
@@ -77,8 +87,7 @@ type WebsocketVatel struct {
 	ws                    websocket.Server
 	path                  map[string]*Endpoint
 	cfg                   WsOption
-	store                 connStore
-	registry              wsConnRegistry
+	conns                 wsConns
 	callbackOnOpen        func(*websocket.Conn)
 	callbackOnClose       func(*websocket.Conn, error)
 	callbackOnTokenUpdate func(cid uint64, tp AuthPayload) error
@@ -91,6 +100,8 @@ type WsOption struct {
 	authFunc func(ctx WebsocketContext, path string, requiredPerms []string) error
 }
 
+// WithLogger sets the logger of WS endpoints; their lines get "layer":"ws".
+// Without it WS endpoints log to the logger passed to BuildHandlers.
 func WithLogger(log *zerolog.Logger) func(*WsOption) {
 	return func(o *WsOption) {
 		zl := log.With().Str("layer", "ws").Logger()
@@ -115,9 +126,8 @@ func WithWsAuthFunc(fn func(ctx WebsocketContext, path string, requiredPerms []s
 // updateAccessToken endpoint.
 func NewWebsocketVatel(optFunc ...func(*WsOption)) *WebsocketVatel {
 	wv := &WebsocketVatel{
-		path:     make(map[string]*Endpoint),
-		store:    connStore{conns: make(map[uint64]AuthPayload)},
-		registry: wsConnRegistry{conns: make(map[uint64]*websocket.Conn)},
+		path:  make(map[string]*Endpoint),
+		conns: newWsConns(),
 	}
 	for _, f := range optFunc {
 		f(&wv.cfg)
@@ -154,10 +164,12 @@ func (wv *WebsocketVatel) RegisterEndpoint(v *Vatel, e *Endpoint, l *zerolog.Log
 // compileWS validates and configures a WS endpoint, reusing compileCommon
 // for the shared Vatel config injection.
 func (wv *WebsocketVatel) compileWS(v *Vatel, e *Endpoint, l *zerolog.Logger) error {
-	if err := compileCommon(v, e); err != nil {
-		return err
-	}
+	compileCommon(v, e)
 	e.wsLogger = l
+	if wv.cfg.log != nil {
+		wl := wv.cfg.log.With().Str("method", e.Method).Str("path", e.Path).Logger()
+		e.wsLogger = &wl
+	}
 
 	// If the endpoint declares required permissions, an auth function must be set.
 	if len(e.Perms) > 0 && wv.cfg.authFunc == nil {
@@ -186,23 +198,24 @@ func (wv *WebsocketVatel) OnOpen(f func(*websocket.Conn)) { wv.callbackOnOpen = 
 func (wv *WebsocketVatel) OnClose(f func(*websocket.Conn, error)) { wv.callbackOnClose = f }
 
 // OnTokenUpdate registers a callback invoked by UpdateAccessToken after the
-// token is decoded and its payload is stored for the connection cid. An error
-// returned by f is returned from UpdateAccessToken (and so sent to the client
-// of the updateAccessToken endpoint); the payload stays stored.
+// token is decoded and before its payload is stored for the connection cid.
+// Returning an error rejects the token: the payload is not stored (the
+// connection keeps its previous payload, if any) and the error is returned
+// from UpdateAccessToken, and so sent to the client of the updateAccessToken
+// endpoint.
 func (wv *WebsocketVatel) OnTokenUpdate(f func(cid uint64, tp AuthPayload) error) {
 	wv.callbackOnTokenUpdate = f
 }
 
 func (wv *WebsocketVatel) onOpen(c *websocket.Conn) {
-	wv.registry.add(c)
+	wv.conns.add(c)
 	if wv.callbackOnOpen != nil {
 		wv.callbackOnOpen(c)
 	}
 }
 
 func (wv *WebsocketVatel) onClose(c *websocket.Conn, err error) {
-	wv.registry.remove(c.ID())
-	wv.store.delete(c.ID())
+	wv.conns.remove(c.ID())
 	if wv.callbackOnClose != nil {
 		wv.callbackOnClose(c, err)
 	}
@@ -211,7 +224,7 @@ func (wv *WebsocketVatel) onClose(c *websocket.Conn, err error) {
 // Shutdown closes all active WebSocket connections with a "going away" status.
 // Call this before shutting down the HTTP server to allow clients to reconnect.
 func (wv *WebsocketVatel) Shutdown() {
-	wv.registry.closeAll()
+	wv.conns.closeAll()
 }
 
 // Upgrade upgrades an HTTP connection to WebSocket.
@@ -231,6 +244,9 @@ type WebsocketRequest struct {
 }
 
 // AuthMessageData is the payload for token-based authentication messages.
+//
+// Deprecated: vatel does not use it; the updateAccessToken endpoint reads
+// {"mid": ..., "at": ...}. Kept for compatibility.
 type AuthMessageData struct {
 	AccessToken string `json:"accessToken"`
 }
@@ -263,18 +279,18 @@ func (wv *WebsocketVatel) onMessage(c *websocket.Conn, isBinary bool, data []byt
 		return
 	}
 
-	verbose := e.verboseError
+	verbose := e.v.cfg.verboseError
 
 	lo := effectiveLogLevel(e.LogOptions)
 
 	zco := e.wsLogger.With().Str("client", c.RemoteAddr().String())
-	if e.logRequestID {
+	if e.v.cfg.logRequestID {
 		zco = zco.Uint64("connectionId", c.ID())
 	}
 	zc := zco
 
-	// Restore token payload from the connection store (set on auth or token update).
-	if tp, ok := wv.store.get(c.ID()); ok {
+	// Restore token payload from the connection table (set by UpdateAccessToken).
+	if tp, ok := wv.conns.payload(c.ID()); ok {
 		ctx.SetTokenPayload(tp)
 	}
 
@@ -289,7 +305,7 @@ func (wv *WebsocketVatel) onMessage(c *websocket.Conn, isBinary bool, data []byt
 			}
 		}
 		if err := wv.cfg.authFunc(ctx, msg.Path, e.Perms); err != nil {
-			wsWriteErrorResponse(e, c, lo, verbose, &zc, ctx.Created(), err)
+			e.wsWriteErrorResponse(c, lo, verbose, &zc, ctx.Created(), err)
 			return
 		}
 	}
@@ -304,15 +320,15 @@ func (wv *WebsocketVatel) onMessage(c *websocket.Conn, isBinary bool, data []byt
 
 	// ── Input decoding ───────────────────────────────────────────────────────
 	if input, ok := h.(Inputer); ok {
-		if err := decodeWSInput(msg.Data, input.Input()); err != nil {
-			wsWriteErrorResponse(e, c, lo, verbose, &zc, ctx.Created(), err)
+		if err := decodeWSInput(msg.Data, input.Input(), e.inputFields.HasRules()); err != nil {
+			e.wsWriteErrorResponse(c, lo, verbose, &zc, ctx.Created(), err)
 			return
 		}
 	}
 
 	// ── Handler ──────────────────────────────────────────────────────────────
 	if err := h.Handle(ctx); err != nil {
-		wsWriteErrorResponse(e, c, lo, verbose, &zc, ctx.Created(), err)
+		e.wsWriteErrorResponse(c, lo, verbose, &zc, ctx.Created(), err)
 		return
 	}
 
@@ -320,8 +336,8 @@ func (wv *WebsocketVatel) onMessage(c *websocket.Conn, isBinary bool, data []byt
 	if e.hasRespBody {
 		res := h.(Resulter).Result()
 		if !isNilResult(res) {
-			if err := e.wsWriteResponse(c, lo, res, &zc); err != nil {
-				wsWriteErrorResponse(e, c, lo, verbose, &zc, ctx.Created(), err)
+			if err := e.writeJSON(c, lo, res, &zc); err != nil {
+				e.wsWriteErrorResponse(c, lo, verbose, &zc, ctx.Created(), err)
 				return
 			}
 		}
@@ -330,90 +346,61 @@ func (wv *WebsocketVatel) onMessage(c *websocket.Conn, isBinary bool, data []byt
 	// ── Exit logging + metrics ───────────────────────────────────────────────
 	dur := time.Since(ctx.Created())
 	if lo&LogExit == LogExit {
-		msg := "completed"
-		if lo&LogEnter != LogEnter {
-			msg = "processed"
-		}
-		ctx.VisitValues(func(key []byte, v interface{}) {
-			if bytes.Equal(key, []byte("message")) {
-				msg = v.(string)
-				return
-			}
-			zc = zc.Interface(string(key), v)
-		})
-		zl := zc.Logger()
-		zl.Debug().Str("dur", dur.String()).Msg(msg)
+		logExit(zc, lo, ctx.VisitValues, nil, dur)
 	}
-
-	if e.mr != nil {
-		e.mr.ReportMetric(e.Method, e.Path, 200, dur.Seconds(), 0)
-	}
+	e.reportMetric(200, dur, 0)
 }
 
 // decodeWSInput unmarshals the "data" field of a WebSocket message into dest.
-// A malformed or missing payload is a client error: ErrInvalidRequestBody (400).
-func decodeWSInput(data []byte, dest interface{}) error {
+// A malformed or missing payload is a client error: ErrInvalidRequestBody
+// (400). masked reports whether the type of dest has mask rules (see
+// jsonDecodeError).
+func decodeWSInput(data []byte, dest interface{}, masked bool) error {
 	if err := json.Unmarshal(data, dest); err != nil {
-		return ErrInvalidRequestBody.Wrap(err).Msg("ws message data is not valid JSON")
+		return jsonDecodeError(err, masked, "ws message data is not valid JSON")
 	}
 	return nil
 }
 
 // wsWriteErrorResponse logs an error (at level lo) and sends it to the
-// WebSocket client w.
-func wsWriteErrorResponse(e *Endpoint, w io.Writer, lo LogOption, verbose bool, zc *zerolog.Context, created time.Time, err error) {
+// WebSocket client w. The status and the client JSON are resolved as for
+// HTTP (see errorResponse).
+func (e *Endpoint) wsWriteErrorResponse(w io.Writer, lo LogOption, verbose bool, zc *zerolog.Context, created time.Time, err error) {
 	if err == nil {
 		return
 	}
 
-	statusCode := 0
-	if xe, ok := err.(*errors.Error); ok {
-		ce := errors.Serialize(xe, errors.WithAttributes(errors.ServerOutputFormat))
-		statusCode = ce.StatusCode
-	}
-	if statusCode == 0 {
-		statusCode = defaultErrorStatus(err)
-	}
+	statusCode, body, _ := e.errorResponse(err, verbose)
 
 	if isErrorLogged(lo, statusCode) {
 		zl := zc.RawJSON("err", errors.ToJSON(err, errors.WithAttributes(errors.ServerOutputFormat))).Logger()
 		zl.Error().Msg("ws request failed")
 	}
 
-	var ff errors.ErrorSerializationRule
-	if verbose {
-		ff = errors.AddStack | errors.AddFields | errors.AddWrappedErrors
-	}
-	var rootFields []string
-	if e != nil {
-		rootFields = e.clientErrorFields
-	}
-	buf := errors.ToJSON(err, errors.WithAttributes(ff), errors.WithRootLevelFields(rootFields))
-	w.Write(buf) //nolint:errcheck
+	w.Write(body) //nolint:errcheck
 
-	if e != nil && e.mr != nil {
-		e.mr.ReportMetric(e.Method, e.Path, statusCode, time.Since(created).Seconds(), len(buf))
-	}
-
-	if e != nil && e.ala != nil && statusCode >= 500 {
-		e.ala.Alarm(err)
-	}
+	e.reportMetric(statusCode, time.Since(created), len(body))
+	e.alarm(statusCode, err)
 }
 
-// UpdateAccessToken decodes a new access token, stores its payload for the
-// connection cid and calls the OnTokenUpdate callback, returning its error.
+// UpdateAccessToken decodes a new access token and calls the OnTokenUpdate
+// callback, if any; unless the callback returns an error, it stores the
+// payload for the connection cid. A token that cannot be decoded is rejected
+// with ErrUnauthorized. Without WithTokenDecoder it does nothing.
 func (wv *WebsocketVatel) UpdateAccessToken(cid uint64, token string) error {
 	if wv.cfg.td == nil {
 		return nil
 	}
 	at, err := wv.cfg.td.Decode([]byte(token))
 	if err != nil {
-		return err
+		return ErrUnauthorized.Wrap(err)
 	}
 	tp := at.ApplicationPayload()
-	wv.store.set(cid, tp)
 	if wv.callbackOnTokenUpdate != nil {
-		return wv.callbackOnTokenUpdate(cid, tp)
+		if err := wv.callbackOnTokenUpdate(cid, tp); err != nil {
+			return err
+		}
 	}
+	wv.conns.setPayload(cid, tp)
 	return nil
 }

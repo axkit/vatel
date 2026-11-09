@@ -73,7 +73,10 @@
 **Релиз.** bitset v1.0.4 вместо `replace`; `retract v1.24.2`; README, MIGRATION.md, CLAUDE.md.
 
 ## Technical Details
-- `Endpoint`: поля `OptionalBody bool`, `Timeout time.Duration`; внутренние `pathParamKeys []string`, `inputHasMask`, `resultHasMask`, `queryHasMask bool`, `querierFields []fieldInfo`, `queryMaskFields jsonmask.Fields`, `isQuerier bool`.
+- `Endpoint`: поля `OptionalBody bool`, `Timeout time.Duration`; внутренние `pathParamKeys []string`, `querierFields []fieldInfo`, `queryMaskFields jsonmask.Fields`, `isQuerier bool`.
+  - ➕ отклонение: полей `inputHasMask`, `resultHasMask`, `queryHasMask` нет — их заменяет `jsonmask.Fields.HasRules()` на предвычисленных правилах.
+  - ➕ ревью фазы 1: копии настроек `Vatel` в `Endpoint` (`baseCtx`, `verboseError`, `logRequestID`, `clientErrorFields`, `staticLoggingLevel`, `ala`, `mr`) заменены указателем `e.v *Vatel`; `resultPrototyper` убран — правила результата неизвестного при компиляции типа строятся по типу и кэшируются (`resultFieldsByType`).
+- ➕ `Vatel`: `mu`, `srv`, `ln`, `served`, `closed`, `inflight`; `DefaultIdleTimeout`, `ErrServerClosed`, `WithServerConfig`; внутренний `serve(ln, mux)` для тестов на in-memory listener.
 - `decodeBody(body, dest, optional bool)` без вызова `Validate`; `validate(in any) error` вызывается из `buildHandler`.
 - `fieldInfo.mask string` — значение тега `mask`.
 - `compileCommon`: `if e.jm == nil { e.jm = defaultMasker }`, `defaultMasker = jsonmask.New()`.
@@ -109,6 +112,17 @@
 - `BuildHandlers`: WS-эндпоинт без `WithWebsocketSupport` и повторный WS-путь теперь возвращают ошибку с путём эндпоинта (раньше — panic; `MustBuildHandlers` по-прежнему паникует). Ошибка повторного WS-пути из `WebsocketVatel.RegisterEndpoint` — обычная ошибка «WS endpoint <path>: already registered», а не `*errors.Error` с полем `path`. После неудачной сборки `Vatel` непригоден: повторный `BuildHandlers` и `ListenAndServe` возвращают ошибку «previous build failed» (раньше `ListenAndServe` после неудачного `BuildHandlers` запускал сервер с частью маршрутов).
 - новое: `WebsocketVatel.OnTokenUpdate(f func(cid uint64, tp AuthPayload) error)` — вызывается из `UpdateAccessToken` после сохранения payload; ошибка `f` возвращается из `UpdateAccessToken` (и уходит клиенту эндпоинта `updateAccessToken`).
 - модуль: версия v1.24.2 отозвана (`retract` в go.mod, опубликована по ошибке — переходить на v1.25.0 или новее); `github.com/axkit/bitset` — обычная зависимость v1.0.4 (без `replace`).
+- ➕ ревью фазы 1 (перенесено в MIGRATION.md; пункты, отличающиеся только от v1.24.2, вынесены там в раздел 4):
+  - журнал: тело запроса типа с тегами `mask` пишется из разобранного входа (маршалинг + маскирование), не сырым — `encoding/json` принимает ключи в другом регистре и последний из дубликатов; неразбираемое тело такого типа не пишется (`requestBodyLoggingFailed`). Ключ ошибки маскирования ответа — `respBodyMaskingFailed`/`resultMaskingFailed` (было `respMaskingFailed`). При `LogRespBody|LogRespOutput` ответ пишется один раз, под `respBody`. `reqId` больше не дублируется; нестроковое значение `message` не вызывает panic.
+  - ошибки: клиенту уходит первая `*errors.Error`/`*errors.ErrorTemplate` в цепочке (`fmt.Errorf("%w")` сохраняет статус, текст обёртки не уходит); цепочка без неё → общая ошибка (`internal error`, `VTL-0005`) без режима отладки. То же для WS. Ошибка разбора маскированного path/query-параметра не содержит значения.
+  - ошибка `OnSuccessResponse` действительно игнорируется (раньше перезаписывала статус на 500 и дописывала тело ошибки).
+  - `Shutdown`: отменяет контексты запросов по дедлайну `ctx` (не по возврату), ждёт до 1 с отменённые запросы; не ждёт простаивающие keep-alive соединения; гонка `v.srv` устранена; `ListenAndServe` после `Shutdown` → `ErrServerClosed`. Сервер: `IdleTimeout = DefaultIdleTimeout` (90 с), `CloseOnShutdown`, новая опция `WithServerConfig`.
+  - `BuildHandlers`: panic router (дубликат/конфликт пути, свой `GET /`) и путь без ведущего `/` → ошибка.
+  - path-параметры поддерживают те же типы, что query (указатели, `date.Date`); `float32` разбирается с 32-битной точностью.
+  - jsonmask: собственный тег продвинутого поля главнее тега встроенной структуры.
+  - WS: `OnTokenUpdate` вызывается до сохранения payload, ошибка отвергает токен; ошибка декодирования токена → `ErrUnauthorized`; `WithLogger` теперь используется; `AuthMessageData` и `ErrAuthorizationHeaderMissed` помечены `Deprecated`.
+  - auth: nil `Decoder` и ошибка `RevokeCheck` → 500 `VTL-0005` на защищённых эндпоинтах; `Disabled` задаётся до начала обслуживания (гонка данных при изменении во время работы).
+  - метрики: размер ответа HEAD — 0.
 
 ## What Goes Where
 - **Implementation Steps**: код, тесты, документация в этом репозитории, коммиты на ветке `refactor`.

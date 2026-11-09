@@ -16,6 +16,10 @@ Contents:
 1. [API mapping](#1-api-mapping)
 2. [Behaviour changes](#2-behaviour-changes)
 3. [Upgrading from v0.13/v0.14 and axkit/errors v0.x / v1.0.x](#3-upgrading-from-v013v014-and-axkiterrors-v0x--v10x)
+4. [Changes since the retracted v1.24.2](#4-changes-since-the-retracted-v1242)
+
+Sections 1–3 compare v1.25 with v0.14. If you tried the retracted v1.24.2, also read
+section 4.
 
 ## 1. API mapping
 
@@ -62,8 +66,8 @@ Contents:
 | `Tokener.ApplicationPayload() TokenPayloader` | `Tokener.ApplicationPayload() AuthPayload` |
 | `Dater`, `Logger` interfaces | removed (unused) |
 | `v.BuildHandlers(mux, l)`, `v.MustBuildHandlers(mux, l)` | unchanged signatures |
-| — | new: `v.ListenAndServe(addr, mux, l)`, `v.Shutdown(ctx)` |
-| — | new options: `WithClientErrorFields`, `WithDefaultTimeout` |
+| — | new: `v.ListenAndServe(addr, mux, l)`, `v.Shutdown(ctx)`, `vatel.ErrServerClosed`, `vatel.DefaultIdleTimeout` |
+| — | new options: `WithClientErrorFields`, `WithDefaultTimeout`, `WithServerConfig` |
 
 Replacing `PermissionManager`:
 
@@ -92,6 +96,7 @@ Endpoints that need a valid token but no permission: `cfg.RequireAuth()`.
 | `ctx.RequestCtx() *fasthttp.RequestCtx` | removed. Use `Header`, `RequestBody`, `PathValue`, `QueryValue`, `FormFile`, `FormValue`, `RemoteAddr` (real IP), `RequestTime`, `SetHeader`; the request ID is `ctx.Get("reqId")` with `WithRequestID()` |
 | `VatelContext.Log`, `LogValues` | removed; values stored with `ctx.Set` are written to the request log |
 | — | new: `ctx.Context()` (Go context), `VerboseError`/`SetVerboseError` |
+| custom implementations of `vatel.Context` (test mocks) | must add the new methods: `Context`, `PathValue`, `QueryValue`, `RemoteAddr`, `RequestTime`, `RequestBody`, `VerboseError`, `SetVerboseError` |
 | `WebsocketContext.TokenPayload() TokenPayloader` | `TokenPayload() any`, `SetTokenPayload(any)` |
 
 ### Middleware
@@ -104,7 +109,7 @@ Signature: `func(vatel.Context) error` → `func(vatel.Context, vatel.EndpointMe
 | — | `OnAuthentication` (token decoding: `auth.Config.Middleware`) |
 | — | `OnAuthorization` (access checks, before input decoding) |
 | `AfterAuthorization` | `OnHandle` (after input decoding, before `Handle`, as in v0.14) |
-| `OnSuccessResponse` | `OnSuccessResponse` (its error is now ignored) |
+| `OnSuccessResponse` | `OnSuccessResponse` (its error is now ignored: the response is not changed and later middleware still runs) |
 | `OnErrorResponse` (adding one panicked: index out of range) | `OnErrorResponse` (works; its error is ignored) |
 
 Per-endpoint middleware: `e.AddMiddleware(pos, f...)` inside an `EndpointOption`.
@@ -115,7 +120,9 @@ Per-endpoint middleware: `e.AddMiddleware(pos, f...)` inside an `EndpointOption`
 |---|---|
 | WS `Perms` checked with the `Vatel` authorizer and permission manager | `vatel.WithWsAuthFunc(func(ctx, path, perms) error)`; required for WS endpoints with `Perms` |
 | token update callback without a setter | `wv.OnTokenUpdate(func(cid uint64, tp vatel.AuthPayload) error)` |
-| `NewWebsocketVatel`, `WithLogger`, `WithTokenDecoder`, `OnOpen`, `OnClose`, `Upgrade`, `UpgradeWithID` | unchanged |
+| `NewWebsocketVatel`, `WithTokenDecoder`, `OnOpen`, `OnClose`, `Upgrade`, `UpgradeWithID` | unchanged |
+| `WithLogger` (stored, but not used) | now used: WS endpoints log to it (`"layer":"ws"`); without it, to the logger passed to `BuildHandlers` |
+| `AuthMessageData` | deprecated, unused |
 | — | new: `wv.Shutdown()` (called by `v.Shutdown`) |
 
 ## 2. Behaviour changes
@@ -127,18 +134,15 @@ Per-endpoint middleware: `e.AddMiddleware(pos, f...)` inside an `EndpointOption`
 - `Endpoint.SuccessStatusCode` (`WithSuccessStatusCode`) is now applied; in v0.14 it was
   ignored. Metrics receive the real response status (v0.14 always reported 200 for a
   successful request).
-- A second `BuildHandlers` returns an error, also after a failed build.
-  `ListenAndServe` after `BuildHandlers` does not register the routes again. WS
-  registration errors are returned, not raised as a panic.
-- `BuildHandlers`: a WS endpoint without `WithWebsocketSupport` and a duplicate WS path
-  return an error that names the endpoint path (was: panic; `MustBuildHandlers` still
-  panics). The duplicate WS path error from `WebsocketVatel.RegisterEndpoint` is a plain
-  error "WS endpoint <path>: already registered", not an `*errors.Error` with a `path`
-  field. After a failed build the `Vatel` is unusable: a further `BuildHandlers` or
-  `ListenAndServe` returns a "previous build failed" error (before, `ListenAndServe` after
-  a failed `BuildHandlers` started the server with part of the routes).
-- Removed: `NoInputLog`, `NoResultLog`, `LanguageLabel` (public in v0.14 too), and the
-  `WithLanguageLabel` option together with the `LanguageLabel` field.
+- A second `BuildHandlers` returns an error, also after a failed build. After a failed
+  build the `Vatel` is unusable: a further `BuildHandlers` or `ListenAndServe` returns a
+  "previous build failed" error.
+- `BuildHandlers` returns errors where v0.14 panicked (`MustBuildHandlers` still panics):
+  a WS endpoint without `WithWebsocketSupport`, a duplicate WS path (both name the path),
+  a route the router rejects (a duplicate or conflicting path, your own `GET /`, which is
+  taken by the built-in endpoint list) and a path that does not begin with `/`.
+- Middleware and endpoints added after `BuildHandlers` have no effect: it copies them.
+- Removed: `NoInputLog`, `NoResultLog`, `LanguageLabel`.
 - The `?description=true` query parameter no longer returns an endpoint description page;
   the request is processed normally.
 
@@ -154,26 +158,42 @@ Per-endpoint middleware: `e.AddMiddleware(pos, f...)` inside an `EndpointOption`
   check is done by `auth`. Code migrated by keeping `Perms` alone is unprotected.
 - `auth.RequirePerms` appends the permission names, sorted, to `Endpoint.Perms`, so
   middleware sees them in `EndpointMeta.Perms` (on a WS endpoint this requires
-  `WithWsAuthFunc`, otherwise `BuildHandlers` fails). `Config.Disabled` is checked on every
-  request in `RequirePerms` as well (before, only when the option was created;
-  `RequireAuth` and `Middleware` already checked it per request). `Config.Authorizer == nil`
-  with `RequirePerms` gives 500 `ErrInternalError` instead of a panic.
+  `WithWsAuthFunc`, otherwise `BuildHandlers` fails). `Config.Disabled` is read on every
+  request; set it before the server starts serving. `Config.Authorizer == nil` with
+  `RequirePerms` gives 500 `ErrInternalError`.
+- `auth.Config.Decoder` receives the raw `Authorization` header value (nothing strips a
+  `Bearer ` prefix, as in v0.14). A nil `Decoder` or a `RevokeCheck` error gives 500
+  `VTL-0005` on `RequireAuth`/`RequirePerms` endpoints; public endpoints serve the
+  request as unauthenticated.
 
 ### Errors
 
 - With axkit/errors v1.1.0 the client does not see error fields unless verbose errors are
   on. Fields safe for the client are listed with `WithClientErrorFields`.
-- A middleware at `OnErrorResponse` always receives the endpoint metadata (`Method`,
-  `Path`, `Perms`, `LogOptions`); before, an error from middleware at `OnRequest`,
-  `OnAuthentication`, `OnAuthorization` or `OnHandle` gave it an empty `EndpointMeta`.
-- An error returned by an `OnSuccessResponse` middleware is ignored; v0.14 wrote an error
-  response after the successful one.
+- **The text of a plain error no longer reaches the client.** v0.14 sent `err.Error()` of
+  any error, e.g. a database driver message. Now the client gets the first
+  `*errors.Error` (or `*errors.ErrorTemplate`) found in the error chain, so
+  `fmt.Errorf("...: %w", vatel.ErrForbidden.New())` gives 403 with the `ErrForbidden`
+  message (before: 500 with the wrapper text). An error chain without one gives a generic
+  error: `"internal error"`, `VTL-0005`, 500 (or "service unavailable"/"gateway timeout"
+  for 503/504). The full error is logged. With verbose errors the client gets the
+  original text. The same applies to WebSocket error messages.
+- A middleware at `OnErrorResponse` receives the endpoint metadata (`Method`, `Path`,
+  `Perms`, `LogOptions`), whatever the pipeline position of the error.
+- An error returned by an `OnSuccessResponse` middleware is ignored: the response, its
+  status, the metrics and the log are not changed and later `OnSuccessResponse`
+  middleware still runs. v0.14 wrote an error response after the successful one.
 - An error without its own status (not an `*errors.Error`, or an `*errors.Error` with
   status 0) whose chain contains `context.DeadlineExceeded` gives 504,
   `context.Canceled` gives 503; an explicit status wins. An `*errors.Error` without a
   status (e.g. `errors.Wrap(err, "msg")` of a plain error) now gives 500, not 200.
 - A query parameter that cannot be parsed (number, bool, `date.Date`) gives 400
-  `VTL-0006` with field `param`; v0.14 returned the raw parse error, i.e. 500.
+  `VTL-0006` with field `param`; v0.14 returned the raw parse error, i.e. 500. For a path
+  or query parameter with a `mask` tag the error does not wrap the parse error, which
+  quotes the value.
+- Path parameters support the same field types as query parameters (pointers,
+  `date.Date`, nested structs); a `float32` path parameter is parsed with 32-bit
+  precision.
 
 ### Input decoding
 
@@ -182,13 +202,10 @@ Per-endpoint middleware: `e.AddMiddleware(pos, f...)` inside an `EndpointOption`
   or whitespace-only body is accepted, the input stays zero and `Validate()` is not called.
   On GET/DELETE it is a `BuildHandlers` error. Without the option a whitespace-only body
   now gives 400 "empty request body" (before: 400 "not valid JSON").
-- New: the `Querier` interface (`QueryInput() any`). `QueryParams[T]` implements
-  `QueryInput()` instead of `Input()`: code that called `Input()` on `QueryParams` must be
-  changed, `QueryParams` is no longer an `Inputer`. The query string is decoded for every
-  method, POST/PUT/PATCH included, so `QueryParams` + `Body` in one controller receive both
-  the query and the body (before, the ambiguous `Input()` disabled input decoding
-  altogether). The plain `Inputer` is unchanged: GET/DELETE from the query, POST/PUT/PATCH
-  from the body. `Validate()` is called after all decoding: first on the `Querier` input,
+- New: the `Querier` interface (`QueryInput() any`), implemented by `QueryParams[T]`. The
+  query string is decoded for every method, POST/PUT/PATCH included, so `QueryParams` +
+  `Body` in one controller receive both the query and the body. The plain `Inputer` is
+  unchanged: GET/DELETE from the query, POST/PUT/PATCH from the body. `Validate()` is called after all decoding: first on the `Querier` input,
   then on the `Inputer` input, including the query input of an `Inputer` on GET/DELETE; the
   first error gives 400. In the log the `Querier` input is written under `reqQuery`, the
   `Inputer` input under `reqInput`.
@@ -225,8 +242,19 @@ Per-endpoint middleware: `e.AddMiddleware(pos, f...)` inside an `EndpointOption`
   the usual `requestBody`/`respBody`. `result` is written as the serialized response (the
   same JSON the client received, after masking), not through `Interface`. When masking
   fails only the error is logged (`requestBodyMaskingFailed`, `reqInputMaskingFailed`,
-  `respMaskingFailed`), without the unmasked value (before, the request body was logged in
-  the clear). When `json.Marshal` of the response fails, the response object is not logged
+  `respBodyMaskingFailed`/`resultMaskingFailed`), without the unmasked value (before, the
+  request body was logged in the clear).
+- The request body of an input type with `mask` tags is logged under `requestBody` as the
+  decoded input, marshalled and masked, not as the raw body: `encoding/json` also decodes
+  keys in another letter case and the last of duplicate keys, which the masker would miss.
+  Keys of the body that are not in the input type are therefore not logged, and a body
+  that cannot be decoded is not logged (`requestBodyLoggingFailed`). Bodies of types
+  without `mask` tags are logged compacted, as before.
+- `LogRespOutput` and `LogRespBody` log the same masked JSON; with both bits set it is
+  written once, under `respBody`. `LogRespOutput` alone writes `result`.
+- With `WithRequestID()` and `LogEnter` or `LogExit`, `reqId` is written once per line
+  (it was duplicated). A non-string `message` context value no longer panics; it is
+  formatted with `fmt.Sprint`. When `json.Marshal` of the response fails, the response object is not logged
   (before, it was logged as `result`). Types without `mask` tags are logged as before.
 - Path and query parameters with a `mask` tag are masked: `mask:"-"` is not logged, any
   other non-empty `mask` logs `"***"` (jsonmask functions are not applied to parameters). A
@@ -244,17 +272,23 @@ Per-endpoint middleware: `e.AddMiddleware(pos, f...)` inside an `EndpointOption`
   supports recursive types and a slice or array root (`*[]T`, `[]*T`), and visits `*Struct`,
   `[]Struct`, `[]*Struct`. A field with a non-empty `mask` tag is a leaf: a struct value
   (`time.Time`, a nested struct, a pointer, a slice) is masked or removed as a whole. A tag
-  on an embedded struct without a json name applies to each of its promoted fields. An
+  on an embedded struct without a json name applies to each of its promoted fields that
+  has no tag of its own. An
   unregistered function name now gives `"***"` (before, the value stayed in the clear). A
   missing field (`omitempty`) is not added. Maps and interface values are not visited.
 
 ### Request context
 
-- New: `ctx.Context()` is a child of the `Vatel` base context (before:
-  `context.Background()`). `Shutdown` cancels it, after waiting for in-flight requests (up
-  to the deadline of the `ctx` passed to `Shutdown`), and at once when there is no server
-  started by `ListenAndServe`; a repeated `Shutdown` is safe. There is no cancellation on
-  client disconnect (fasthttp does not detect it). Timeout: `vatel.WithTimeout(d)` (field
+- New: `ctx.Context()` is a child of the `Vatel` base context. `Shutdown(ctx)` stops
+  accepting connections, waits until no request is in flight (idle keep-alive connections
+  do not hold it up), cancels the base context and returns nil. When `ctx` is done first,
+  it cancels the base context at once, waits up to one more second for the cancelled
+  requests and returns `ctx.Err()`. Without a server started by `ListenAndServe` it
+  cancels at once; a repeated `Shutdown` is safe. `ListenAndServe` returns nil after
+  `Shutdown` and `ErrServerClosed` when called after it. The server it starts has
+  `IdleTimeout` = `DefaultIdleTimeout` (90 s) and `CloseOnShutdown`; change it with
+  `WithServerConfig`. There is no cancellation on client disconnect (fasthttp does not
+  detect it). Timeout: `vatel.WithTimeout(d)` (field
   `Endpoint.Timeout`) per endpoint and `vatel.WithDefaultTimeout(d)` on `Vatel`; a context
   with a timeout is also cancelled at the end of the request. The timeout does not
   interrupt the handler by itself, only code that listens to the context. The 504/503
@@ -272,8 +306,15 @@ Per-endpoint middleware: `e.AddMiddleware(pos, f...)` inside an `EndpointOption`
   504, `context.Canceled` → 503); before, an `*errors.Error` without a status was reported
   to metrics with status 0 and did not trigger `Alarm`.
 - New: `WebsocketVatel.OnTokenUpdate(f func(cid uint64, tp AuthPayload) error)` is called
-  from `UpdateAccessToken` after the payload is stored; the error of `f` is returned from
-  `UpdateAccessToken` (and sent to the client of the `updateAccessToken` endpoint).
+  from `UpdateAccessToken` after the token is decoded and before the payload is stored. An
+  error from `f` rejects the token: the payload is not stored (the connection keeps its
+  previous one) and the error is returned from `UpdateAccessToken` (and sent to the client
+  of the `updateAccessToken` endpoint). A token that cannot be decoded gives
+  `ErrUnauthorized` (401).
+
+### Metrics
+
+- The size reported for a HEAD response is 0: the server drops its body.
 
 ### Module
 
@@ -306,4 +347,24 @@ share one import path, so the whole application moves to v1.1.0 together with va
   | `ce.Alarm(a)` | `errors.SetAlarmer(a)` once, then `err.Alarm()`; vatel calls its own `Alarmer` (`WithAlarmer`) for 5xx |
 
   vatel recognises the status code of an `*errors.Error` from v1.1.0 only; any other error
-  type gives 500 (or 504/503 for context errors).
+  type gives 500 (or 504/503 for context errors) with a generic message.
+
+## 4. Changes since the retracted v1.24.2
+
+v1.24.2 was published from an earlier state of this rewrite. Besides sections 1–3, code
+written against it may need these changes:
+
+- `QueryParams[T]` implements `QueryInput()` (`Querier`) instead of `Input()`; code that
+  called `Input()` on `QueryParams` must call `QueryInput()`. With `QueryParams` + `Body`
+  both are decoded (in v1.24.2 the ambiguous `Input()` disabled input decoding).
+- The `WithLanguageLabel` option is removed.
+- `ctx.Context()` is a child of the `Vatel` base context (v1.24.2: `context.Background()`).
+- `auth`: `Config.Disabled` is checked on every request in `RequirePerms` too (v1.24.2:
+  when the option was created). `Config.Authorizer == nil` gives 500 instead of a panic.
+- `OnErrorResponse` middleware receives the endpoint metadata for errors at every
+  pipeline position (v1.24.2: an empty `EndpointMeta` for middleware errors).
+- The duplicate WS path error of `WebsocketVatel.RegisterEndpoint` is a plain error
+  "WS endpoint <path>: already registered" (v1.24.2: an `*errors.Error` with a `path`
+  field).
+- `ListenAndServe` after a failed `BuildHandlers` returns "previous build failed" (v1.24.2
+  started the server with part of the routes).

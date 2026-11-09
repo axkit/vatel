@@ -2,7 +2,6 @@ package vatel
 
 import (
 	"io"
-	"reflect"
 	"testing"
 
 	"github.com/axkit/date"
@@ -35,7 +34,7 @@ func TestDecodeURLQuery_BasicTypes(t *testing.T) {
 	ctx.QueryArgs().Add("g", "0.5")
 
 	l := zerolog.New(io.Discard)
-	fields := buildQueryFields(reflect.TypeOf(a))
+	fields := mustFields(t, &a)
 	if _, err := decodeURLQuery(&ctx, &a, fields, l.With()); err != nil {
 		t.Fatal(err)
 	}
@@ -62,7 +61,7 @@ func TestDecodeURLQuery_MissingParam(t *testing.T) {
 	}{}
 
 	// Don't add "id" to query — it should be silently skipped (optional params).
-	fields := buildQueryFields(reflect.TypeOf(a))
+	fields := mustFields(t, &a)
 	l := zerolog.New(io.Discard)
 	if _, err := decodeURLQuery(&ctx, &a, fields, l.With()); err != nil {
 		t.Fatalf("unexpected error for missing optional param: %v", err)
@@ -80,7 +79,7 @@ func TestDecodeURLQuery_InvalidInt(t *testing.T) {
 		ID int `param:"id"`
 	}{}
 
-	fields := buildQueryFields(reflect.TypeOf(a))
+	fields := mustFields(t, &a)
 	l := zerolog.New(io.Discard)
 	_, err := decodeURLQuery(&ctx, &a, fields, l.With())
 	if err == nil {
@@ -96,7 +95,7 @@ func TestDecodeURLQuery_Float(t *testing.T) {
 		Price float64 `param:"price"`
 	}{}
 
-	fields := buildQueryFields(reflect.TypeOf(a))
+	fields := mustFields(t, &a)
 	l := zerolog.New(io.Discard)
 	if _, err := decodeURLQuery(&ctx, &a, fields, l.With()); err != nil {
 		t.Fatal(err)
@@ -114,7 +113,7 @@ func TestDecodeURLQuery_String(t *testing.T) {
 		Status string `param:"status"`
 	}{}
 
-	fields := buildQueryFields(reflect.TypeOf(a))
+	fields := mustFields(t, &a)
 	l := zerolog.New(io.Discard)
 	if _, err := decodeURLQuery(&ctx, &a, fields, l.With()); err != nil {
 		t.Fatal(err)
@@ -134,7 +133,7 @@ func TestDecodeParams_Int(t *testing.T) {
 		ID int `param:"id"`
 	}
 	var param p
-	fields := buildParamFields(reflect.TypeOf(param))
+	fields := mustFields(t, &param)
 
 	l := zerolog.New(io.Discard)
 	if _, err := decodeParams(ctx, &param, fields, l.With()); err != nil {
@@ -153,7 +152,7 @@ func TestDecodeParams_String(t *testing.T) {
 		Slug string `param:"slug"`
 	}
 	var param p
-	fields := buildParamFields(reflect.TypeOf(param))
+	fields := mustFields(t, &param)
 
 	l := zerolog.New(io.Discard)
 	if _, err := decodeParams(ctx, &param, fields, l.With()); err != nil {
@@ -172,7 +171,7 @@ func TestDecodeParams_MissingValue(t *testing.T) {
 		ID int `param:"id"`
 	}
 	var param p
-	fields := buildParamFields(reflect.TypeOf(p{}))
+	fields := mustFields(t, &p{})
 
 	l := zerolog.New(io.Discard)
 	_, err := decodeParams(ctx, &param, fields, l.With())
@@ -189,7 +188,7 @@ func TestDecodeParams_InvalidInt(t *testing.T) {
 		ID int `param:"id"`
 	}
 	var param p
-	fields := buildParamFields(reflect.TypeOf(param))
+	fields := mustFields(t, &param)
 
 	l := zerolog.New(io.Discard)
 	_, err := decodeParams(ctx, &param, fields, l.With())
@@ -206,7 +205,7 @@ func TestDecodeBody_Success(t *testing.T) {
 		Age  int    `json:"age"`
 	}
 	var dest in
-	if _, err := decodeBody([]byte(`{"name":"Alice","age":30}`), &dest, false); err != nil {
+	if _, err := decodeBody([]byte(`{"name":"Alice","age":30}`), &dest, false, false); err != nil {
 		t.Fatal(err)
 	}
 	if dest.Name != "Alice" || dest.Age != 30 {
@@ -217,7 +216,7 @@ func TestDecodeBody_Success(t *testing.T) {
 func TestDecodeBody_EmptyBody(t *testing.T) {
 	var dest struct{}
 	for _, body := range [][]byte{nil, {}, []byte(" \n\t ")} {
-		if _, err := decodeBody(body, &dest, false); err == nil {
+		if _, err := decodeBody(body, &dest, false, false); err == nil {
 			t.Errorf("body %q: expected error", body)
 		}
 	}
@@ -226,7 +225,7 @@ func TestDecodeBody_EmptyBody(t *testing.T) {
 func TestDecodeBody_OptionalEmptyBody(t *testing.T) {
 	for _, body := range [][]byte{nil, {}, []byte(" \n\t ")} {
 		dest := struct{ Name string }{Name: "keep"}
-		decoded, err := decodeBody(body, &dest, true)
+		decoded, err := decodeBody(body, &dest, true, false)
 		if err != nil {
 			t.Fatalf("body %q: unexpected error: %v", body, err)
 		}
@@ -242,7 +241,7 @@ func TestDecodeBody_OptionalEmptyBody(t *testing.T) {
 func TestDecodeBody_InvalidJSON(t *testing.T) {
 	var dest struct{ Name string }
 	for _, optional := range []bool{false, true} {
-		if _, err := decodeBody([]byte(`not json`), &dest, optional); err == nil {
+		if _, err := decodeBody([]byte(`not json`), &dest, optional, false); err == nil {
 			t.Errorf("optional=%v: expected error for invalid JSON", optional)
 		}
 	}
@@ -250,7 +249,7 @@ func TestDecodeBody_InvalidJSON(t *testing.T) {
 
 func TestDecodeBody_DoesNotValidate(t *testing.T) {
 	var dest validInput
-	decoded, err := decodeBody([]byte(`{"name":""}`), &dest, false)
+	decoded, err := decodeBody([]byte(`{"name":""}`), &dest, false, false)
 	if err != nil {
 		t.Fatalf("decodeBody must not call Validate, got %v", err)
 	}
@@ -305,7 +304,7 @@ func TestBuildQueryFields_CountsTaggedFields(t *testing.T) {
 			Also int `param:"also"`
 		}
 	}
-	fields := buildQueryFields(reflect.TypeOf(input{}))
+	fields := mustFields(t, &input{})
 	if len(fields) != 2 {
 		t.Errorf("want 2 fields, got %d: %+v", len(fields), fields)
 	}
@@ -316,7 +315,7 @@ func TestBuildParamFields_IgnoresUntagged(t *testing.T) {
 		ID    int    `param:"id"`
 		NoTag string // must be skipped
 	}
-	fields := buildParamFields(reflect.TypeOf(params{}))
+	fields := mustFields(t, &params{})
 	if len(fields) != 1 {
 		t.Errorf("want 1 field, got %d", len(fields))
 	}
@@ -328,7 +327,7 @@ func TestBuildParamFields_IgnoresUntagged(t *testing.T) {
 // ── compile validation ────────────────────────────────────────────────────────
 
 func TestCompile_ParamerPathMismatch(t *testing.T) {
-	v := noAuthVatel()
+	v := NewVatel()
 	// Endpoint has {id} but controller does not implement Paramer.
 	e := &Endpoint{
 		EndpointMeta: EndpointMeta{Method: "GET", Path: "/items/{id}"},
@@ -340,7 +339,7 @@ func TestCompile_ParamerPathMismatch(t *testing.T) {
 }
 
 func TestCompile_ParamerWithoutPathParam(t *testing.T) {
-	v := noAuthVatel()
+	v := NewVatel()
 	e := &Endpoint{
 		EndpointMeta: EndpointMeta{Method: "GET", Path: "/items"},
 		Controller:   func() Handler { return &pathHandler{} },
@@ -351,7 +350,7 @@ func TestCompile_ParamerWithoutPathParam(t *testing.T) {
 }
 
 func TestCompile_UnknownHTTPMethod(t *testing.T) {
-	v := noAuthVatel()
+	v := NewVatel()
 	e := &Endpoint{
 		EndpointMeta: EndpointMeta{Method: "TRACE", Path: "/items"},
 		Controller:   func() Handler { return &plainHandler{} },
@@ -401,12 +400,12 @@ func TestParseLogLevelHeader(t *testing.T) {
 
 // ── middlewareSet size ────────────────────────────────────────────────────────
 
-func TestMiddlewareSetSize(t *testing.T) {
-	const wantSize = 6
-	var ms middlewareSet
-	if len(ms) != wantSize {
-		t.Errorf("middlewareSet length: want %d, got %d", wantSize, len(ms))
+// mustFields returns the query field layout of in, a pointer to a struct.
+func mustFields(t *testing.T, in interface{}) []fieldInfo {
+	t.Helper()
+	fields, err := buildQueryFields(in, "Input()")
+	if err != nil {
+		t.Fatal(err)
 	}
-	// Ensure OnErrorResponse (index 5) is accessible without panic.
-	_ = ms[OnErrorResponse]
+	return fields
 }

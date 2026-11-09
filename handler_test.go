@@ -33,7 +33,7 @@ func run(v *Vatel, e Endpoint, fctx *fasthttp.RequestCtx) {
 
 func TestHandler_PlainSuccess(t *testing.T) {
 	h := &plainHandler{}
-	v := noAuthVatel()
+	v := NewVatel()
 	fctx := newGETCtx("/items")
 
 	run(v, GET("/items", func() Handler { return h }), fctx)
@@ -48,7 +48,7 @@ func TestHandler_PlainSuccess(t *testing.T) {
 
 func TestHandler_HandlerError(t *testing.T) {
 	h := &plainHandler{retErr: fmt.Errorf("something went wrong")}
-	v := noAuthVatel()
+	v := NewVatel()
 	fctx := newGETCtx("/items")
 
 	run(v, GET("/items", func() Handler { return h }), fctx)
@@ -64,7 +64,7 @@ func TestHandler_HandlerError(t *testing.T) {
 func TestHandler_StructuredError(t *testing.T) {
 	sentinel := ErrValidationFailed.New().Msg("bad input")
 	h := &plainHandler{retErr: sentinel}
-	v := noAuthVatel()
+	v := NewVatel()
 	fctx := newGETCtx("/items")
 
 	run(v, GET("/items", func() Handler { return h }), fctx)
@@ -82,7 +82,7 @@ func TestHandler_StructuredError(t *testing.T) {
 
 func TestHandler_QueryParams(t *testing.T) {
 	h := &queryHandler{}
-	v := noAuthVatel()
+	v := NewVatel()
 	fctx := newGETCtx("/items?id=7&name=foo")
 
 	run(v, GET("/items", func() Handler { return h }), fctx)
@@ -100,7 +100,7 @@ func TestHandler_QueryParams(t *testing.T) {
 
 func TestHandler_QueryParams_InvalidType(t *testing.T) {
 	h := &queryHandler{}
-	v := noAuthVatel()
+	v := NewVatel()
 	fctx := newGETCtx("/items?id=notanumber")
 
 	run(v, GET("/items", func() Handler { return h }), fctx)
@@ -117,7 +117,7 @@ func TestHandler_QueryParams_InvalidType(t *testing.T) {
 
 func TestHandler_PathParams(t *testing.T) {
 	h := &pathHandler{}
-	v := noAuthVatel()
+	v := NewVatel()
 	fctx := newGETCtx("/items/99")
 	fctx.SetUserValue("id", "99")
 
@@ -133,7 +133,7 @@ func TestHandler_PathParams(t *testing.T) {
 
 func TestHandler_PathParams_Missing(t *testing.T) {
 	h := &pathHandler{}
-	v := noAuthVatel()
+	v := NewVatel()
 	fctx := newGETCtx("/items/")
 	// intentionally not setting user value "id"
 
@@ -151,7 +151,7 @@ func TestHandler_PathParams_Missing(t *testing.T) {
 
 func TestHandler_PostBody(t *testing.T) {
 	h := &bodyHandler{}
-	v := noAuthVatel()
+	v := NewVatel()
 	fctx := newPOSTCtx("/items", []byte(`{"title":"test","count":3}`))
 
 	run(v, POST("/items", func() Handler { return h }), fctx)
@@ -166,7 +166,7 @@ func TestHandler_PostBody(t *testing.T) {
 
 func TestHandler_PostBody_Empty(t *testing.T) {
 	h := &bodyHandler{}
-	v := noAuthVatel()
+	v := NewVatel()
 	fctx := newPOSTCtx("/items", nil)
 
 	run(v, POST("/items", func() Handler { return h }), fctx)
@@ -181,7 +181,7 @@ func TestHandler_PostBody_Empty(t *testing.T) {
 
 func TestHandler_PostBody_InvalidJSON(t *testing.T) {
 	h := &bodyHandler{}
-	v := noAuthVatel()
+	v := NewVatel()
 	fctx := newPOSTCtx("/items", []byte(`not json`))
 
 	run(v, POST("/items", func() Handler { return h }), fctx)
@@ -195,7 +195,7 @@ func TestHandler_PostBody_InvalidJSON(t *testing.T) {
 
 func TestHandler_ResponseBody(t *testing.T) {
 	h := &resultHandler{}
-	v := noAuthVatel()
+	v := NewVatel()
 	fctx := newGETCtx("/items")
 
 	run(v, GET("/items", func() Handler { return h }), fctx)
@@ -223,7 +223,7 @@ func TestHandler_ResponseBody(t *testing.T) {
 
 func TestHandler_NilResult_NoBody(t *testing.T) {
 	h := &nilResultHandler{} // out is nil — Result() returns nil
-	v := noAuthVatel()
+	v := NewVatel()
 	fctx := newGETCtx("/items")
 
 	run(v, GET("/items", func() Handler { return h }), fctx)
@@ -236,122 +236,10 @@ func TestHandler_NilResult_NoBody(t *testing.T) {
 	}
 }
 
-// ── authorization ─────────────────────────────────────────────────────────────
-
-func TestHandler_Auth_MissingHeader(t *testing.T) {
-	v, _, _, cfg := authVatel(true)
-	h := &plainHandler{}
-	fctx := newGETCtx("/secret")
-
-	run(v, GET("/secret", func() Handler { return h }, cfg.RequirePerms(map[string]uint{"read": 0})), fctx)
-
-	if responseStatus(fctx) != 401 {
-		t.Errorf("want 401, got %d", responseStatus(fctx))
-	}
-	if h.called {
-		t.Error("handler should not be called without token")
-	}
-}
-
-func TestHandler_Auth_ValidToken(t *testing.T) {
-	v, _, _, cfg := authVatel(true)
-	h := &tokenHandler{}
-	fctx := newGETCtx("/secret")
-	fctx.Request.Header.Set("Authorization", "Bearer valid-token")
-
-	run(v, GET("/secret", func() Handler { return h }, cfg.RequirePerms(map[string]uint{"read": 0})), fctx)
-
-	if responseStatus(fctx) != 200 {
-		t.Errorf("want 200, got %d", responseStatus(fctx))
-	}
-	if h.payload == nil {
-		t.Error("token payload should be set in context")
-	}
-	if h.payload.(*mockPayload).Login() != "alice" {
-		t.Errorf("want login=alice, got %s", h.payload.(*mockPayload).Login())
-	}
-}
-
-func TestHandler_Auth_Forbidden(t *testing.T) {
-	v, _, _, cfg := authVatel(false) // allowed=false
-	h := &plainHandler{}
-	fctx := newGETCtx("/secret")
-	fctx.Request.Header.Set("Authorization", "Bearer token")
-
-	run(v, GET("/secret", func() Handler { return h }, cfg.RequirePerms(map[string]uint{"write": 0})), fctx)
-
-	if responseStatus(fctx) != 403 {
-		t.Errorf("want 403, got %d", responseStatus(fctx))
-	}
-	if h.called {
-		t.Error("handler should not be called when forbidden")
-	}
-}
-
-func TestHandler_Auth_RevokedToken(t *testing.T) {
-	payload := &mockPayload{login: "alice", role: 1, perms: []byte{0xFF}}
-	token := &mockTokener{payload: payload}
-	dec := &mockDecoder{token: token}
-	auth := &mockAuthorizer{allowed: true}
-	revoker := &mockRevoker{revoked: true}
-
-	v := NewVatel()
-	v.AddMiddleware(OnAuthentication, func(ctx Context, _ EndpointMeta) error {
-		at := ctx.Header("Authorization")
-		if len(at) == 0 {
-			return nil
-		}
-		revoked, err := revoker.IsTokenRevoked(string(at))
-		if err != nil {
-			return err
-		}
-		if revoked {
-			return ErrAccessTokenRevoked.New()
-		}
-		tok, err2 := dec.Decode(at)
-		if err2 != nil {
-			return ErrUnauthorized.Wrap(err2)
-		}
-		ctx.SetTokenPayload(tok.ApplicationPayload())
-		return nil
-	})
-	cfg := authConfig(dec, auth)
-
-	h := &plainHandler{}
-	fctx := newGETCtx("/secret")
-	fctx.Request.Header.Set("Authorization", "Bearer revoked-token")
-
-	run(v, GET("/secret", func() Handler { return h }, cfg.RequirePerms(map[string]uint{"read": 0})), fctx)
-
-	if responseStatus(fctx) != 401 {
-		t.Errorf("want 401 for revoked token, got %d", responseStatus(fctx))
-	}
-	if h.called {
-		t.Error("handler should not be called with revoked token")
-	}
-}
-
-func TestHandler_Auth_PublicEndpoint_TokenOptional(t *testing.T) {
-	// Endpoint has no Perms — token header should be optional/ignored.
-	v, _, _, _ := authVatel(true)
-	h := &plainHandler{}
-	fctx := newGETCtx("/public")
-	// No Authorization header.
-
-	run(v, GET("/public", func() Handler { return h }), fctx)
-
-	if !h.called {
-		t.Error("public handler should be called without token")
-	}
-	if responseStatus(fctx) != 200 {
-		t.Errorf("want 200, got %d", responseStatus(fctx))
-	}
-}
-
 // ── middleware ────────────────────────────────────────────────────────────────
 
 func TestHandler_OnAuthentication_Success(t *testing.T) {
-	v := noAuthVatel()
+	v := NewVatel()
 	var mwCalled bool
 	v.AddMiddleware(OnAuthentication, func(ctx Context, _ EndpointMeta) error {
 		mwCalled = true
@@ -375,7 +263,7 @@ func TestHandler_OnAuthentication_Success(t *testing.T) {
 }
 
 func TestHandler_OnAuthentication_StopsPipeline(t *testing.T) {
-	v := noAuthVatel()
+	v := NewVatel()
 	v.AddMiddleware(OnAuthentication, func(ctx Context, _ EndpointMeta) error {
 		return ErrForbidden.New()
 	})
@@ -393,7 +281,7 @@ func TestHandler_OnAuthentication_StopsPipeline(t *testing.T) {
 }
 
 func TestHandler_OnAuthorization_RunsBeforeHandler(t *testing.T) {
-	v := noAuthVatel()
+	v := NewVatel()
 	var order []string
 
 	v.AddMiddleware(OnAuthorization, func(ctx Context, _ EndpointMeta) error {
@@ -401,28 +289,18 @@ func TestHandler_OnAuthorization_RunsBeforeHandler(t *testing.T) {
 		return nil
 	})
 
-	h := &plainHandler{}
-	origHandle := h.Handle
-	_ = origHandle // just capturing call order via h.called is enough
-
-	// Wrap handler to record order.
-	called := false
 	fctx := newGETCtx("/items")
 	run(v, GET("/items", func() Handler {
-		return &orderTracker{order: &order, label: "handler", inner: h}
+		return &orderTracker{order: &order, label: "handler", inner: &plainHandler{}}
 	}), fctx)
 
-	if len(order) < 2 {
-		t.Fatalf("want at least 2 events, got %v", order)
-	}
-	if order[0] != "after-auth" || order[1] != "handler" {
+	if len(order) != 2 || order[0] != "after-auth" || order[1] != "handler" {
 		t.Errorf("wrong order: %v", order)
 	}
-	_ = called
 }
 
 func TestHandler_OnAuthorization_StopsPipeline(t *testing.T) {
-	v := noAuthVatel()
+	v := NewVatel()
 	v.AddMiddleware(OnAuthorization, func(ctx Context, _ EndpointMeta) error {
 		return ErrForbidden.New()
 	})
@@ -440,7 +318,7 @@ func TestHandler_OnAuthorization_StopsPipeline(t *testing.T) {
 }
 
 func TestHandler_OnSuccessResponse_Called(t *testing.T) {
-	v := noAuthVatel()
+	v := NewVatel()
 	var successCalled bool
 	v.AddMiddleware(OnSuccessResponse, func(ctx Context, _ EndpointMeta) error {
 		successCalled = true
@@ -456,7 +334,7 @@ func TestHandler_OnSuccessResponse_Called(t *testing.T) {
 }
 
 func TestHandler_OnSuccessResponse_NotCalledOnError(t *testing.T) {
-	v := noAuthVatel()
+	v := NewVatel()
 	var successCalled bool
 	v.AddMiddleware(OnSuccessResponse, func(ctx Context, _ EndpointMeta) error {
 		successCalled = true
@@ -474,7 +352,7 @@ func TestHandler_OnSuccessResponse_NotCalledOnError(t *testing.T) {
 }
 
 func TestHandler_OnErrorResponse_CalledOnError(t *testing.T) {
-	v := noAuthVatel()
+	v := NewVatel()
 	var errCalled bool
 	v.AddMiddleware(OnErrorResponse, func(ctx Context, _ EndpointMeta) error {
 		errCalled = true
@@ -492,7 +370,7 @@ func TestHandler_OnErrorResponse_CalledOnError(t *testing.T) {
 }
 
 func TestHandler_OnErrorResponse_NotCalledOnSuccess(t *testing.T) {
-	v := noAuthVatel()
+	v := NewVatel()
 	var errCalled bool
 	v.AddMiddleware(OnErrorResponse, func(ctx Context, _ EndpointMeta) error {
 		errCalled = true
@@ -511,7 +389,7 @@ func TestHandler_OnErrorResponse_NotCalledOnSuccess(t *testing.T) {
 
 func TestHandler_Metrics_Success(t *testing.T) {
 	m := &mockMetrics{}
-	v := noAuthVatel(WithMetricReporter(m))
+	v := NewVatel(WithMetricReporter(m))
 	fctx := newGETCtx("/items")
 
 	run(v, GET("/items", func() Handler { return &plainHandler{} }), fctx)
@@ -526,7 +404,7 @@ func TestHandler_Metrics_Success(t *testing.T) {
 
 func TestHandler_Metrics_Error(t *testing.T) {
 	m := &mockMetrics{}
-	v := noAuthVatel(WithMetricReporter(m))
+	v := NewVatel(WithMetricReporter(m))
 	fctx := newGETCtx("/items")
 
 	run(v, GET("/items", func() Handler {
@@ -545,7 +423,7 @@ func TestHandler_Metrics_Error(t *testing.T) {
 
 func TestHandler_Alarmer_TriggeredOn5xx(t *testing.T) {
 	ala := &mockAlarmer{}
-	v := noAuthVatel(WithAlarmer(ala))
+	v := NewVatel(WithAlarmer(ala))
 	fctx := newGETCtx("/items")
 
 	run(v, GET("/items", func() Handler {
@@ -559,7 +437,7 @@ func TestHandler_Alarmer_TriggeredOn5xx(t *testing.T) {
 
 func TestHandler_Alarmer_NotTriggeredOn4xx(t *testing.T) {
 	ala := &mockAlarmer{}
-	v := noAuthVatel(WithAlarmer(ala))
+	v := NewVatel(WithAlarmer(ala))
 	fctx := newGETCtx("/items")
 
 	run(v, GET("/items", func() Handler {
@@ -573,22 +451,9 @@ func TestHandler_Alarmer_NotTriggeredOn4xx(t *testing.T) {
 
 // ── endpoint options ──────────────────────────────────────────────────────────
 
-func TestHandler_LogSilent_NoResponse(t *testing.T) {
-	// With LogSilent the handler still processes normally; just no logging.
-	h := &plainHandler{}
-	v := noAuthVatel()
-	fctx := newGETCtx("/items")
-
-	run(v, GET("/items", func() Handler { return h }, WithLogOption(LogSilent)), fctx)
-
-	if !h.called {
-		t.Error("handler should be called even with LogSilent")
-	}
-}
-
 func TestHandler_CustomSuccessStatusCode(t *testing.T) {
 	m := &mockMetrics{}
-	v := noAuthVatel(WithMetricReporter(m))
+	v := NewVatel(WithMetricReporter(m))
 	fctx := newPOSTCtx("/items", []byte(`{"title":"x","count":1}`))
 
 	run(v, POST("/items", func() Handler { return &bodyHandler{} },
@@ -603,7 +468,7 @@ func TestHandler_CustomSuccessStatusCode(t *testing.T) {
 }
 
 func TestHandler_SuccessStatusCode_NotAppliedOnError(t *testing.T) {
-	v := noAuthVatel()
+	v := NewVatel()
 	fctx := newGETCtx("/items")
 
 	run(v, GET("/items", func() Handler {
@@ -624,7 +489,7 @@ func (h *statusHandler) Handle(ctx Context) error {
 }
 
 func TestHandler_ManualStatusCode(t *testing.T) {
-	v := noAuthVatel()
+	v := NewVatel()
 	fctx := newGETCtx("/items")
 
 	run(v, GET("/items", func() Handler { return &statusHandler{code: 202} },
@@ -638,7 +503,7 @@ func TestHandler_ManualStatusCode(t *testing.T) {
 // ── client error fields ───────────────────────────────────────────────────────
 
 func TestHandler_ErrorFields_HiddenFromClient(t *testing.T) {
-	v := noAuthVatel()
+	v := NewVatel()
 	fctx := newGETCtx("/items")
 
 	run(v, GET("/items", func() Handler {
@@ -658,7 +523,7 @@ func TestHandler_ErrorFields_HiddenFromClient(t *testing.T) {
 }
 
 func TestHandler_WithClientErrorFields(t *testing.T) {
-	v := noAuthVatel(WithClientErrorFields("reason", "suggestedName"))
+	v := NewVatel(WithClientErrorFields("reason", "suggestedName"))
 	fctx := newGETCtx("/items")
 
 	run(v, GET("/items", func() Handler {
@@ -686,7 +551,7 @@ func TestHandler_WithClientErrorFields(t *testing.T) {
 // ── build ─────────────────────────────────────────────────────────────────────
 
 func TestBuildHandlers_Twice(t *testing.T) {
-	v := noAuthVatel()
+	v := NewVatel()
 	v.Add(Endpoints{GET("/items", func() Handler { return &plainHandler{} })})
 	mux := router.New()
 
@@ -767,9 +632,9 @@ func TestContext_TokenPayload(t *testing.T) {
 	if ctx.TokenPayload() != nil {
 		t.Error("token payload should be nil initially")
 	}
-	p := &mockPayload{login: "bob"}
+	p := &mockPayload{perms: []byte{7}}
 	ctx.SetTokenPayload(p)
-	if ctx.TokenPayload().(*mockPayload).Login() != "bob" {
+	if ctx.TokenPayload() != any(p) {
 		t.Error("token payload not stored")
 	}
 }
@@ -808,7 +673,7 @@ func TestContext_GoContext(t *testing.T) {
 
 func TestFunc_Adapter(t *testing.T) {
 	called := false
-	v := noAuthVatel()
+	v := NewVatel()
 	fctx := newGETCtx("/ping")
 
 	run(v, GET("/ping", Func(func(ctx Context) error {
@@ -825,7 +690,7 @@ func TestFunc_Adapter(t *testing.T) {
 }
 
 func TestFunc_Adapter_Error(t *testing.T) {
-	v := noAuthVatel()
+	v := NewVatel()
 	fctx := newGETCtx("/ping")
 
 	run(v, GET("/ping", Func(func(ctx Context) error {
@@ -872,7 +737,7 @@ func TestHandler_OptionalBody(t *testing.T) {
 			h := &bodyHandler{}
 			fctx := newPOSTCtx("/items", tt.body)
 
-			run(noAuthVatel(), POST("/items", func() Handler { return h }, WithOptionalBody()), fctx)
+			run(NewVatel(), POST("/items", func() Handler { return h }, WithOptionalBody()), fctx)
 
 			if got := responseStatus(fctx); got != tt.wantStatus {
 				t.Fatalf("want %d, got %d (body %s)", tt.wantStatus, got, fctx.Response.Body())
@@ -892,7 +757,7 @@ func TestHandler_WithoutOptionalBody_BlankBodyRejected(t *testing.T) {
 		h := &bodyHandler{}
 		fctx := newPOSTCtx("/items", body)
 
-		run(noAuthVatel(), POST("/items", func() Handler { return h }), fctx)
+		run(NewVatel(), POST("/items", func() Handler { return h }), fctx)
 
 		if got := responseStatus(fctx); got != 400 {
 			t.Errorf("body %q: want 400, got %d", body, got)
@@ -911,7 +776,7 @@ func TestCompile_OptionalBodyOnMethodsWithoutBody(t *testing.T) {
 		HEAD("/items", ctrl, WithOptionalBody()),
 		OPTIONS("/items", ctrl, WithOptionalBody()),
 	} {
-		if err := e.compile(noAuthVatel()); err == nil {
+		if err := e.compile(NewVatel()); err == nil {
 			t.Errorf("%s: expected compile error for WithOptionalBody", e.Method)
 		}
 	}
@@ -956,7 +821,7 @@ func TestHandler_OptionalBody_Validator(t *testing.T) {
 			h := &validatedBodyHandler{}
 			fctx := newPOSTCtx("/items", tt.body)
 
-			run(noAuthVatel(), POST("/items", func() Handler { return h }, WithOptionalBody()), fctx)
+			run(NewVatel(), POST("/items", func() Handler { return h }, WithOptionalBody()), fctx)
 
 			if got := responseStatus(fctx); got != tt.wantStatus {
 				t.Fatalf("want %d, got %d", tt.wantStatus, got)
@@ -1003,7 +868,7 @@ func TestHandler_QueryParamsAndBody_POST(t *testing.T) {
 	h := &queryAndBodyHandler{}
 	fctx := newPOSTCtx("/items?page=2&sort=asc", []byte(`{"title":"x"}`))
 
-	run(noAuthVatel(), POST("/items", func() Handler { return h }), fctx)
+	run(NewVatel(), POST("/items", func() Handler { return h }), fctx)
 
 	if got := responseStatus(fctx); got != 200 {
 		t.Fatalf("want 200, got %d (body %s)", got, fctx.Response.Body())
@@ -1020,7 +885,7 @@ func TestHandler_QueryParamsOnly_POSTNeedsNoBody(t *testing.T) {
 	h := &queryOnlyHandler{}
 	fctx := newPOSTCtx("/items?page=4", nil)
 
-	run(noAuthVatel(), POST("/items", func() Handler { return h }), fctx)
+	run(NewVatel(), POST("/items", func() Handler { return h }), fctx)
 
 	if got := responseStatus(fctx); got != 200 {
 		t.Fatalf("want 200, got %d (body %s)", got, fctx.Response.Body())
@@ -1038,7 +903,7 @@ func TestHandler_QueryParams_GETAndDELETE(t *testing.T) {
 			fctx.Request.Header.SetMethod(method)
 
 			ep := buildEndpoint(method, "/items", func() Handler { return h })
-			run(noAuthVatel(), ep, fctx)
+			run(NewVatel(), ep, fctx)
 
 			if got := responseStatus(fctx); got != 200 {
 				t.Fatalf("want 200, got %d", got)
@@ -1067,7 +932,7 @@ func TestHandler_LegacyInputer_GETQuery_POSTBody(t *testing.T) {
 	t.Run("GET decodes query", func(t *testing.T) {
 		h := &legacyInputHandler{}
 		fctx := newGETCtx("/items?page=9")
-		run(noAuthVatel(), GET("/items", func() Handler { return h }), fctx)
+		run(NewVatel(), GET("/items", func() Handler { return h }), fctx)
 		if got := responseStatus(fctx); got != 200 {
 			t.Fatalf("want 200, got %d", got)
 		}
@@ -1078,7 +943,7 @@ func TestHandler_LegacyInputer_GETQuery_POSTBody(t *testing.T) {
 	t.Run("POST decodes body, not query", func(t *testing.T) {
 		h := &legacyInputHandler{}
 		fctx := newPOSTCtx("/items?page=9", []byte(`{"title":"t"}`))
-		run(noAuthVatel(), POST("/items", func() Handler { return h }), fctx)
+		run(NewVatel(), POST("/items", func() Handler { return h }), fctx)
 		if got := responseStatus(fctx); got != 200 {
 			t.Fatalf("want 200, got %d", got)
 		}
@@ -1138,7 +1003,7 @@ func TestHandler_Validator_QuerierOnly(t *testing.T) {
 	} {
 		h := &validatedQuerierHandler{}
 		fctx := newGETCtx(tt.uri)
-		run(noAuthVatel(), GET("/items", func() Handler { return h }), fctx)
+		run(NewVatel(), GET("/items", func() Handler { return h }), fctx)
 		if got := responseStatus(fctx); got != tt.wantStatus {
 			t.Errorf("%s: want %d, got %d", tt.uri, tt.wantStatus, got)
 		}
@@ -1161,7 +1026,7 @@ func TestHandler_Validator_LegacyInputerQuery(t *testing.T) {
 	} {
 		h := &validatedLegacyQueryHandler{}
 		fctx := newGETCtx(tt.uri)
-		run(noAuthVatel(), GET("/items", func() Handler { return h }), fctx)
+		run(NewVatel(), GET("/items", func() Handler { return h }), fctx)
 		if got := responseStatus(fctx); got != tt.wantStatus {
 			t.Errorf("%s: want %d, got %d", tt.uri, tt.wantStatus, got)
 		}
@@ -1191,7 +1056,7 @@ func TestHandler_Validator_QueryBeforeBody(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			h := &validatedQueryAndBodyHandler{}
 			fctx := newPOSTCtx(tt.uri, []byte(tt.body))
-			run(noAuthVatel(), POST("/items", func() Handler { return h }), fctx)
+			run(NewVatel(), POST("/items", func() Handler { return h }), fctx)
 			if got := responseStatus(fctx); got != tt.wantStatus {
 				t.Fatalf("want %d, got %d", tt.wantStatus, got)
 			}
@@ -1237,7 +1102,7 @@ func TestHandler_Log_QuerierUnderReqQuery_InputerUnderReqInput(t *testing.T) {
 	h := &queryAndBodyHandler{}
 	fctx := newPOSTCtx("/items?page=2", []byte(`{"title":"x"}`))
 
-	runLogged(t, noAuthVatel(), POST("/items", func() Handler { return h },
+	runLogged(t, NewVatel(), POST("/items", func() Handler { return h },
 		WithLogOption(LogExit|LogReqInput)), fctx, &buf)
 
 	m := lastLogLine(t, &buf)
@@ -1311,7 +1176,7 @@ func rawRoundTrip(t *testing.T, h fasthttp.RequestHandler, method, uri string) (
 }
 
 func TestHEAD_InMemoryServer_NoBody(t *testing.T) {
-	v := noAuthVatel()
+	v := NewVatel()
 	headH := &itemResultHandler{}
 	v.Add(Endpoints{
 		GET("/items", func() Handler { return &itemResultHandler{} }),
@@ -1348,7 +1213,7 @@ func TestOPTIONS_CompilesAndServes(t *testing.T) {
 	fctx := newGETCtx("/items")
 	fctx.Request.Header.SetMethod("OPTIONS")
 
-	run(noAuthVatel(), OPTIONS("/items", func() Handler { return h }), fctx)
+	run(NewVatel(), OPTIONS("/items", func() Handler { return h }), fctx)
 
 	if got := responseStatus(fctx); got != 200 {
 		t.Fatalf("want 200, got %d (body %s)", got, fctx.Response.Body())
@@ -1371,7 +1236,7 @@ func TestHandler_InputRouting_AllMethods(t *testing.T) {
 			fctx := newPOSTCtx("/items?page=3&sort=asc", nil)
 			fctx.Request.Header.SetMethod(method)
 
-			run(noAuthVatel(), build("/items", func() Handler { return h }), fctx)
+			run(NewVatel(), build("/items", func() Handler { return h }), fctx)
 
 			if got := responseStatus(fctx); got != 200 {
 				t.Fatalf("want 200, got %d (body %s)", got, fctx.Response.Body())
@@ -1385,7 +1250,7 @@ func TestHandler_InputRouting_AllMethods(t *testing.T) {
 			fctx := newPOSTCtx("/items?page=9", []byte(`{"title":"t"}`))
 			fctx.Request.Header.SetMethod(method)
 
-			run(noAuthVatel(), build("/items", func() Handler { return h }), fctx)
+			run(NewVatel(), build("/items", func() Handler { return h }), fctx)
 
 			if got := responseStatus(fctx); got != 200 {
 				t.Fatalf("want 200, got %d (body %s)", got, fctx.Response.Body())
@@ -1405,7 +1270,7 @@ func TestHandler_InputRouting_AllMethods(t *testing.T) {
 
 func TestRouter_GlobalOPTIONS_WithVatelEndpoints(t *testing.T) {
 	explicit := &plainHandler{}
-	v := noAuthVatel()
+	v := NewVatel()
 	v.Add(Endpoints{
 		GET("/items", func() Handler { return &plainHandler{} }),
 		GET("/explicit", func() Handler { return &plainHandler{} }),
@@ -1576,7 +1441,7 @@ func TestCompile_DefaultMasker_NoPanic(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			e := tt.e
-			if err := e.compile(noAuthVatel()); err != nil {
+			if err := e.compile(NewVatel()); err != nil {
 				t.Fatalf("compile: %v", err)
 			}
 			if e.jm == nil {
@@ -1605,26 +1470,14 @@ func TestHandler_Log_MasksArrayElements(t *testing.T) {
 	t.Run("Body[[]T]", func(t *testing.T) {
 		var buf bytes.Buffer
 		fctx := newPOSTCtx("/items", []byte(`[{"name":"a","password":"p1"},{"name":"b","password":"p2"}]`))
-		runLogged(t, noAuthVatel(), POST("/items", func() Handler { return &sliceBodyHandler{} },
+		runLogged(t, NewVatel(), POST("/items", func() Handler { return &sliceBodyHandler{} },
 			WithLogOption(LogExit|LogReqBody|LogReqInput)), fctx, &buf)
 
+		if strings.Contains(buf.String(), "p1") || strings.Contains(buf.String(), "p2") {
+			t.Errorf("secret leaked to log: %s", buf.String())
+		}
 		m := lastLogLine(t, &buf)
 		for _, key := range []string{"requestBody", "reqInput"} {
-			for i, v := range maskedValues(t, m, key, "password") {
-				if v != jsonmask.DefaultMask {
-					t.Errorf("%s[%d].password = %v, want %q", key, i, v, jsonmask.DefaultMask)
-				}
-			}
-		}
-	})
-	t.Run("Output[[]T]", func(t *testing.T) {
-		var buf bytes.Buffer
-		fctx := newGETCtx("/items")
-		runLogged(t, noAuthVatel(), GET("/items", func() Handler { return &sliceOutputHandler{} },
-			WithLogOption(LogExit|LogRespBody|LogRespOutput)), fctx, &buf)
-
-		m := lastLogLine(t, &buf)
-		for _, key := range []string{"respBody", "result"} {
 			vals := maskedValues(t, m, key, "password")
 			if len(vals) != 2 {
 				t.Fatalf("%s: want 2 elements, got %d", key, len(vals))
@@ -1635,8 +1488,30 @@ func TestHandler_Log_MasksArrayElements(t *testing.T) {
 				}
 			}
 		}
-		if !strings.Contains(string(fctx.Response.Body()), `"password":"p1"`) {
-			t.Errorf("response body must not be masked: %s", fctx.Response.Body())
+	})
+	t.Run("Output[[]T]", func(t *testing.T) {
+		for _, f := range []struct {
+			lo  LogOption
+			key string
+		}{{LogRespBody, "respBody"}, {LogRespOutput, "result"}} {
+			var buf bytes.Buffer
+			fctx := newGETCtx("/items")
+			runLogged(t, NewVatel(), GET("/items", func() Handler { return &sliceOutputHandler{} },
+				WithLogOption(LogExit|f.lo)), fctx, &buf)
+			key := f.key
+			m := lastLogLine(t, &buf)
+			vals := maskedValues(t, m, key, "password")
+			if len(vals) != 2 {
+				t.Fatalf("%s: want 2 elements, got %d", key, len(vals))
+			}
+			for i, v := range vals {
+				if v != jsonmask.DefaultMask {
+					t.Errorf("%s[%d].password = %v, want %q", key, i, v, jsonmask.DefaultMask)
+				}
+			}
+			if !strings.Contains(string(fctx.Response.Body()), `"password":"p1"`) {
+				t.Errorf("response body must not be masked: %s", fctx.Response.Body())
+			}
 		}
 	})
 }
@@ -1663,7 +1538,7 @@ func TestHandler_Log_MasksTaggedFields(t *testing.T) {
 			t.Run(mk.name+"/"+f.key, func(t *testing.T) {
 				var buf bytes.Buffer
 				fctx := newPOSTCtx("/items", []byte(`{"name":"a","password":"p1"}`))
-				runLogged(t, noAuthVatel(mk.opts...), POST("/items", func() Handler { return &secretBodyHandler{} },
+				runLogged(t, NewVatel(mk.opts...), POST("/items", func() Handler { return &secretBodyHandler{} },
 					WithLogOption(LogExit|f.lo)), fctx, &buf)
 
 				m := lastLogLine(t, &buf)
@@ -1690,7 +1565,7 @@ func TestHandler_Log_MasksTaggedFields(t *testing.T) {
 func TestHandler_Log_MasksOptionalOutput(t *testing.T) {
 	var buf bytes.Buffer
 	fctx := newGETCtx("/items")
-	runLogged(t, noAuthVatel(), GET("/items", func() Handler { return &optionalSecretHandler{} },
+	runLogged(t, NewVatel(), GET("/items", func() Handler { return &optionalSecretHandler{} },
 		WithLogOption(LogExit|LogRespBody|LogRespOutput)), fctx, &buf)
 
 	if strings.Contains(buf.String(), "p1") {
@@ -1706,7 +1581,7 @@ func TestHandler_Log_MasksQueryInputs(t *testing.T) {
 	t.Run("Querier", func(t *testing.T) {
 		var buf bytes.Buffer
 		fctx := newGETCtx("/items?name=a&token=t1")
-		runLogged(t, noAuthVatel(), GET("/items", func() Handler { return &secretQueryHandler{} },
+		runLogged(t, NewVatel(), GET("/items", func() Handler { return &secretQueryHandler{} },
 			WithLogOption(LogExit|LogReqInput)), fctx, &buf)
 
 		m := lastLogLine(t, &buf)
@@ -1718,7 +1593,7 @@ func TestHandler_Log_MasksQueryInputs(t *testing.T) {
 	t.Run("Inputer on GET", func(t *testing.T) {
 		var buf bytes.Buffer
 		fctx := newGETCtx("/items?token=t1")
-		runLogged(t, noAuthVatel(), GET("/items", func() Handler { return &secretGetInputHandler{} },
+		runLogged(t, NewVatel(), GET("/items", func() Handler { return &secretGetInputHandler{} },
 			WithLogOption(LogExit|LogReqInput)), fctx, &buf)
 
 		m := lastLogLine(t, &buf)
@@ -1732,11 +1607,14 @@ func TestHandler_Log_MasksQueryInputs(t *testing.T) {
 func TestHandler_Log_NoMaskTags_Unchanged(t *testing.T) {
 	var buf bytes.Buffer
 	fctx := newPOSTCtx("/items", []byte(`{"name":"a", "password":"p1"}`))
-	runLogged(t, noAuthVatel(), POST("/items", func() Handler { return &plainBodyHandler{} },
+	runLogged(t, NewVatel(), POST("/items", func() Handler { return &plainBodyHandler{} },
 		WithLogOption(LogExit|LogReqBody|LogReqInput|LogRespBody|LogRespOutput)), fctx, &buf)
 
 	m := lastLogLine(t, &buf)
-	for _, key := range []string{"requestBody", "reqInput", "respBody", "result"} {
+	if _, ok := m["result"]; ok {
+		t.Errorf("result must not repeat respBody: %s", buf.String())
+	}
+	for _, key := range []string{"requestBody", "reqInput", "respBody"} {
 		obj, ok := m[key].(map[string]interface{})
 		if !ok {
 			t.Fatalf("%s missing in log: %s", key, buf.String())
@@ -1750,7 +1628,7 @@ func TestHandler_Log_NoMaskTags_Unchanged(t *testing.T) {
 func TestHandler_Log_MarshalErrorOmitsResult(t *testing.T) {
 	var buf bytes.Buffer
 	fctx := newGETCtx("/items")
-	runLogged(t, noAuthVatel(), GET("/items", func() Handler { return &chanOutputHandler{} },
+	runLogged(t, NewVatel(), GET("/items", func() Handler { return &chanOutputHandler{} },
 		WithLogOption(LogExit|LogRespBody|LogRespOutput)), fctx, &buf)
 
 	if got := responseStatus(fctx); got != 500 {
@@ -1798,7 +1676,7 @@ func (h *ctxWaitHandler) Handle(ctx Context) error {
 }
 
 func TestContext_ShutdownCancelsHandlerContext(t *testing.T) {
-	v := noAuthVatel()
+	v := NewVatel()
 	h := newCtxWaitHandler()
 	fctx := newGETCtx("/wait")
 
@@ -1826,7 +1704,7 @@ func TestContext_ShutdownCancelsHandlerContext(t *testing.T) {
 }
 
 func TestContext_ShutdownWithServer_CancelsAfterDeadline(t *testing.T) {
-	v := noAuthVatel()
+	v := NewVatel()
 	h := newCtxWaitHandler()
 	v.Add(Endpoints{GET("/wait", func() Handler { return h })})
 	mux := router.New()
@@ -1835,12 +1713,9 @@ func TestContext_ShutdownWithServer_CancelsAfterDeadline(t *testing.T) {
 	}
 
 	ln := fasthttputil.NewInmemoryListener()
-	v.srv = &fasthttp.Server{Handler: mux.Handler}
-	served := make(chan struct{})
-	go func() {
-		defer close(served)
-		_ = v.srv.Serve(ln)
-	}()
+	served := make(chan error, 1)
+	go func() { served <- v.serve(ln, mux) }()
+	waitServing(t, v)
 
 	conn, err := ln.Dial()
 	if err != nil {
@@ -1865,7 +1740,9 @@ func TestContext_ShutdownWithServer_CancelsAfterDeadline(t *testing.T) {
 	if !strings.HasPrefix(string(raw), "HTTP/1.1 503") {
 		t.Errorf("response = %q, want 503", raw)
 	}
-	<-served
+	if err := <-served; err != nil {
+		t.Errorf("serve = %v, want nil after Shutdown", err)
+	}
 	if err := <-h.errc; !stderrors.Is(err, context.Canceled) {
 		t.Errorf("handler context error = %v, want context.Canceled", err)
 	}
@@ -1876,7 +1753,7 @@ func TestContext_EndpointTimeout(t *testing.T) {
 	var deadlineSet bool
 	fctx := newGETCtx("/wait")
 
-	run(noAuthVatel(), GET("/wait", Func(func(ctx Context) error {
+	run(NewVatel(), GET("/wait", Func(func(ctx Context) error {
 		_, deadlineSet = ctx.Context().Deadline()
 		return h.Handle(ctx)
 	}), WithTimeout(50*time.Millisecond)), fctx)
@@ -1905,7 +1782,7 @@ func TestContext_DefaultTimeout(t *testing.T) {
 		return d, ok
 	}
 
-	v := noAuthVatel(WithDefaultTimeout(time.Hour))
+	v := NewVatel(WithDefaultTimeout(time.Hour))
 
 	d, ok := deadline(v)
 	if !ok || d <= 30*time.Minute || d > time.Hour {
@@ -1919,7 +1796,7 @@ func TestContext_DefaultTimeout(t *testing.T) {
 
 func TestContext_TimeoutCancelledAfterRequest(t *testing.T) {
 	var reqCtx context.Context
-	run(noAuthVatel(), GET("/d", Func(func(ctx Context) error {
+	run(NewVatel(), GET("/d", Func(func(ctx Context) error {
 		reqCtx = ctx.Context()
 		return nil
 	}), WithTimeout(time.Hour)), newGETCtx("/d"))
@@ -1932,7 +1809,7 @@ func TestContext_TimeoutCancelledAfterRequest(t *testing.T) {
 func TestContext_NoTimeout_NoDeadline(t *testing.T) {
 	var reqCtx context.Context
 	var deadlineSet bool
-	run(noAuthVatel(), GET("/d", Func(func(ctx Context) error {
+	run(NewVatel(), GET("/d", Func(func(ctx Context) error {
 		reqCtx = ctx.Context()
 		_, deadlineSet = reqCtx.Deadline()
 		return nil
@@ -1970,7 +1847,7 @@ func TestContext_ErrorStatus(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			fctx := newGETCtx("/e")
-			run(noAuthVatel(), GET("/e", Func(func(Context) error { return tt.err })), fctx)
+			run(NewVatel(), GET("/e", Func(func(Context) error { return tt.err })), fctx)
 			if got := responseStatus(fctx); got != tt.want {
 				t.Errorf("want %d, got %d (%s)", tt.want, got, fctx.Response.Body())
 			}
@@ -1981,7 +1858,7 @@ func TestContext_ErrorStatus(t *testing.T) {
 // ── OnErrorResponse metadata and LogSilent ───────────────────────────────────
 
 func TestHandler_OnErrorResponse_MetaOnAuthorizationReject(t *testing.T) {
-	v := noAuthVatel()
+	v := NewVatel()
 	v.AddMiddleware(OnAuthorization, func(Context, EndpointMeta) error {
 		return ErrForbidden.New()
 	})
@@ -2034,7 +1911,7 @@ func TestHandler_LogSilent(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			var buf bytes.Buffer
-			v := noAuthVatel()
+			v := NewVatel()
 			if c.mdwErr != nil {
 				err := c.mdwErr
 				v.AddMiddleware(OnRequest, func(Context, EndpointMeta) error { return err })
@@ -2076,7 +1953,7 @@ func TestHandler_NotSilent_4xxLogged(t *testing.T) {
 	var buf bytes.Buffer
 	fctx := newGETCtx("/items")
 
-	runLogged(t, noAuthVatel(), GET("/items", func() Handler {
+	runLogged(t, NewVatel(), GET("/items", func() Handler {
 		return &plainHandler{retErr: ErrValidationFailed.New()}
 	}, WithLogOption(LogExit)), fctx, &buf)
 
@@ -2125,7 +2002,7 @@ func TestHandler_UndecodableBody_400(t *testing.T) {
 				h := &undecodableBodyHandler{}
 				fctx := newPOSTCtx("/items", []byte(body))
 
-				run(noAuthVatel(WithVerboseError(verbose)), POST("/items", func() Handler { return h }), fctx)
+				run(NewVatel(WithVerboseError(verbose)), POST("/items", func() Handler { return h }), fctx)
 
 				if got := responseStatus(fctx); got != 400 {
 					t.Fatalf("want 400, got %d: %s", got, fctx.Response.Body())
@@ -2151,7 +2028,7 @@ func TestHandler_UndecodableBody_400(t *testing.T) {
 func TestHandler_OnAuthorization_RunsBeforeBodyDecode(t *testing.T) {
 	for _, reject := range []bool{true, false} {
 		t.Run(fmt.Sprintf("reject=%v", reject), func(t *testing.T) {
-			v := noAuthVatel()
+			v := NewVatel()
 			called := false
 			v.AddMiddleware(OnAuthorization, func(Context, EndpointMeta) error {
 				called = true
@@ -2182,7 +2059,7 @@ func TestHandler_OnAuthorization_RunsBeforeBodyDecode(t *testing.T) {
 // Gostly №9: every middleware gets the endpoint metadata — method, path
 // template (with the URL prefix, not the request path) and perms.
 func TestMiddleware_SeesEndpointMeta(t *testing.T) {
-	v := noAuthVatel(WithUrlPrefix("/api"))
+	v := NewVatel(WithUrlPrefix("/api"))
 	var got []EndpointMeta
 	for _, pos := range []MiddlewarePos{OnRequest, OnAuthentication, OnAuthorization, OnHandle, OnSuccessResponse} {
 		v.AddMiddleware(pos, func(_ Context, m EndpointMeta) error {

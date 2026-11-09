@@ -3,6 +3,8 @@ package vatel
 import (
 	"bytes"
 	"encoding/json"
+	stderrors "errors"
+	"fmt"
 	"reflect"
 	"strconv"
 
@@ -27,10 +29,10 @@ type fieldInfo struct {
 // logParam adds the path or query parameter val to zc under its tag, honouring
 // the field's mask tag: "-" omits it, any other non-empty value logs
 // jsonmask.DefaultMask. Masking functions are not applied to parameters.
-func logParam[V string | []byte](zc zerolog.Context, fi *fieldInfo, val V) zerolog.Context {
+func logParam(zc zerolog.Context, fi *fieldInfo, val string) zerolog.Context {
 	switch fi.mask {
 	case "":
-		return zc.Str(fi.tag, string(val))
+		return zc.Str(fi.tag, val)
 	case "-":
 		return zc
 	default:
@@ -38,47 +40,105 @@ func logParam[V string | []byte](zc zerolog.Context, fi *fieldInfo, val V) zerol
 	}
 }
 
-// buildParamFields reflects on a path-param struct type and returns precomputed
-// field metadata. Path param structs are expected to be flat (no nesting).
-func buildParamFields(t reflect.Type) []fieldInfo {
-	if t.Kind() == reflect.Ptr {
-		t = t.Elem()
+// paramError returns the error of a param value that cannot be parsed. The
+// parse error quotes the value, so it is wrapped only for an unmasked param:
+// a masked value must reach neither the log nor a verbose response.
+func paramError(fi *fieldInfo, err error) error {
+	if fi.mask != "" {
+		return ErrValidationFailed.New().Set("param", fi.tag).Msg("invalid param value")
 	}
-	var fields []fieldInfo
-	for i := 0; i < t.NumField(); i++ {
-		f := t.Field(i)
-		if !f.IsExported() {
-			continue
-		}
-		tag := f.Tag.Get("param")
-		if tag == "" {
-			continue
-		}
-		fields = append(fields, fieldInfo{
-			indices: []int{i},
-			tag:     tag,
-			kind:    f.Type.Kind(),
-			mask:    f.Tag.Get("mask"),
-		})
-	}
-	return fields
+	return ErrValidationFailed.Wrap(err).Set("param", fi.tag)
 }
 
-// buildQueryFields reflects on a query/body input struct type and returns
-// precomputed field metadata, flattening nested structs. A mask tag on a
-// nested struct applies to its fields that have no mask tag of their own.
-func buildQueryFields(t reflect.Type) []fieldInfo {
-	if t.Kind() == reflect.Ptr {
-		t = t.Elem()
+// setParam parses the path or query parameter val into the field sf according
+// to fi. kind names the param source ("path" or "query") in errors.
+func setParam(sf reflect.Value, fi *fieldInfo, val, kind string) error {
+	if fi.isPtr {
+		if sf.IsNil() {
+			sf.Set(reflect.New(sf.Type().Elem()))
+		}
+		sf = sf.Elem()
+	}
+
+	if fi.isDate {
+		d, err := date.Parse(val)
+		if err != nil {
+			return paramError(fi, err)
+		}
+		sf.SetUint(uint64(d))
+		return nil
+	}
+
+	switch fi.kind {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		n, err := strconv.ParseInt(val, 10, 64)
+		if err != nil {
+			return paramError(fi, err)
+		}
+		sf.SetInt(n)
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		n, err := strconv.ParseUint(val, 10, 64)
+		if err != nil {
+			return paramError(fi, err)
+		}
+		sf.SetUint(n)
+	case reflect.String:
+		sf.SetString(val)
+	case reflect.Float32:
+		f, err := strconv.ParseFloat(val, 32)
+		if err != nil {
+			return paramError(fi, err)
+		}
+		sf.SetFloat(f)
+	case reflect.Float64:
+		f, err := strconv.ParseFloat(val, 64)
+		if err != nil {
+			return paramError(fi, err)
+		}
+		sf.SetFloat(f)
+	case reflect.Bool:
+		b, err := strconv.ParseBool(val)
+		if err != nil {
+			return paramError(fi, err)
+		}
+		sf.SetBool(b)
+	default:
+		return ErrValidationFailed.New().
+			Msg("unsupported "+kind+" param type").
+			Set("param", fi.tag).
+			Set("kind", fi.kind.String())
+	}
+	return nil
+}
+
+// buildParamFields reflects on the value returned by Param() and returns
+// precomputed field metadata. It uses the query layout, so path params support
+// the same field types as query params (pointers, date.Date, nested structs).
+func buildParamFields(param interface{}) ([]fieldInfo, error) {
+	return buildQueryFields(param, "Param()")
+}
+
+// buildQueryFields reflects on in, the value returned by QueryInput() or
+// Input() (named by method in errors), and returns precomputed field metadata,
+// flattening nested structs. A mask tag on a nested struct applies to its
+// fields that have no mask tag of their own. in must be a non-nil pointer to a
+// struct. A nested struct whose type is already being flattened (a cycle such
+// as a Parent *Filter field) is skipped.
+func buildQueryFields(in interface{}, method string) ([]fieldInfo, error) {
+	t := reflect.TypeOf(in)
+	if t == nil || t.Kind() != reflect.Ptr || t.Elem().Kind() != reflect.Struct {
+		return nil, fmt.Errorf("%s must return a pointer to a struct, got %v", method, t)
 	}
 	var fields []fieldInfo
-	flattenQueryFields(t, nil, "", &fields)
-	return fields
+	flattenQueryFields(t.Elem(), nil, "", map[reflect.Type]bool{}, &fields)
+	return fields, nil
 }
 
 var dateType = reflect.TypeOf(date.Date(0))
 
-func flattenQueryFields(t reflect.Type, path []int, parentMask string, fields *[]fieldInfo) {
+func flattenQueryFields(t reflect.Type, path []int, parentMask string, visiting map[reflect.Type]bool, fields *[]fieldInfo) {
+	visiting[t] = true
+	defer delete(visiting, t)
 	for i := 0; i < t.NumField(); i++ {
 		f := t.Field(i)
 		if !f.IsExported() {
@@ -115,7 +175,9 @@ func flattenQueryFields(t reflect.Type, path []int, parentMask string, fields *[
 
 		if ft.Kind() == reflect.Struct {
 			// Recurse into nested struct (embedded or named field without a tag).
-			flattenQueryFields(ft, indices, mask, fields)
+			if !visiting[ft] {
+				flattenQueryFields(ft, indices, mask, visiting, fields)
+			}
 			continue
 		}
 
@@ -167,41 +229,8 @@ func decodeParams(fctx *fasthttp.RequestCtx, param interface{}, fields []fieldIn
 			return zc, ErrInternalError.New().Set("param", fi.tag).Msg("path param is not a string")
 		}
 		zc = logParam(zc, fi, val)
-
-		sf := s.Field(fi.indices[0])
-
-		switch fi.kind {
-		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-			n, err := strconv.ParseInt(val, 10, 64)
-			if err != nil {
-				return zc, ErrValidationFailed.Wrap(err).Set("param", fi.tag)
-			}
-			sf.SetInt(n)
-		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-			n, err := strconv.ParseUint(val, 10, 64)
-			if err != nil {
-				return zc, ErrValidationFailed.Wrap(err).Set("param", fi.tag)
-			}
-			sf.SetUint(n)
-		case reflect.String:
-			sf.SetString(val)
-		case reflect.Bool:
-			b, err := strconv.ParseBool(val)
-			if err != nil {
-				return zc, ErrValidationFailed.Wrap(err).Set("param", fi.tag)
-			}
-			sf.SetBool(b)
-		case reflect.Float32, reflect.Float64:
-			f, err := strconv.ParseFloat(val, 64)
-			if err != nil {
-				return zc, ErrValidationFailed.Wrap(err).Set("param", fi.tag)
-			}
-			sf.SetFloat(f)
-		default:
-			return zc, ErrValidationFailed.New().
-				Msg("unsupported path param type").
-				Set("param", fi.tag).
-				Set("kind", fi.kind.String())
+		if err := setParam(fieldByIndices(s, fi.indices), fi, val, "path"); err != nil {
+			return zc, err
 		}
 	}
 	return zc, nil
@@ -216,67 +245,12 @@ func decodeURLQuery(fctx *fasthttp.RequestCtx, input interface{}, fields []field
 	for i := range fields {
 		fi := &fields[i]
 		val := fctx.QueryArgs().Peek(fi.tag)
-		zc = logParam(zc, fi, val)
+		zc = logParam(zc, fi, string(val))
 		if val == nil {
 			continue
 		}
-
-		sf := fieldByIndices(s, fi.indices)
-
-		if fi.isDate {
-			d, err := date.Parse(string(val))
-			if err != nil {
-				return zc, ErrValidationFailed.Wrap(err).Set("param", fi.tag)
-			}
-			sf.SetUint(uint64(d))
-			continue
-		}
-
-		if fi.isPtr {
-			if sf.IsNil() {
-				sf.Set(reflect.New(sf.Type().Elem()))
-			}
-			sf = sf.Elem()
-		}
-
-		switch fi.kind {
-		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-			n, err := strconv.ParseInt(string(val), 10, 64)
-			if err != nil {
-				return zc, ErrValidationFailed.Wrap(err).Set("param", fi.tag)
-			}
-			sf.SetInt(n)
-		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-			n, err := strconv.ParseUint(string(val), 10, 64)
-			if err != nil {
-				return zc, ErrValidationFailed.Wrap(err).Set("param", fi.tag)
-			}
-			sf.SetUint(n)
-		case reflect.String:
-			sf.SetString(string(val))
-		case reflect.Float32:
-			f, err := strconv.ParseFloat(string(val), 32)
-			if err != nil {
-				return zc, ErrValidationFailed.Wrap(err).Set("param", fi.tag)
-			}
-			sf.SetFloat(f)
-		case reflect.Float64:
-			f, err := strconv.ParseFloat(string(val), 64)
-			if err != nil {
-				return zc, ErrValidationFailed.Wrap(err).Set("param", fi.tag)
-			}
-			sf.SetFloat(f)
-		case reflect.Bool:
-			b, err := strconv.ParseBool(string(val))
-			if err != nil {
-				return zc, ErrValidationFailed.Wrap(err).Set("param", fi.tag)
-			}
-			sf.SetBool(b)
-		default:
-			return zc, ErrValidationFailed.New().
-				Msg("unsupported query param type").
-				Set("param", fi.tag).
-				Set("kind", fi.kind.String())
+		if err := setParam(fieldByIndices(s, fi.indices), fi, string(val), "query"); err != nil {
+			return zc, err
 		}
 	}
 	return zc, nil
@@ -285,8 +259,9 @@ func decodeURLQuery(fctx *fasthttp.RequestCtx, input interface{}, fields []field
 // decodeBody unmarshals the request body JSON into dest. A body that is empty
 // or contains only whitespace is rejected with ErrInvalidRequestBody unless
 // optional is true, in which case dest is left untouched and decoded is false.
+// masked reports whether the type of dest has mask rules (see jsonDecodeError).
 // Validation is a separate step (see validate).
-func decodeBody(body []byte, dest interface{}, optional bool) (decoded bool, err error) {
+func decodeBody(body []byte, dest interface{}, optional, masked bool) (decoded bool, err error) {
 	if len(bytes.TrimSpace(body)) == 0 {
 		if optional {
 			return false, nil
@@ -294,9 +269,35 @@ func decodeBody(body []byte, dest interface{}, optional bool) (decoded bool, err
 		return false, ErrInvalidRequestBody.New().Msg("empty request body, JSON expected")
 	}
 	if err := json.Unmarshal(body, dest); err != nil {
-		return false, ErrInvalidRequestBody.Wrap(err).Msg("request body is not valid JSON")
+		return false, jsonDecodeError(err, masked, "request body is not valid JSON")
 	}
 	return true, nil
+}
+
+// jsonDecodeError returns ErrInvalidRequestBody with message msg for the
+// json.Unmarshal error err. The text of err may quote the input (a number
+// that does not fit the field, a time.Time or ",string" value, a custom
+// UnmarshalJSON error), so when the target type has mask rules err is not
+// wrapped: a masked value must reach neither the log nor a verbose response.
+// Only value-free details are kept then: the field, its Go type and the
+// offset of a type mismatch, the offset of a syntax error.
+func jsonDecodeError(err error, masked bool, msg string) error {
+	if !masked {
+		return ErrInvalidRequestBody.Wrap(err).Msg(msg)
+	}
+	e := ErrInvalidRequestBody.New().Msg(msg)
+	var te *json.UnmarshalTypeError
+	var se *json.SyntaxError
+	switch {
+	case stderrors.As(err, &te):
+		e = e.Set("field", te.Field).Set("offset", te.Offset)
+		if te.Type != nil {
+			e = e.Set("type", te.Type.String())
+		}
+	case stderrors.As(err, &se):
+		e = e.Set("offset", se.Offset)
+	}
+	return e
 }
 
 // validate calls Validate() if in implements Validator. A validation error is

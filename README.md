@@ -136,7 +136,8 @@ func main() {
 	}
 
 	go func() {
-		if err := v.ListenAndServe(":8080", mux, &log); err != nil {
+		// nil after Shutdown; ErrServerClosed if Shutdown ran first.
+		if err := v.ListenAndServe(":8080", mux, &log); err != nil && !errors.Is(err, vatel.ErrServerClosed) {
 			log.Fatal().Err(err).Msg("server stopped")
 		}
 	}()
@@ -165,7 +166,9 @@ GET /orders/1   (no token)                -> 401 {"msg":"authentication required
 POST /orders    {"product":""}            -> 400 {"msg":"validation failed","severity":"tiny","code":"VTL-0006","statusCode":400,"reason":"product is required"}
 ```
 
-`GET /` is registered automatically and returns an HTML list of all endpoints.
+`GET /` (under `WithUrlPrefix`, if set) is registered automatically and returns an HTML
+list of all endpoints, WS endpoints included. It is public and cannot be replaced: your
+own `GET /` makes `BuildHandlers` fail. Keep in mind that it exposes the route list.
 
 ## Endpoints
 
@@ -197,7 +200,7 @@ with `v.Add(...)`.
 | `vatel.WithLogOption(lo)` | Log verbosity of the endpoint (see [Logging](#logging)). |
 | `vatel.WithSuccessStatusCode(code)` | Status of a successful response (default 200). Overrides a status set by the handler. |
 | `vatel.WithManualStatusCode()` | vatel does not set the success status; the handler calls `ctx.SetStatusCode`. |
-| `vatel.WithContentType(ct)` | Response `Content-Type` (default `application/json; charset=utf-8`). |
+| `vatel.WithContentType(ct)` | `Content-Type` of the `Resulter` body (default `application/json; charset=utf-8`); the body is still JSON-marshalled. A handler writing to `ctx.BodyWriter()` sets the type itself with `ctx.SetContentType`. |
 | `vatel.WithCompress()` | Wraps the handler in `fasthttp.CompressHandler`. |
 | `vatel.WithOptionalBody()` | POST/PUT/PATCH: an empty body is accepted (see below). |
 | `vatel.WithTimeout(d)` | Timeout of the request context (see [Request context](#request-context-timeouts-and-shutdown)). |
@@ -210,9 +213,14 @@ per-endpoint middleware with `e.AddMiddleware(pos, f)`.
 
 `v.BuildHandlers(mux, &log)` validates every endpoint and registers it with the router.
 It returns an error for, among others: a path with `{params}` and a controller that is not
-a `Paramer` (or the reverse), `WithOptionalBody` on GET/DELETE/HEAD/OPTIONS, an unknown
-method, a WS endpoint without `WithWebsocketSupport`, a duplicate WS path, WS `Perms`
-without `WithWsAuthFunc`. `MustBuildHandlers` panics instead.
+a `Paramer` (or the reverse), a path that does not begin with `/`, a route the router
+rejects (a duplicate or conflicting path, your own `GET /`), `WithOptionalBody` on
+GET/DELETE/HEAD/OPTIONS, an unknown method, a WS endpoint without `WithWebsocketSupport`,
+a duplicate WS path, WS `Perms` without `WithWsAuthFunc`. `MustBuildHandlers` panics
+instead.
+
+Add endpoints (`v.Add`) and middleware (`v.AddMiddleware`) before `BuildHandlers`: it
+copies them, later additions have no effect.
 
 `BuildHandlers` may be called once. Registration is not transactional: after a failed
 build the router may hold part of the routes, so the `Vatel` is unusable; further
@@ -220,8 +228,12 @@ build the router may hold part of the routes, so the `Vatel` is unusable; furthe
 `Vatel` and router.
 
 `v.ListenAndServe(addr, mux, &log)` builds the handlers if that has not been done yet and
-starts a `fasthttp.Server`. You can also serve `mux.Handler` with your own server; then
-`Shutdown` only cancels request contexts and closes WebSocket connections.
+starts a `fasthttp.Server` with `IdleTimeout` = `vatel.DefaultIdleTimeout` (90 s) and
+`CloseOnShutdown`. `vatel.WithServerConfig(func(*fasthttp.Server))` changes it (e.g.
+`ReadTimeout`, `MaxRequestBodySize`). After `Shutdown` it returns nil; called after
+`Shutdown`, it returns `vatel.ErrServerClosed`. You can also serve `mux.Handler` with your
+own server; then `Shutdown` only cancels request contexts and closes WebSocket
+connections.
 
 ## Controllers and carriers
 
@@ -348,9 +360,12 @@ func (f *SearchFilter) Validate() error {
 }
 ```
 
-The client sees the message "validation failed". A plain `errors.New("...")` text from
-`Validate()` reaches the client only with verbose errors; to show a reason, set an error
-field and list it in `WithClientErrorFields` (see [Errors](#errors)).
+The client sees the message "validation failed" with status 400: any status of the
+returned error (409, 422, ...) is replaced by 400; its code and fields are kept. A plain
+`errors.New("...")` text from `Validate()` reaches the client only with verbose errors; to
+show a reason, set an error field and list it in `WithClientErrorFields` (see
+[Errors](#errors)). `Validate()` is called on `Querier` and `Inputer` input only, not on a
+`PathParams` struct.
 
 ### Optional request body
 
@@ -375,7 +390,7 @@ a position in the pipeline:
 | `OnAuthentication` | Decode the token, set the token payload (`auth.Config.Middleware`). |
 | `OnAuthorization` | Check access (`auth.RequireAuth`, `auth.RequirePerms`). Runs **before** input decoding. |
 | `OnHandle` | After input decoding and validation, before `Handle`. Per-user limits, audit. |
-| `OnSuccessResponse` | After a successful response is written. The error is ignored. |
+| `OnSuccessResponse` | After a successful response is written. The error is ignored: the response is not changed and later middleware still runs. |
 | `OnErrorResponse` | After an error response is written. The error is ignored. |
 
 Global middleware is added with `v.AddMiddleware(pos, f...)`, per-endpoint middleware with
@@ -438,10 +453,16 @@ v.Add(vatel.Endpoints{
 - `RequirePerms(map[string]uint)` maps permission names to bit positions. It rejects a
   request without a valid token (401) or without all bits (403 `VTL-0003`). The names are
   appended, sorted, to `EndpointMeta.Perms`. A nil `Authorizer` gives 500 instead of a panic.
-- `Config.Disabled = true` turns all checks off; it is read on every request.
+- `Config.Decoder` is required with `Middleware()`. It and `RevokeCheck` receive the raw
+  `Authorization` header value; nothing strips a `Bearer ` prefix, so strip it in the
+  decoder. A nil `Decoder` or a `RevokeCheck` error fails `RequireAuth`/`RequirePerms`
+  endpoints with 500 `VTL-0005`; public endpoints serve the request as unauthenticated.
+- `Config.Disabled = true` turns all checks off; it is read on every request without
+  synchronisation, so set it before the server starts serving.
 
-The payload must implement `vatel.AuthPayload` (`Perms() []byte`, `Debug() bool`); handlers
-type-assert `ctx.TokenPayload()` to the concrete type. `vatel.Perms(...)` alone does not
+The payload must implement `vatel.AuthPayload` (`Perms() []byte`, `Debug() bool`; the
+vatel core does not call them, `vatel/auth` does); handlers type-assert
+`ctx.TokenPayload()` to the concrete type. `vatel.Perms(...)` alone does not
 protect an HTTP endpoint.
 
 ## Errors
@@ -458,7 +479,9 @@ return ErrOrderLocked.New().Set("orderId", id).Set("reason", "payment in progres
 return ErrOrderLocked.Wrap(err)
 ```
 
-The client receives the message, severity, code and status:
+The client receives the message, severity, code and status of the first `*errors.Error`
+(or `*errors.ErrorTemplate`) in the error chain; a `fmt.Errorf("...: %w", err)` wrapper
+keeps its status and the wrapper text is not sent:
 
 ```json
 {"msg":"order is locked","severity":"medium","code":"APP-0042","statusCode":409}
@@ -480,6 +503,12 @@ requests by `vatel.WithVerboseError(true)`, or per request by a token whose payl
 `Debug()` returns true (or by middleware calling `ctx.SetVerboseError(true)`). Use them in
 development only.
 
+An error chain without `*errors.Error` (a driver error, `errors.New`, `fmt.Errorf`) may
+carry internal text, so the client gets a generic error instead: `{"msg":"internal
+error",...,"code":"VTL-0005","statusCode":500}`, or "service unavailable" / "gateway
+timeout" for 503/504. The original error is logged. With verbose errors the client gets
+the original text.
+
 Status of an error without its own status (a plain `error`, or an `*errors.Error` with
 status 0): 504 if the chain contains `context.DeadlineExceeded`, 503 for
 `context.Canceled`, 500 otherwise. An error with status 429 and a `Retry-After` field sets
@@ -490,7 +519,7 @@ Predefined errors:
 
 | Error | Code | Status |
 |---|---|---|
-| `ErrAuthorizationHeaderMissed` | VTL-0001 | 401 |
+| `ErrAuthorizationHeaderMissed` | VTL-0001 | 401 (deprecated: no longer returned, kept for compatibility) |
 | `ErrAccessTokenRevoked` | VTL-0002 | 401 |
 | `ErrForbidden` | VTL-0003 | 403 |
 | `ErrUnauthorized` | VTL-0004 | 401 |
@@ -501,7 +530,10 @@ Predefined errors:
 ## Logging
 
 vatel logs with [zerolog](https://github.com/rs/zerolog). Each endpoint logger carries
-`method`, `path` and `client` (real IP); `WithRequestID()` adds `reqId`.
+`method`, `path` and `client` (real IP); `WithRequestID()` adds `reqId`. `path` is the
+path as registered, without the `WithUrlPrefix` prefix (`EndpointMeta.Path` and metrics
+include it). The "new request" and exit lines are logged at debug level, so a logger at
+info level hides them; errors are logged at error level.
 
 What is logged is a bitmask (`LogOption`):
 
@@ -509,10 +541,10 @@ What is logged is a bitmask (`LogOption`):
 |---|---|---|
 | `LogEnter` | `enter` | a "new request" line when the request arrives |
 | `LogExit` | `exit` | a line when the request completes, with `dur` |
-| `LogReqBody` | `req-body` | raw request body as `requestBody` |
+| `LogReqBody` | `req-body` | request body as `requestBody`: compacted JSON, or, for an input type with `mask` tags, the decoded input marshalled and masked |
 | `LogReqInput` | `req-input` | decoded input as `reqInput` (`Inputer`) and `reqQuery` (`Querier`) |
 | `LogRespBody` | `resp-body` | response body as `respBody` |
-| `LogRespOutput` | `resp-out` | response as `result` |
+| `LogRespOutput` | `resp-out` | response as `result`, only when `LogRespBody` is not set (the same masked JSON is not logged twice) |
 | `LogSilent` | `silent` | nothing except 5xx errors; overrides all other bits |
 
 Presets: `LogFull` (enter, exit, request body and input, response body), `LogFullOnExit`
@@ -564,15 +596,22 @@ type LoginInput struct {
 - Masked log keys: `requestBody`, `reqInput`, `reqQuery`, `respBody`, `result`, including
   elements of arrays (`Body[[]T]`, `Output[[]T]`) and `OptionalOutput[T]`. If masking
   fails only the error is logged (`requestBodyMaskingFailed`, `reqInputMaskingFailed`,
-  `respMaskingFailed`), never the unmasked value.
+  `respBodyMaskingFailed` or `resultMaskingFailed`), never the unmasked value.
+- The request body of an input type with `mask` tags is logged as the decoded input, not
+  as the raw body: `encoding/json` also decodes keys in another letter case
+  (`"Password"`) and the last of duplicate keys, which a path-based masker would miss. A
+  body that cannot be decoded is then not logged (`requestBodyLoggingFailed`).
 - Tags are honoured in nested structs, `*Struct`, `[]Struct`, `[]*Struct` and recursive
   types. A tagged field is a leaf: a tagged struct, pointer or slice (e.g. `time.Time`) is
-  masked or removed as a whole. A tag on an embedded struct applies to each promoted field.
+  masked or removed as a whole. A tag on an embedded struct applies to each promoted field
+  without a tag of its own.
   Maps and `interface{}` values are not visited. Fields absent from the JSON
   (`omitempty`) are not added.
 - **Path and query parameters**: `mask:"-"` omits the parameter from the log, any other
   non-empty `mask` logs `"***"`. Masking functions are not applied to parameters. A `mask`
   tag on a nested struct of a query input applies to its fields without their own tag.
+  An invalid value of a masked parameter gives 400 without the value in the error (not
+  even in verbose responses).
 
 ```go
 type ResetPassword struct {
@@ -591,10 +630,18 @@ Types without `mask` tags are logged unchanged.
 
 `ctx.Context()` returns a Go context for the request; pass it to database and HTTP calls.
 
-- It is a child of a base context owned by the `Vatel`. `v.Shutdown(ctx)` closes WebSocket
-  connections, waits for in-flight requests (until `ctx` is done), then cancels the base
-  context, so handlers still running get `context.Canceled`. Without a server started by
-  `ListenAndServe`, the base context is cancelled at once. Calling `Shutdown` again is safe.
+- It is a child of a base context owned by the `Vatel`. `v.Shutdown(ctx)`:
+  1. closes WebSocket connections and stops accepting new connections;
+  2. waits until no request is in flight. Idle keep-alive connections do not hold it up:
+     the server closes them on their next request (the response carries
+     `Connection: close`) or after the idle timeout;
+  3. cancels the base context and returns nil.
+
+  When `ctx` is done first, the base context is cancelled at once, so handlers still
+  running get `context.Canceled` (503); `Shutdown` waits up to one more second for them
+  to finish and returns `ctx.Err()`. Requests that start after `Shutdown` get a cancelled
+  context. Without a server started by `ListenAndServe`, the base context is cancelled at
+  once. Calling `Shutdown` again is safe.
 - `vatel.WithTimeout(d)` (endpoint) and `vatel.WithDefaultTimeout(d)` (`Vatel`, for
   endpoints without their own timeout) add a deadline. Such a context is also cancelled
   when the request ends.
@@ -698,13 +745,21 @@ mux.GET("/ws", wv.Upgrade) // the HTTP route that upgrades to WebSocket
 ```
 
 - The built-in endpoint `updateAccessToken` (`data`: `{"mid": "<uuid>", "at": "<token>"}`)
-  decodes the token with `WithTokenDecoder`, stores the payload for the connection and
-  calls the `OnTokenUpdate` callback; an error from the callback is sent to the client.
-  The stored payload is available as `ctx.TokenPayload()` in later messages.
+  decodes the token with `WithTokenDecoder` and calls the `OnTokenUpdate` callback; unless
+  the callback returns an error, it stores the payload for the connection. An error from
+  the callback rejects the token (the connection keeps its previous payload) and is sent
+  to the client; a token that cannot be decoded gives 401 `VTL-0004`. Without
+  `WithTokenDecoder` it replies `"Ok"` and stores nothing. The stored payload is available
+  as `ctx.TokenPayload()` in later messages.
 - `WithWsAuthFunc` is called for every message with the endpoint's `Perms`; WS endpoints
   with `Perms` require it. HTTP middleware does not run for WS messages.
-- Invalid `data` gives a 400 `VTL-0007` error message. Errors are logged and reported to
-  metrics and the `Alarmer` like HTTP errors.
+- Invalid `data` gives a 400 `VTL-0007` error message. Errors are sent, logged and
+  reported to metrics and the `Alarmer` like HTTP errors.
+- WS handlers have no Go context: `WithTimeout`, `WithDefaultTimeout` and the `Shutdown`
+  cancellation do not apply. `LogReqBody`/`LogReqInput` are ignored. `WithRequestID` logs
+  `connectionId` instead of `reqId`.
+- `vatel.WithLogger(l)` sets the logger of WS endpoints (lines get `"layer":"ws"`);
+  without it they log to the logger passed to `BuildHandlers`.
 - `OnOpen` and `OnClose` register connection callbacks. `v.Shutdown` closes all WebSocket
   connections with a "going away" status first.
 
@@ -720,9 +775,10 @@ mux.GET("/ws", wv.Upgrade) // the HTTP route that upgrades to WebSocket
 | `WithStaticLoggingLevel()` | Ignore the `X-Set-Log-Level` header. |
 | `WithDefaultTimeout(d)` | Request context timeout of endpoints without their own. |
 | `WithJsonMasker(jm)` | Masker for logged JSON (default `jsonmask.New()`). |
-| `WithMetricReporter(mr)` | `ReportMetric(method, path, statusCode, durSeconds, size)` per request; `path` is the template. |
+| `WithMetricReporter(mr)` | `ReportMetric(method, path, statusCode, durSeconds, size)` per request; `path` is the template; `size` is 0 for HEAD. |
 | `WithAlarmer(a)` | `Alarm(err)` for errors with status >= 500. |
 | `WithWebsocketSupport(wv)` | Enables WS endpoints. |
+| `WithServerConfig(f)` | Configures the `fasthttp.Server` started by `ListenAndServe`. |
 
 ## License
 

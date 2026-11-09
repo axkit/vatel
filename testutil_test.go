@@ -10,19 +10,12 @@ import (
 // ── Mock implementations ─────────────────────────────────────────────────────
 
 type mockPayload struct {
-	user  int
-	login string
-	role  int
 	perms []byte
 	debug bool
 }
 
-func (m *mockPayload) User() int          { return m.user }
-func (m *mockPayload) Login() string      { return m.login }
-func (m *mockPayload) Role() int          { return m.role }
-func (m *mockPayload) Perms() []byte      { return m.perms }
-func (m *mockPayload) Extra() interface{} { return nil }
-func (m *mockPayload) Debug() bool        { return m.debug }
+func (m *mockPayload) Perms() []byte { return m.perms }
+func (m *mockPayload) Debug() bool   { return m.debug }
 
 type mockTokener struct{ payload AuthPayload }
 
@@ -35,20 +28,6 @@ type mockDecoder struct {
 }
 
 func (m *mockDecoder) Decode([]byte) (Tokener, error) { return m.token, m.err }
-
-type mockAuthorizer struct {
-	allowed bool
-	err     error
-}
-
-func (m *mockAuthorizer) IsAllowed([]byte, ...uint) (bool, error) { return m.allowed, m.err }
-
-type mockRevoker struct {
-	revoked bool
-	err     error
-}
-
-func (m *mockRevoker) IsTokenRevoked(string) (bool, error) { return m.revoked, m.err }
 
 type mockMetrics struct {
 	lastMethod string
@@ -149,82 +128,6 @@ func (h *tokenHandler) Handle(ctx Context) error {
 func discardLogger() *zerolog.Logger {
 	l := zerolog.New(io.Discard)
 	return &l
-}
-
-// noAuthVatel returns a Vatel with no auth middleware attached.
-func noAuthVatel(opts ...func(*Option)) *Vatel {
-	return NewVatel(opts...)
-}
-
-// authVatel returns a Vatel with mock auth middleware and an auth.Config for
-// building per-endpoint RequirePerms options.
-func authVatel(allowed bool) (*Vatel, *mockDecoder, *mockAuthorizer, *testAuthConfig) {
-	payload := &mockPayload{login: "alice", role: 1, perms: []byte{0xFF}}
-	token := &mockTokener{payload: payload}
-	dec := &mockDecoder{token: token}
-	auth := &mockAuthorizer{allowed: allowed}
-
-	v := NewVatel()
-
-	cfg := authConfig(dec, auth)
-	v.AddMiddleware(OnAuthentication, cfg.Middleware())
-
-	return v, dec, auth, cfg
-}
-
-// authConfig builds a vatel/auth-style Config from mock dependencies.
-// Imported inline here to avoid importing the subpackage from _test files.
-type testAuthConfig struct {
-	dec  *mockDecoder
-	auth *mockAuthorizer
-}
-
-func authConfig(dec *mockDecoder, auth *mockAuthorizer) *testAuthConfig {
-	return &testAuthConfig{dec: dec, auth: auth}
-}
-
-func (c *testAuthConfig) Middleware() func(Context, EndpointMeta) error {
-	return func(ctx Context, _ EndpointMeta) error {
-		at := ctx.Header("Authorization")
-		if len(at) == 0 {
-			return nil
-		}
-		token, err := c.dec.Decode(at)
-		if err != nil {
-			return ErrUnauthorized.Wrap(err)
-		}
-		ctx.SetTokenPayload(token.ApplicationPayload())
-		return nil
-	}
-}
-
-func (c *testAuthConfig) RequirePerms(perms map[string]uint) EndpointOption {
-	bits := make([]uint, 0, len(perms))
-	names := make([]string, 0, len(perms))
-	for name, bit := range perms {
-		names = append(names, name)
-		bits = append(bits, bit)
-	}
-	return func(e *Endpoint) {
-		e.AddMiddleware(OnAuthorization, func(ctx Context, _ EndpointMeta) error {
-			tp := ctx.TokenPayload()
-			if tp == nil {
-				return ErrUnauthorized.New().Set("perms", names)
-			}
-			pa, ok := tp.(interface{ Perms() []byte })
-			if !ok {
-				return ErrUnauthorized.New()
-			}
-			allowed, err := c.auth.IsAllowed(pa.Perms(), bits...)
-			if err != nil {
-				return ErrUnauthorized.Wrap(err)
-			}
-			if !allowed {
-				return ErrForbidden.New().Set("perms", names)
-			}
-			return nil
-		})
-	}
 }
 
 // compileAndRun compiles e against v, then invokes the resulting handler on fctx.

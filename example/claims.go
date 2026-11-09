@@ -21,7 +21,8 @@ type Claims struct {
 	IsDebug   bool   `json:"debug"`
 }
 
-// Perms and Debug satisfy vatel.AuthPayload (used by the WS auth layer).
+// Perms and Debug satisfy vatel.AuthPayload: vatel/auth uses Perms for
+// RequirePerms and Debug to turn on verbose errors for the request.
 func (c *Claims) Perms() []byte { return c.PermBytes }
 func (c *Claims) Debug() bool   { return c.IsDebug }
 

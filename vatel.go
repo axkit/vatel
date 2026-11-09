@@ -2,9 +2,13 @@ package vatel
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
+	"net"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/axkit/vatel/jsonmask"
@@ -13,9 +17,10 @@ import (
 	"github.com/valyala/fasthttp"
 )
 
-// AuthPayload is the minimal interface the framework requires from a decoded
-// token. It carries only what vatel needs internally: permission bytes for the
-// authorization check and a debug flag for verbose error responses.
+// AuthPayload is the application part of a decoded token, returned by
+// Tokener.ApplicationPayload. The vatel core does not call its methods; they
+// are used by vatel/auth: Perms for the permission check of RequirePerms and
+// Debug to turn on verbose error responses for the request.
 //
 // Handlers retrieve the payload via ctx.TokenPayload() and type-assert it to
 // their concrete type (e.g. ctx.TokenPayload().(MyJWTClaims)).
@@ -62,7 +67,6 @@ type Vatel struct {
 	ep    []Endpoint
 	mdw   middlewareSet
 	cfg   Option
-	srv   *fasthttp.Server
 	built bool
 	// buildErr is the error of a failed BuildHandlers. The router may hold the
 	// routes registered before the failure, so the Vatel is unusable after it.
@@ -73,7 +77,28 @@ type Vatel struct {
 	// channel, closed only by Server.Shutdown.
 	baseCtx context.Context
 	cancel  context.CancelFunc
+
+	// inflight counts HTTP requests being processed by vatel endpoints.
+	inflight atomic.Int64
+
+	mu     sync.Mutex       // guards the fields below
+	srv    *fasthttp.Server // server started by ListenAndServe
+	ln     net.Listener     // its listener
+	served chan struct{}    // closed when the server stops accepting connections
+	closed bool             // Shutdown was called
 }
+
+// DefaultIdleTimeout is the IdleTimeout of the server started by
+// ListenAndServe: a keep-alive connection without a new request is closed
+// after it. Change it with WithServerConfig.
+const DefaultIdleTimeout = 90 * time.Second
+
+// shutdownGrace is how long Shutdown waits, after it has cancelled the
+// request contexts, for the cancelled requests to finish.
+const shutdownGrace = time.Second
+
+// ErrServerClosed is returned by ListenAndServe called after Shutdown.
+var ErrServerClosed = stderrors.New("vatel: server closed")
 
 // NewVatel returns a new Vatel instance. The root GET / endpoint (table of
 // contents) is registered automatically.
@@ -100,6 +125,15 @@ type Option struct {
 	ala                Alarmer
 	mr                 MetricReporter
 	wv                 *WebsocketVatel
+	serverConfig       func(*fasthttp.Server)
+}
+
+// WithServerConfig sets a function that configures the fasthttp.Server
+// started by ListenAndServe, e.g. its ReadTimeout or MaxRequestBodySize. It is
+// called after vatel has set Handler, IdleTimeout (DefaultIdleTimeout) and
+// CloseOnShutdown (true). Do not replace Handler.
+func WithServerConfig(f func(*fasthttp.Server)) func(*Option) {
+	return func(o *Option) { o.serverConfig = f }
 }
 
 func WithMetricReporter(mr MetricReporter) func(*Option) {
@@ -170,14 +204,20 @@ func (v *Vatel) Endpoints() []Endpoint { return v.ep }
 
 // MustBuildHandlers registers all endpoints with the router. Panics on error.
 func (v *Vatel) MustBuildHandlers(mux *router.Router, l *zerolog.Logger) {
-	if err := v.buildHandlers(mux, l); err != nil {
+	if err := v.BuildHandlers(mux, l); err != nil {
 		panic(err.Error())
 	}
 }
 
 // BuildHandlers registers all endpoints with the router. It returns an error
-// instead of panicking: an invalid endpoint, a WS endpoint without
-// WithWebsocketSupport or a duplicate WS path.
+// instead of panicking: an invalid endpoint (e.g. a Param(), QueryInput() or
+// GET Input() that does not return a pointer to a struct), a path that does
+// not begin with "/", a route the router rejects (a duplicate or conflicting path, or an own
+// GET "/", which is taken by the built-in endpoint list), a WS endpoint
+// without WithWebsocketSupport or a duplicate WS path.
+//
+// Middleware (AddMiddleware) and endpoints (Add) must be added before
+// BuildHandlers: it copies them, later additions have no effect.
 //
 // BuildHandlers may be called only once. Registration is not transactional:
 // after a failed build the router may already hold some of the routes and
@@ -185,10 +225,6 @@ func (v *Vatel) MustBuildHandlers(mux *router.Router, l *zerolog.Logger) {
 // or ListenAndServe returns a "previous build failed" error; create a new
 // Vatel and router instead.
 func (v *Vatel) BuildHandlers(mux *router.Router, l *zerolog.Logger) error {
-	return v.buildHandlers(mux, l)
-}
-
-func (v *Vatel) buildHandlers(mux *router.Router, l *zerolog.Logger) error {
 	if v.built {
 		if v.buildErr != nil {
 			return fmt.Errorf("vatel: previous build failed: %w", v.buildErr)
@@ -234,15 +270,29 @@ func (v *Vatel) registerEndpoints(mux *router.Router, l *zerolog.Logger) error {
 		if err := e.compile(v); err != nil {
 			return err
 		}
+		h := e.handler(&logger)
 		if e.Compress {
-			mux.Handle(e.Method, e.Path, fasthttp.CompressHandler(e.handler(&logger)))
-		} else {
-			mux.Handle(e.Method, e.Path, e.handler(&logger))
+			h = fasthttp.CompressHandler(h)
+		}
+		if err := handle(mux, e.Method, e.Path, h); err != nil {
+			return err
 		}
 
 		logger.Info().Msg("handler registered")
 	}
 
+	return nil
+}
+
+// handle registers h with the router, returning the router's panic (a
+// duplicate or conflicting route) as an error.
+func handle(mux *router.Router, method, path string, h fasthttp.RequestHandler) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("endpoint %s %s: %v", method, path, r)
+		}
+	}()
+	mux.Handle(method, path, h)
 	return nil
 }
 
@@ -255,51 +305,172 @@ func (v *Vatel) AddMiddleware(pos MiddlewarePos, f ...func(Context, EndpointMeta
 // ListenAndServe compiles all endpoints (unless BuildHandlers was already
 // called), starts the HTTP server on addr, and blocks until the server stops.
 // The caller retains ownership of mux so that non-vatel routes can be added
-// before calling this method.
+// before calling this method. The server is configured with
+// DefaultIdleTimeout and CloseOnShutdown; see WithServerConfig.
 //
-// Use Shutdown to stop the server gracefully.
+// Use Shutdown to stop the server gracefully; ListenAndServe then returns
+// nil. Called after Shutdown, it returns ErrServerClosed without starting.
 func (v *Vatel) ListenAndServe(addr string, mux *router.Router, l *zerolog.Logger) error {
-	if !v.built {
-		if err := v.buildHandlers(mux, l); err != nil {
+	if !v.built || v.buildErr != nil {
+		if err := v.BuildHandlers(mux, l); err != nil {
 			return err
 		}
-	} else if v.buildErr != nil {
-		return fmt.Errorf("vatel: previous build failed: %w", v.buildErr)
 	}
-	v.srv = &fasthttp.Server{Handler: mux.Handler}
-	return v.srv.ListenAndServe(addr)
+	ln, err := net.Listen("tcp4", addr)
+	if err != nil {
+		return err
+	}
+	return v.serve(ln, mux)
 }
 
-// Shutdown gracefully stops the server. It first closes all active WebSocket
-// connections (clients receive a "going away" frame and can reconnect), then
-// waits for in-flight HTTP requests to finish or until ctx is cancelled.
-// Finally it cancels the request contexts (Context.Context()) of requests
-// still in flight, so handlers listening to them can stop. Without a server
-// started by ListenAndServe the request contexts are cancelled at once.
-// Calling Shutdown again is safe.
+// serve serves mux on ln until Shutdown.
+func (v *Vatel) serve(ln net.Listener, mux *router.Router) error {
+	srv := &fasthttp.Server{
+		Handler:         mux.Handler,
+		IdleTimeout:     DefaultIdleTimeout,
+		CloseOnShutdown: true,
+	}
+	if v.cfg.serverConfig != nil {
+		v.cfg.serverConfig(srv)
+	}
+	sl := &serverListener{Listener: ln, srv: srv}
+
+	v.mu.Lock()
+	if v.closed || v.srv != nil {
+		started := v.srv != nil
+		v.mu.Unlock()
+		ln.Close() //nolint:errcheck
+		if started {
+			return fmt.Errorf("vatel: server already started")
+		}
+		return ErrServerClosed
+	}
+	served := make(chan struct{})
+	v.srv, v.ln, v.served = srv, sl, served
+	v.mu.Unlock()
+
+	err := srv.Serve(sl)
+	close(served)
+
+	v.mu.Lock()
+	closed := v.closed
+	v.mu.Unlock()
+	if closed {
+		// Shutdown may close the listener before Serve registers it; the
+		// accept error is then the expected end of serving.
+		return nil
+	}
+	return err
+}
+
+// serverListener is the listener of the server started by ListenAndServe.
+// Close is idempotent, so both Shutdown and fasthttp's Server.Shutdown can
+// close it. Accepted TCP connections get the keep-alive settings of the
+// server, as fasthttp's own ListenAndServe does.
+type serverListener struct {
+	net.Listener
+	srv  *fasthttp.Server
+	once sync.Once
+	err  error
+}
+
+func (l *serverListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	if tc, ok := c.(*net.TCPConn); ok && l.srv.TCPKeepalive {
+		tc.SetKeepAlive(true) //nolint:errcheck
+		if p := l.srv.TCPKeepalivePeriod; p > 0 {
+			tc.SetKeepAlivePeriod(p) //nolint:errcheck
+		}
+	}
+	return c, nil
+}
+
+func (l *serverListener) Close() error {
+	l.once.Do(func() { l.err = l.Listener.Close() })
+	return l.err
+}
+
+// Shutdown gracefully stops the server:
 //
-// Pass a context with a deadline to enforce a hard cutoff:
+//  1. It closes all active WebSocket connections (clients receive a "going
+//     away" frame and can reconnect) and stops accepting new connections.
+//     ListenAndServe returns nil; called later, it returns ErrServerClosed.
+//  2. It waits until no HTTP request is in flight. Idle keep-alive
+//     connections do not hold it up; the server closes them when they send
+//     a request (the response carries "Connection: close") or after the
+//     IdleTimeout.
+//  3. It cancels the request contexts (Context.Context()) and returns nil.
+//
+// When ctx is done before step 2 ends, the request contexts of requests still
+// in flight are cancelled at once, so handlers listening to them can stop
+// (a context.Canceled error gives 503). Shutdown then waits up to one more
+// second for them to finish and returns ctx.Err().
+//
+// Without a server started by ListenAndServe the request contexts are
+// cancelled at once. Requests that start after Shutdown get a cancelled
+// context. Calling Shutdown again is safe.
+//
+// Pass a context with a deadline to bound the graceful phase:
 //
 //	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 //	defer cancel()
 //	v.Shutdown(ctx)
 func (v *Vatel) Shutdown(ctx context.Context) error {
-	if v.cancel != nil {
-		defer v.cancel()
-	}
+	v.mu.Lock()
+	v.closed = true
+	srv, ln, served := v.srv, v.ln, v.served
+	v.mu.Unlock()
+
 	if v.cfg.wv != nil {
 		v.cfg.wv.Shutdown()
 	}
-	if v.srv == nil {
+	if srv == nil {
+		v.cancel()
 		return nil
 	}
 
-	done := make(chan error, 1)
-	go func() { done <- v.srv.Shutdown() }()
-	select {
-	case err := <-done:
+	// fasthttp's Shutdown does nothing when it runs before Serve has
+	// registered the listener, so the listener is closed here as well.
+	ln.Close() //nolint:errcheck
+	srvDone := make(chan error, 1)
+	go func() { srvDone <- srv.Shutdown() }()
+
+	done, err := v.waitRequests(ctx, served, srvDone)
+	v.cancel()
+	if done {
 		return err
-	case <-ctx.Done():
-		return ctx.Err()
+	}
+
+	grace, cancel := context.WithTimeout(context.Background(), shutdownGrace)
+	defer cancel()
+	v.waitRequests(grace, served, srvDone) //nolint:errcheck
+	return ctx.Err()
+}
+
+// waitRequests waits until the server has stopped accepting connections and
+// no request is in flight, or until srvDone delivers the result of the
+// server's Shutdown (all connections are closed). done is false when ctx is
+// done first.
+func (v *Vatel) waitRequests(ctx context.Context, served <-chan struct{}, srvDone <-chan error) (done bool, err error) {
+	t := time.NewTicker(10 * time.Millisecond)
+	defer t.Stop()
+	for {
+		select {
+		case <-served:
+			if v.inflight.Load() == 0 {
+				return true, nil
+			}
+		default:
+		}
+		select {
+		case err := <-srvDone:
+			return true, err
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case <-t.C:
+		}
 	}
 }

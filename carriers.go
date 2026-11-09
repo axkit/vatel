@@ -118,10 +118,6 @@ func (o *OptionalOutput[T]) Result() interface{} {
 	return o.Out
 }
 
-// resultPrototype returns a typed nil pointer to the result type, used to
-// build masking rules at compile time while Out is still nil.
-func (o *OptionalOutput[T]) resultPrototype() interface{} { return (*T)(nil) }
-
 // Upload is an embeddable type that provides multipart file upload handling
 // for struct-based controllers. Unlike PathParams/Body, binding is not
 // automatic — call BindFile(ctx) at the start of Handle().
@@ -186,7 +182,9 @@ type funcHandler struct {
 func (h *funcHandler) Handle(ctx Context) error { return h.f(ctx) }
 
 // Func wraps a plain function as a per-request Handler factory, suitable for
-// simple stateless endpoints that do not need a full controller struct.
+// simple stateless endpoints that do not need a full controller struct. It may
+// be used on a path with {params}: read them with ctx.PathValue (they are not
+// logged).
 //
 //	vatel.DELETE("/orders/{id}", vatel.Func(func(ctx vatel.Context) error {
 //	    id := ctx.PathValue("id")

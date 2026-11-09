@@ -9,6 +9,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/signal"
 	"syscall"
@@ -60,7 +61,9 @@ func main() {
 
 	go func() {
 		log.Info().Str("addr", addr).Msg("server started")
-		if err := v.ListenAndServe(addr, mux, &log); err != nil {
+		// ListenAndServe returns nil after Shutdown, and ErrServerClosed
+		// when the signal arrived before the server started.
+		if err := v.ListenAndServe(addr, mux, &log); err != nil && !errors.Is(err, vatel.ErrServerClosed) {
 			log.Fatal().Err(err).Msg("server stopped unexpectedly")
 		}
 	}()
@@ -68,6 +71,8 @@ func main() {
 	<-quit
 	log.Info().Msg("shutting down...")
 
+	// In-flight requests get up to 30 s to finish; then their contexts are
+	// cancelled and Shutdown returns context.DeadlineExceeded.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := v.Shutdown(ctx); err != nil {

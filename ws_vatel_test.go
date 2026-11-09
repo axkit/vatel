@@ -2,6 +2,7 @@ package vatel
 
 import (
 	"bytes"
+	"context"
 	stderrors "errors"
 	"strings"
 	"testing"
@@ -24,7 +25,7 @@ func TestDecodeWSInput_Invalid(t *testing.T) {
 	for name, data := range cases {
 		t.Run(name, func(t *testing.T) {
 			var in input
-			err := decodeWSInput(data, &in)
+			err := decodeWSInput(data, &in, false)
 			if err == nil {
 				t.Fatal("expected error")
 			}
@@ -48,7 +49,7 @@ func TestDecodeWSInput_Valid(t *testing.T) {
 		Age  int    `json:"age"`
 	}
 	var in input
-	if err := decodeWSInput([]byte(`{"name":"bob","age":7}`), &in); err != nil {
+	if err := decodeWSInput([]byte(`{"name":"bob","age":7}`), &in, false); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if in.Name != "bob" || in.Age != 7 {
@@ -75,8 +76,9 @@ func TestWsWriteErrorResponse_LogSilent(t *testing.T) {
 			var logBuf, out bytes.Buffer
 			zc := zerolog.New(&logBuf).With()
 			e := &Endpoint{EndpointMeta: EndpointMeta{Method: "WS", Path: "x"}}
+			compileCommon(NewVatel(), e)
 
-			wsWriteErrorResponse(e, &out, c.lo, false, &zc, time.Now(), c.err)
+			e.wsWriteErrorResponse(&out, c.lo, false, &zc, time.Now(), c.err)
 
 			if out.Len() == 0 {
 				t.Error("error must be sent to the client")
@@ -168,33 +170,82 @@ func TestBuildHandlers_AfterFailedBuild(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "previous build failed") {
 		t.Fatalf("want 'previous build failed' error, got %v", err)
 	}
-	if err := v.ListenAndServe("127.0.0.1:0", mux, discardLogger()); err == nil || !strings.Contains(err.Error(), "previous build failed") {
-		t.Fatalf("ListenAndServe after failed build: want 'previous build failed', got %v", err)
+	// A regression would start serving and block: run it with a timeout.
+	errc := make(chan error, 1)
+	go func() { errc <- v.ListenAndServe("127.0.0.1:0", mux, discardLogger()) }()
+	select {
+	case err := <-errc:
+		if err == nil || !strings.Contains(err.Error(), "previous build failed") {
+			t.Fatalf("ListenAndServe after failed build: want 'previous build failed', got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		v.Shutdown(context.Background()) //nolint:errcheck
+		t.Fatal("ListenAndServe after failed build started the server")
 	}
 }
 
 // ── OnTokenUpdate ─────────────────────────────────────────────────────────────
 
 func TestOnTokenUpdate(t *testing.T) {
-	payload := &mockPayload{user: 7}
-	wv := NewWebsocketVatel(WithTokenDecoder(&mockDecoder{token: &mockTokener{payload: payload}}))
+	first, second := &mockPayload{perms: []byte{1}}, &mockPayload{perms: []byte{2}}
+	dec := &mockDecoder{token: &mockTokener{payload: first}}
+	wv := NewWebsocketVatel(WithTokenDecoder(dec))
 
 	var gotCID uint64
 	var gotTP AuthPayload
+	var stored bool
 	wv.OnTokenUpdate(func(cid uint64, tp AuthPayload) error {
 		gotCID, gotTP = cid, tp
+		_, stored = wv.conns.payload(cid)
 		return nil
 	})
 	if err := wv.UpdateAccessToken(42, "token"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if gotCID != 42 || gotTP != AuthPayload(payload) {
+	if gotCID != 42 || gotTP != AuthPayload(first) {
 		t.Errorf("callback got cid=%d tp=%v", gotCID, gotTP)
 	}
+	if stored {
+		t.Error("the callback must run before the payload is stored")
+	}
+	if tp, ok := wv.conns.payload(42); !ok || tp != AuthPayload(first) {
+		t.Errorf("stored payload = %v, %v; want the accepted payload", tp, ok)
+	}
 
+	// A rejected token is not stored: the connection keeps its payload.
 	errCb := stderrors.New("rejected")
 	wv.OnTokenUpdate(func(uint64, AuthPayload) error { return errCb })
+	dec.token = &mockTokener{payload: second}
 	if err := wv.UpdateAccessToken(42, "token"); !stderrors.Is(err, errCb) {
 		t.Errorf("want callback error, got %v", err)
+	}
+	if tp, _ := wv.conns.payload(42); tp != AuthPayload(first) {
+		t.Errorf("stored payload = %v, want the previous payload after a rejection", tp)
+	}
+}
+
+func TestUpdateAccessToken_DecodeError(t *testing.T) {
+	wv := NewWebsocketVatel(WithTokenDecoder(&mockDecoder{err: stderrors.New("expired")}))
+	err := wv.UpdateAccessToken(1, "bad")
+	if !errors.Is(err, ErrUnauthorized) {
+		t.Errorf("want ErrUnauthorized, got %v", err)
+	}
+	if _, ok := wv.conns.payload(1); ok {
+		t.Error("payload must not be stored")
+	}
+}
+
+func TestUpdateAccessToken_NoDecoder(t *testing.T) {
+	wv := NewWebsocketVatel()
+	called := false
+	wv.OnTokenUpdate(func(uint64, AuthPayload) error { called = true; return nil })
+	if err := wv.UpdateAccessToken(1, "token"); err != nil {
+		t.Errorf("want nil without a decoder, got %v", err)
+	}
+	if called {
+		t.Error("callback must not run without a decoder")
+	}
+	if _, ok := wv.conns.payload(1); ok {
+		t.Error("nothing must be stored without a decoder")
 	}
 }

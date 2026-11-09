@@ -91,7 +91,7 @@ func TestLog_PathParamsMasked(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			h := &secretPathHandler{fail: tc.fail}
-			fctx, lines, raw := serveLogged(t, noAuthVatel(), Endpoints{
+			fctx, lines, raw := serveLogged(t, NewVatel(), Endpoints{
 				GET("/items/{id}/{token}/{code}", func() Handler { return h }, WithLogOption(tc.lo)),
 			}, "GET", "/items/7/tok-path-secret/code-path-secret")
 
@@ -115,6 +115,17 @@ func TestLog_PathParamsMasked(t *testing.T) {
 			}
 			checkKeyCount(t, lines0Raw(raw), "id", 1)
 			checkKeyCount(t, lines0Raw(raw), "token", 1)
+			// With LogEnter the params are on the enter line only.
+			if tc.lo&LogEnter != 0 {
+				if len(lines) != 2 {
+					t.Fatalf("want enter and exit lines: %s", raw)
+				}
+				for _, k := range []string{"id", "token", "code"} {
+					if _, ok := lines[1][k]; ok {
+						t.Errorf("exit line must not repeat path param %s: %s", k, raw)
+					}
+				}
+			}
 
 			// The handler sees the real values.
 			if h.seen.ID != 7 || h.seen.Token != "tok-path-secret" || h.seen.Code != "code-path-secret" {
@@ -129,9 +140,12 @@ func lines0Raw(raw string) string {
 	return strings.SplitN(strings.TrimSpace(raw), "\n", 2)[0]
 }
 
+// TestLog_PathParamDecodeError_Masked checks the params decoded before the
+// failing one; TestLog_MaskedParamParseError_NoLeak checks a failing masked
+// param.
 func TestLog_PathParamDecodeError_Masked(t *testing.T) {
 	h := &secretPathHandler{}
-	fctx, lines, raw := serveLogged(t, noAuthVatel(), Endpoints{
+	fctx, lines, raw := serveLogged(t, NewVatel(), Endpoints{
 		GET("/items/{token}/{code}/{id}", func() Handler { return h }, WithLogOption(LogExit)),
 	}, "GET", "/items/tok-path-secret/code-path-secret/abc")
 
@@ -203,7 +217,7 @@ func TestLog_QueryParamsMasked(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			h, seen := tc.ctrl(tc.fail)
-			fctx, lines, raw := serveLogged(t, noAuthVatel(), Endpoints{
+			fctx, lines, raw := serveLogged(t, NewVatel(), Endpoints{
 				GET("/items", func() Handler { return h }, WithLogOption(LogExit)),
 			}, "GET", uri)
 
@@ -245,7 +259,7 @@ func legacyCtrl(fail error) (Handler, func() (string, string, string)) {
 }
 
 func TestLog_QueryParamsMasked_NestedStructTag(t *testing.T) {
-	_, lines, raw := serveLogged(t, noAuthVatel(), Endpoints{
+	_, lines, raw := serveLogged(t, NewVatel(), Endpoints{
 		GET("/items", func() Handler { return &nestedSecretQueryHandler{} }, WithLogOption(LogExit)),
 	}, "GET", "/items?name=a&token=tok-nested-secret")
 
@@ -259,7 +273,7 @@ func TestLog_QueryParamsMasked_NestedStructTag(t *testing.T) {
 
 func TestLog_ParamsWithoutMaskTag_Unchanged(t *testing.T) {
 	h := &pathAndQueryHandler{}
-	_, lines, raw := serveLogged(t, noAuthVatel(), Endpoints{
+	_, lines, raw := serveLogged(t, NewVatel(), Endpoints{
 		GET("/items/{id}", func() Handler { return h }, WithLogOption(LogExit)),
 	}, "GET", "/items/42?page=3")
 

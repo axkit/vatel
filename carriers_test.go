@@ -186,7 +186,7 @@ func TestEmbeddedCarriers_InterfacesSatisfied(t *testing.T) {
 }
 
 func TestEmbeddedCarriers_EndToEnd(t *testing.T) {
-	v := noAuthVatel()
+	v := NewVatel()
 	fctx := newGETCtx("/orders/5?status=active")
 	fctx.SetUserValue("id", "5")
 
@@ -298,7 +298,7 @@ func TestEndpoints_ImplementsEndpointer(t *testing.T) {
 
 func TestEndpoints_UsedWithVatelAdd(t *testing.T) {
 	ctrl := func() Handler { return &plainHandler{} }
-	v := noAuthVatel()
+	v := NewVatel()
 
 	v.Add(Endpoints{
 		GET("/a", ctrl),
@@ -312,56 +312,52 @@ func TestEndpoints_UsedWithVatelAdd(t *testing.T) {
 	}
 }
 
-// ── connStore (WS) ───────────────────────────────────────────────────────────
+// ── wsConns (WS) ─────────────────────────────────────────────────────────────
 
-func TestConnStore_SetGetDelete(t *testing.T) {
-	cs := connStore{conns: make(map[uint64]AuthPayload)}
-	tp := &mockPayload{login: "alice"}
+func TestWsConns_SetGetRemove(t *testing.T) {
+	cs := newWsConns()
+	tp := &mockPayload{perms: []byte{1}}
 
-	// Initially not present.
-	if _, ok := cs.get(1); ok {
+	if _, ok := cs.payload(1); ok {
 		t.Error("expected not found before set")
 	}
 
-	cs.set(1, tp)
-	got, ok := cs.get(1)
-	if !ok {
-		t.Fatal("expected found after set")
-	}
-	if got.(*mockPayload).Login() != "alice" {
-		t.Errorf("want alice, got %s", got.(*mockPayload).Login())
+	cs.setPayload(1, tp)
+	got, ok := cs.payload(1)
+	if !ok || got != AuthPayload(tp) {
+		t.Fatalf("payload after set = %v, %v", got, ok)
 	}
 
-	cs.delete(1)
-	if _, ok := cs.get(1); ok {
-		t.Error("expected not found after delete")
+	cs.remove(1)
+	if _, ok := cs.payload(1); ok {
+		t.Error("expected not found after remove")
 	}
 }
 
-func TestConnStore_Overwrite(t *testing.T) {
-	cs := connStore{conns: make(map[uint64]AuthPayload)}
-	cs.set(1, &mockPayload{login: "alice"})
-	cs.set(1, &mockPayload{login: "bob"})
+func TestWsConns_Overwrite(t *testing.T) {
+	cs := newWsConns()
+	first, second := &mockPayload{}, &mockPayload{}
+	cs.setPayload(1, first)
+	cs.setPayload(1, second)
 
-	got, ok := cs.get(1)
-	if !ok || got.(*mockPayload).Login() != "bob" {
-		t.Errorf("expected bob after overwrite, got %v", got)
+	if got, ok := cs.payload(1); !ok || got != AuthPayload(second) {
+		t.Errorf("expected the second payload after overwrite, got %v", got)
 	}
 }
 
-func TestConnStore_Concurrent(t *testing.T) {
-	cs := connStore{conns: make(map[uint64]AuthPayload)}
+func TestWsConns_Concurrent(t *testing.T) {
+	cs := newWsConns()
 	done := make(chan struct{})
 	const n = 100
 
 	go func() {
 		for i := uint64(0); i < n; i++ {
-			cs.set(i, &mockPayload{login: "user"})
+			cs.setPayload(i, &mockPayload{})
 		}
 		close(done)
 	}()
 	for i := uint64(0); i < n; i++ {
-		cs.get(i)
+		cs.payload(i)
 	}
 	<-done
 }
@@ -392,28 +388,6 @@ func TestWsCompile_PermsWithAuthFunc_OK(t *testing.T) {
 	l := discardLogger()
 	if err := wv.compileWS(v, e, l); err != nil {
 		t.Errorf("unexpected error: %v", err)
-	}
-}
-
-func TestWsAuthFunc_InvokedWithCorrectArgs(t *testing.T) {
-	var gotPath string
-	var gotPerms []string
-	authFn := func(ctx WebsocketContext, path string, requiredPerms []string) error {
-		gotPath = path
-		gotPerms = requiredPerms
-		return nil
-	}
-
-	// Call the auth function directly as the framework would.
-	wsCtx := NewWsContext(nil)
-	if err := authFn(wsCtx, "orders", []string{"orders:read"}); err != nil {
-		t.Fatal(err)
-	}
-	if gotPath != "orders" {
-		t.Errorf("want path=orders, got %q", gotPath)
-	}
-	if len(gotPerms) != 1 || gotPerms[0] != "orders:read" {
-		t.Errorf("want perms=[orders:read], got %v", gotPerms)
 	}
 }
 
