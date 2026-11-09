@@ -6,11 +6,14 @@ import (
 	stderrors "errors"
 	"fmt"
 	"net"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/fasthttp/router"
 	"github.com/regorov/websocket"
@@ -147,6 +150,24 @@ func (wsFloodHandler) Handle(ctx WebsocketContext) error {
 	return nil
 }
 
+// wsCloserHandler returns a WsCloseError with the code and reason of its
+// input; with coded, its Err is an *errors.Error (400, VTL-0006).
+type wsCloserHandler struct {
+	Body[struct {
+		Code   int    `json:"code"`
+		Reason string `json:"reason"`
+		Coded  bool   `json:"coded"`
+	}]
+}
+
+func (h *wsCloserHandler) Handle(WebsocketContext) error {
+	var err error
+	if h.In.Coded {
+		err = ErrValidationFailed.New().Msg("bad state")
+	}
+	return NewWsCloseError(websocket.StatusCode(h.In.Code), h.In.Reason, err)
+}
+
 type wsHarness struct {
 	t       *testing.T
 	client  *websocket.Client
@@ -159,8 +180,9 @@ type wsHarness struct {
 	served  atomic.Int32 // wsValidatedHandler calls
 	closed  atomic.Int32 // OnClose calls
 
-	openHook  atomic.Pointer[func()] // called by OnOpen, if set
-	closeHook atomic.Pointer[func()] // called by OnClose, if set
+	openHook  atomic.Pointer[func()]                  // called by OnOpen, if set
+	closeHook atomic.Pointer[func()]                  // called by OnClose, if set
+	authHook  atomic.Pointer[func(path string) error] // its error is returned by the auth func, if set
 
 	mu        sync.Mutex
 	conns     []net.Conn // client connections, closed before the cleanup Shutdown
@@ -181,6 +203,9 @@ func newWSHarness(t *testing.T, opts ...func(*WsOption)) *wsHarness {
 			h.authPaths = append(h.authPaths, path)
 			h.authPerms = append(h.authPerms, perms)
 			h.authTP = append(h.authTP, ctx.TokenPayload())
+			if f := h.authHook.Load(); f != nil {
+				return (*f)(path)
+			}
 			return nil
 		}),
 	}, opts...)...)
@@ -209,11 +234,20 @@ func newWSHarness(t *testing.T, opts ...func(*WsOption)) *wsHarness {
 		WS("flood", func() WebsocketHandler { return wsFloodHandler{} }),
 		WS("panic", func() WebsocketHandler { return wsPanicHandler{} }),
 		WS("validated", func() WebsocketHandler { return &wsValidatedHandler{served: &h.served} }, WithLogOption(LogExit)),
+		WS("closer", func() WebsocketHandler { return &wsCloserHandler{} }, WithLogOption(LogExit)),
 	})
 
 	mux := router.New()
 	mux.GET("/ws", wv.Upgrade)
 	mux.GET("/ws7", func(ctx *fasthttp.RequestCtx) { wv.UpgradeWithID(ctx, 7) })
+	mux.GET("/wsid/{id}", func(ctx *fasthttp.RequestCtx) {
+		id, err := strconv.ParseUint(ctx.UserValue("id").(string), 10, 64)
+		if err != nil {
+			ctx.SetStatusCode(fasthttp.StatusBadRequest)
+			return
+		}
+		wv.UpgradeWithID(ctx, id)
+	})
 	l := zerolog.New(h.log)
 	if err := v.BuildHandlers(mux, &l); err != nil {
 		t.Fatalf("BuildHandlers: %v", err)
@@ -273,7 +307,8 @@ func (h *wsHarness) send(msg string) string {
 	return h.sendOn(h.client, msg)
 }
 
-// sendOn writes a message to c and returns the reply.
+// sendOn writes a message to c and returns the reply. A close frame instead
+// of the reply fails the test.
 func (h *wsHarness) sendOn(c *websocket.Client, msg string) string {
 	h.t.Helper()
 	if _, err := c.Write([]byte(msg)); err != nil {
@@ -284,7 +319,44 @@ func (h *wsHarness) sendOn(c *websocket.Client, msg string) string {
 	if _, err := c.ReadFrame(fr); err != nil {
 		h.t.Fatalf("read: %v", err)
 	}
+	if fr.IsClose() {
+		h.t.Fatalf("connection closed with status %d %q instead of a reply to %s", fr.Status(), fr.Payload(), msg)
+	}
 	return string(fr.Payload())
+}
+
+// readClose reads frames of c until a close frame and returns the payloads
+// of the frames before it, and the status and reason of the close frame.
+func readClose(t *testing.T, c *websocket.Client) (msgs []string, status websocket.StatusCode, reason string) {
+	t.Helper()
+	fr := websocket.AcquireFrame()
+	defer websocket.ReleaseFrame(fr)
+	for {
+		fr.Reset()
+		if _, err := c.ReadFrame(fr); err != nil {
+			t.Fatalf("read: %v (frames so far: %q; want a close frame)", err, msgs)
+		}
+		if fr.IsClose() {
+			return msgs, fr.Status(), string(fr.Payload())
+		}
+		msgs = append(msgs, string(fr.Payload()))
+	}
+}
+
+// waitConn waits until the connection cid is registered (its onOpen ran).
+func (h *wsHarness) waitConn(cid uint64) {
+	h.t.Helper()
+	h.waitFor(fmt.Sprintf("connection %d", cid), func() bool {
+		h.wv.conns.mu.RLock()
+		defer h.wv.conns.mu.RUnlock()
+		wc, ok := h.wv.conns.conns[cid]
+		return ok && wc.conn != nil
+	})
+}
+
+// tokenMsg returns an updateAccessToken message with the token tok.
+func tokenMsg(tok string) string {
+	return `{"path":"updateAccessToken","data":{"mid":"00000000-0000-0000-0000-000000000001","at":"` + tok + `"}}`
 }
 
 // waitFor waits until cond holds.
@@ -764,4 +836,395 @@ func TestWS_NonReadingClientWriteTimeout(t *testing.T) {
 	}
 	h.waitMetric("flood", 1) // the handler finished
 	h.waitFor("OnClose", func() bool { return h.closed.Load() == 1 })
+}
+
+// ── security context: one connection, one (user, organization) ──────────────
+
+// ctxPayload is a token payload with a security context (user, organization)
+// and an optional expiry.
+type ctxPayload struct {
+	user, org int
+	exp       time.Time
+}
+
+func (p *ctxPayload) Perms() []byte        { return []byte{1} }
+func (p *ctxPayload) Debug() bool          { return false }
+func (p *ctxPayload) ExpiresAt() time.Time { return p.exp }
+
+// ctxDecoder decodes tokens "user/org", or "user/org/ttl" with a Go duration
+// ttl: the payload expires ttl after decoding (a negative ttl: it has
+// expired).
+type ctxDecoder struct{}
+
+func (ctxDecoder) Decode(b []byte) (Tokener, error) {
+	parts := strings.Split(string(b), "/")
+	if len(parts) < 2 {
+		return nil, stderrors.New("malformed token")
+	}
+	p := &ctxPayload{}
+	var err error
+	if p.user, err = strconv.Atoi(parts[0]); err != nil {
+		return nil, err
+	}
+	if p.org, err = strconv.Atoi(parts[1]); err != nil {
+		return nil, err
+	}
+	if len(parts) > 2 {
+		ttl, err := time.ParseDuration(parts[2])
+		if err != nil {
+			return nil, err
+		}
+		p.exp = time.Now().Add(ttl)
+	}
+	return &mockTokener{payload: p}, nil
+}
+
+// sameSecurityContext is the OnTokenUpdate policy of one security context
+// per connection: the first token is accepted; a later one must have the same
+// user and organization.
+func sameSecurityContext(_ uint64, prev, next AuthPayload) error {
+	if prev == nil {
+		return nil
+	}
+	p, n := prev.(*ctxPayload), next.(*ctxPayload)
+	switch {
+	case p.user != n.user:
+		return NewWsCloseError(WsStatusForbidden, "user changed", nil)
+	case p.org != n.org:
+		return NewWsCloseError(WsStatusContextChanged, "organization changed", nil)
+	}
+	return nil
+}
+
+// A handler error with a WsCloseError: the client gets the error reply for
+// the message, then the close frame with the code and reason; the next
+// message is not served. The reply comes from Err when it has an
+// *errors.Error, otherwise from the code. No alarm: it is not a 5xx.
+func TestWS_CloseErrorFromHandler(t *testing.T) {
+	tests := []struct {
+		name, data, wantReply string
+		wantCode              websocket.StatusCode
+		wantStatus            int
+	}{
+		{"4001", `{"code":4001,"reason":"auth required"}`, `"code":"VTL-0004","statusCode":401`, WsStatusAuthRequired, 401},
+		{"4003", `{"code":4003,"reason":"forbidden"}`, `"code":"VTL-0003","statusCode":403`, WsStatusForbidden, 403},
+		{"4009", `{"code":4009,"reason":"context changed"}`, `"code":"VTL-0009","statusCode":409`, WsStatusContextChanged, 409},
+		{"other 4xxx", `{"code":4100,"reason":"custom"}`, `"statusCode":400`, 4100, 400},
+		{"Err with *errors.Error", `{"code":4003,"reason":"r","coded":true}`, `"code":"VTL-0006","statusCode":400`, WsStatusForbidden, 400},
+	}
+	h := newWSHarness(t)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c, _ := h.dialPath("/ws")
+			if _, err := c.Write([]byte(`{"path":"closer","data":` + tt.data + `}`)); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := c.Write([]byte(`{"path":"secret","data":{"name":"late"}}`)); err != nil {
+				t.Fatal(err)
+			}
+			msgs, code, _ := readClose(t, c)
+			if len(msgs) != 1 || !strings.Contains(msgs[0], tt.wantReply) {
+				t.Errorf("frames before close = %q, want one error reply with %s", msgs, tt.wantReply)
+			}
+			if code != tt.wantCode {
+				t.Errorf("close status = %d, want %d", code, tt.wantCode)
+			}
+		})
+	}
+	st, alarms := h.waitMetric("closer", len(tests))
+	for i, tt := range tests {
+		if st[i] != tt.wantStatus {
+			t.Errorf("metric status %d = %d, want %d", i, st[i], tt.wantStatus)
+		}
+	}
+	if alarms != 0 {
+		t.Errorf("alarms = %d, want 0 for WsCloseError", alarms)
+	}
+	if st, _ := h.metrics.get("secret"); len(st) != 0 {
+		t.Errorf("a message after the closing one was served: %v", st)
+	}
+}
+
+// A WsCloseError from the WithWsAuthFunc function closes the connection after
+// the error reply as well.
+func TestWS_CloseErrorFromAuthFunc(t *testing.T) {
+	h := newWSHarness(t)
+	revoked := func(path string) error {
+		if path == "perm" {
+			return NewWsCloseError(WsStatusAuthRequired, "token revoked", nil)
+		}
+		return nil
+	}
+	h.authHook.Store(&revoked)
+	if _, err := h.client.Write([]byte(`{"path":"perm","data":{"name":"a"}}`)); err != nil {
+		t.Fatal(err)
+	}
+	msgs, code, reason := readClose(t, h.client)
+	if len(msgs) != 1 || !strings.Contains(msgs[0], `"code":"VTL-0004","statusCode":401`) {
+		t.Errorf("frames before close = %q, want a 401 VTL-0004 reply", msgs)
+	}
+	if code != WsStatusAuthRequired || reason != "token revoked" {
+		t.Errorf("close = %d %q, want 4001 \"token revoked\"", code, reason)
+	}
+}
+
+// OnTokenUpdate gets the previous and the new payload (prev == nil for the
+// first token). A token of the same context is accepted; a token of another
+// organization closes the connection with 4009 and of another user with
+// 4003, after the error reply, and is not stored.
+func TestWS_SecurityContextPolicy(t *testing.T) {
+	h := newWSHarness(t, WithTokenDecoder(ctxDecoder{}))
+	type call struct {
+		cid        uint64
+		prev, next AuthPayload
+	}
+	var mu sync.Mutex
+	var calls []call
+	h.wv.OnTokenUpdate(func(cid uint64, prev, next AuthPayload) error {
+		mu.Lock()
+		calls = append(calls, call{cid, prev, next})
+		mu.Unlock()
+		return sameSecurityContext(cid, prev, next)
+	})
+	lastCall := func() call {
+		mu.Lock()
+		defer mu.Unlock()
+		return calls[len(calls)-1]
+	}
+
+	tests := []struct {
+		name, second, wantReply string
+		wantClose               websocket.StatusCode
+	}{
+		{"same context", "1/10", `"result":"Ok"`, 0},
+		{"other organization", "1/20", `"code":"VTL-0009","statusCode":409`, WsStatusContextChanged},
+		{"other user", "2/10", `"code":"VTL-0003","statusCode":403`, WsStatusForbidden},
+	}
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cid := uint64(100 + i)
+			c, _ := h.dialPath("/wsid/" + strconv.FormatUint(cid, 10))
+			if got := h.sendOn(c, tokenMsg("1/10")); !strings.Contains(got, `"result":"Ok"`) {
+				t.Fatalf("first token reply = %s", got)
+			}
+			first := lastCall()
+			if first.cid != cid || first.prev != nil {
+				t.Errorf("first call: cid %d prev %v; want cid %d, prev nil", first.cid, first.prev, cid)
+			}
+			stored, _ := h.wv.conns.payload(cid)
+			if stored != first.next {
+				t.Fatalf("stored payload %v, want the first token's %v", stored, first.next)
+			}
+
+			if got := h.sendOn(c, tokenMsg(tt.second)); !strings.Contains(got, tt.wantReply) {
+				t.Errorf("second token reply = %s, want %s", got, tt.wantReply)
+			}
+			second := lastCall()
+			if second.prev != first.next {
+				t.Errorf("second call: prev %v, want the stored payload %v", second.prev, first.next)
+			}
+			if tt.wantClose == 0 {
+				if tp, _ := h.wv.conns.payload(cid); tp != second.next {
+					t.Errorf("stored payload %v, want the accepted %v", tp, second.next)
+				}
+				h.sendOn(c, `{"path":"secret","data":{"name":"still open"}}`)
+				return
+			}
+			if tp, ok := h.wv.conns.payload(cid); ok && tp != first.next {
+				t.Errorf("rejected payload stored: %v", tp)
+			}
+			msgs, code, _ := readClose(t, c)
+			if len(msgs) != 0 || code != tt.wantClose {
+				t.Errorf("frames %q, close status %d; want close %d", msgs, code, tt.wantClose)
+			}
+		})
+	}
+}
+
+// CloseConn closes a live connection by ID with the code and reason and
+// reports true; for an unknown ID, or a connection already being closed, it
+// reports false.
+func TestWS_CloseConn(t *testing.T) {
+	h := newWSHarness(t)
+	c, _ := h.dialPath("/wsid/42")
+	h.waitConn(42)
+
+	if h.wv.CloseConn(99, WsStatusForbidden, "x") {
+		t.Error("CloseConn of an unknown ID = true, want false")
+	}
+	if !h.wv.CloseConn(42, WsStatusForbidden, "removed from organization") {
+		t.Fatal("CloseConn of a live connection = false, want true")
+	}
+	if h.wv.CloseConn(42, WsStatusForbidden, "again") {
+		t.Error("CloseConn of a closing connection = true, want false")
+	}
+	msgs, code, reason := readClose(t, c)
+	if len(msgs) != 0 || code != WsStatusForbidden || reason != "removed from organization" {
+		t.Errorf("frames %q, close %d %q; want close 4003 \"removed from organization\"", msgs, code, reason)
+	}
+	h.waitFor("OnClose", func() bool { return h.closed.Load() == 1 })
+	if h.wv.CloseConn(42, WsStatusForbidden, "closed") {
+		t.Error("CloseConn of a closed connection = true, want false")
+	}
+	if got := h.send(`{"path":"secret","data":{"name":"a"}}`); !strings.Contains(got, `"name":"a"`) {
+		t.Errorf("other connection reply = %s", got)
+	}
+}
+
+// The close reason is cut to 123 bytes (the close frame payload is at most
+// 125 bytes with the code) on a UTF-8 character boundary.
+func TestWS_CloseReasonTruncated(t *testing.T) {
+	h := newWSHarness(t)
+	c, _ := h.dialPath("/wsid/43")
+	h.waitConn(43)
+	long := strings.Repeat("я", 100) // 200 bytes
+	if !h.wv.CloseConn(43, WsStatusForbidden, long) {
+		t.Fatal("CloseConn = false")
+	}
+	_, code, reason := readClose(t, c)
+	if code != WsStatusForbidden {
+		t.Errorf("close status = %d, want 4003", code)
+	}
+	if reason != strings.Repeat("я", 61) || !utf8.ValidString(reason) {
+		t.Errorf("reason = %q (%d bytes), want 61 runes (122 bytes)", reason, len(reason))
+	}
+}
+
+// VisitConns walks the live connections with their payloads; its callback may
+// call CloseConn (no deadlock) and stops the walk by returning false.
+func TestWS_VisitConnsCloseConn(t *testing.T) {
+	h := newWSHarness(t, WithTokenDecoder(ctxDecoder{}))
+	conns := map[uint64]*websocket.Client{}
+	for cid, tok := range map[uint64]string{101: "1/10", 102: "2/10", 103: "3/20"} {
+		c, _ := h.dialPath("/wsid/" + strconv.FormatUint(cid, 10))
+		if got := h.sendOn(c, tokenMsg(tok)); !strings.Contains(got, `"Ok"`) {
+			t.Fatalf("token reply = %s", got)
+		}
+		conns[cid] = c
+	}
+
+	var visited []uint64
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.wv.VisitConns(func(cid uint64, tp AuthPayload) bool {
+			visited = append(visited, cid)
+			if p, ok := tp.(*ctxPayload); ok && p.org == 10 {
+				if !h.wv.CloseConn(cid, WsStatusForbidden, "organization deleted") {
+					t.Errorf("CloseConn(%d) = false", cid)
+				}
+			}
+			return true
+		})
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("VisitConns with CloseConn in its callback deadlocked")
+	}
+	for _, cid := range []uint64{101, 102, 103} {
+		if !slices.Contains(visited, cid) {
+			t.Errorf("connection %d not visited: %v", cid, visited)
+		}
+	}
+	for _, cid := range []uint64{101, 102} {
+		if _, code, _ := readClose(t, conns[cid]); code != WsStatusForbidden {
+			t.Errorf("connection %d: close status %d, want 4003", cid, code)
+		}
+	}
+	h.sendOn(conns[103], `{"path":"secret","data":{"name":"org 20"}}`)
+
+	// Closing connections are not visited; false stops the walk.
+	n := 0
+	h.wv.VisitConns(func(cid uint64, _ AuthPayload) bool {
+		n++
+		if cid == 101 || cid == 102 {
+			t.Errorf("closing connection %d visited", cid)
+		}
+		return false
+	})
+	if n != 1 {
+		t.Errorf("callback calls after returning false = %d, want 1", n)
+	}
+}
+
+// A payload implementing Expirer closes its connection with 4001 when it
+// expires; a token update before that moves the expiry.
+func TestWS_TokenExpiry(t *testing.T) {
+	h := newWSHarness(t, WithTokenDecoder(ctxDecoder{}))
+
+	c, _ := h.dialPath("/wsid/201")
+	start := time.Now()
+	if got := h.sendOn(c, tokenMsg("1/10/200ms")); !strings.Contains(got, `"Ok"`) {
+		t.Fatalf("token reply = %s", got)
+	}
+	_, code, reason := readClose(t, c)
+	if code != WsStatusAuthRequired || reason != "token expired" {
+		t.Errorf("close = %d %q, want 4001 \"token expired\"", code, reason)
+	}
+	if d := time.Since(start); d < 200*time.Millisecond {
+		t.Errorf("closed %v after the token, before it expired", d)
+	}
+
+	c2, _ := h.dialPath("/wsid/202")
+	firstExp := time.Now().Add(300 * time.Millisecond)
+	h.sendOn(c2, tokenMsg("1/10/300ms"))
+	h.sendOn(c2, tokenMsg("1/10/1500ms"))
+	time.Sleep(time.Until(firstExp.Add(300 * time.Millisecond)))
+	h.sendOn(c2, `{"path":"secret","data":{"name":"after the first expiry"}}`)
+	if _, code, _ := readClose(t, c2); code != WsStatusAuthRequired {
+		t.Errorf("close status = %d, want 4001", code)
+	}
+	if d := time.Since(firstExp); d < time.Second {
+		t.Errorf("closed %v after the first expiry, want after the second", d)
+	}
+}
+
+// WithWsAuthTimeout: a connection without a stored payload is closed with
+// 4001 after the timeout (a rejected token does not count); a connection
+// that got a token in time stays open.
+func TestWS_AuthTimeout(t *testing.T) {
+	h := newWSHarness(t, WithTokenDecoder(ctxDecoder{}), WithWsAuthTimeout(200*time.Millisecond))
+
+	start := time.Now()
+	authed, _ := h.dialPath("/wsid/301")
+	if got := h.sendOn(authed, tokenMsg("1/10")); !strings.Contains(got, `"Ok"`) {
+		t.Fatalf("token reply = %s", got)
+	}
+	expired, _ := h.dialPath("/wsid/302")
+	if got := h.sendOn(expired, tokenMsg("1/10/-1s")); !strings.Contains(got, `"code":"VTL-0004","statusCode":401`) {
+		t.Errorf("expired token reply = %s, want 401 VTL-0004", got)
+	}
+
+	for name, c := range map[string]*websocket.Client{"silent": h.client, "expired token": expired} {
+		if _, code, reason := readClose(t, c); code != WsStatusAuthRequired || reason != "authentication timeout" {
+			t.Errorf("%s: close = %d %q, want 4001 \"authentication timeout\"", name, code, reason)
+		}
+	}
+	time.Sleep(time.Until(start.Add(500 * time.Millisecond)))
+	h.sendOn(authed, `{"path":"secret","data":{"name":"authenticated"}}`)
+}
+
+// Shutdown and the close of a connection stop its timer.
+func TestWS_ShutdownStopsTimers(t *testing.T) {
+	h := newWSHarness(t, WithTokenDecoder(ctxDecoder{}), WithWsAuthTimeout(time.Hour))
+	h.dialPath("/wsid/401")
+	h.waitConn(401)
+	timers := func() (n int) {
+		h.wv.conns.mu.RLock()
+		defer h.wv.conns.mu.RUnlock()
+		for _, wc := range h.wv.conns.conns {
+			if wc.timer != nil {
+				n++
+			}
+		}
+		return n
+	}
+	if n := timers(); n == 0 {
+		t.Fatal("no auth timer armed")
+	}
+	h.wv.Shutdown()
+	if n := timers(); n != 0 {
+		t.Errorf("timers armed after Shutdown: %d", n)
+	}
 }

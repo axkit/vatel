@@ -1,13 +1,18 @@
 package vatel
 
 import (
+	"cmp"
 	"encoding/json"
 	stderrors "errors"
 	"fmt"
 	"io"
 	"net"
+	"slices"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/axkit/errors"
 	"github.com/regorov/websocket"
@@ -20,17 +25,22 @@ import (
 // token payload, which persists authentication state across messages on the
 // same connection.
 type wsConns struct {
-	mu      sync.RWMutex
-	conns   map[uint64]*wsConn
-	closed  bool          // closeAll was called: no new connection is accepted
-	drained chan struct{} // closed once closeAll was called and no connection is registered
+	mu          sync.RWMutex
+	conns       map[uint64]*wsConn
+	closed      bool          // closeAll was called: no new connection is accepted
+	drained     chan struct{} // closed once closeAll was called and no connection is registered
+	authTimeout time.Duration // see WithWsAuthTimeout; 0: none
 }
 
 type wsConn struct {
 	conn      *websocket.Conn // nil when a payload is set for an unknown connection
 	nc        net.Conn        // the network connection of conn
 	tp        AuthPayload
-	goingAway bool // closed by closeAll: its messages are not served
+	exp       time.Time   // expiry of tp (Expirer), zero if none
+	ver       uint64      // number of payloads stored: UpdateAccessToken compares it
+	closing   bool        // closed by the server: its messages are not served
+	goingAway bool        // closed by closeAll: OnClose gets a nil error
+	timer     *time.Timer // closes the live connection when tp expires, or, without a payload, after the auth timeout
 }
 
 var (
@@ -64,39 +74,150 @@ func (cs *wsConns) add(c *websocket.Conn, nc net.Conn) error {
 	wc, ok := cs.conns[c.ID()]
 	switch {
 	case !ok:
-		cs.conns[c.ID()] = &wsConn{conn: c, nc: nc}
+		wc = &wsConn{conn: c, nc: nc}
+		cs.conns[c.ID()] = wc
 	case wc.conn != nil:
 		return errWsDuplicateID
 	default:
 		wc.conn, wc.nc = c, nc
 	}
+	cs.armTimer(c.ID(), wc)
 	return nil
 }
 
-// setPayload stores the token payload of the connection cid.
-func (cs *wsConns) setPayload(cid uint64, tp AuthPayload) {
-	cs.mu.Lock()
-	if wc, ok := cs.conns[cid]; ok {
-		wc.tp = tp
-	} else {
-		cs.conns[cid] = &wsConn{tp: tp}
+// lookup returns the entry of the connection cid (nil if there is none), its
+// payload and the version of the payload, for storePayload.
+func (cs *wsConns) lookup(cid uint64) (wc *wsConn, tp AuthPayload, ver uint64) {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	if wc = cs.conns[cid]; wc != nil {
+		return wc, wc.tp, wc.ver
 	}
-	cs.mu.Unlock()
+	return nil, nil, 0
+}
+
+// storePayload stores the token payload tp, which expires at exp (zero:
+// never), for the connection cid, unless its entry is no longer seen or its
+// payload is no longer of version ver (see lookup): another payload was stored
+// meanwhile, or the connection closed. It reports whether tp was stored.
+func (cs *wsConns) storePayload(cid uint64, seen *wsConn, ver uint64, tp AuthPayload, exp time.Time) bool {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	wc := cs.conns[cid]
+	if wc != seen || (wc != nil && wc.ver != ver) {
+		return false
+	}
+	if wc == nil {
+		wc = &wsConn{}
+		cs.conns[cid] = wc
+	}
+	wc.tp, wc.exp = tp, exp
+	wc.ver++
+	cs.armTimer(cid, wc)
+	return true
+}
+
+// armTimer (re)starts the timer of wc, the entry of the connection cid: if
+// its payload expires, the connection is closed with WsStatusAuthRequired
+// then; without a payload, after cs.authTimeout. The timer does nothing if
+// another payload is stored before it fires. Only a live connection that is
+// not closing gets a timer. cs.mu must be held.
+func (cs *wsConns) armTimer(cid uint64, wc *wsConn) {
+	wc.stopTimer()
+	if wc.conn == nil || wc.closing {
+		return
+	}
+	var d time.Duration
+	var reason string
+	switch {
+	case wc.ver == 0 && cs.authTimeout > 0:
+		d, reason = cs.authTimeout, "authentication timeout"
+	case wc.ver > 0 && !wc.exp.IsZero():
+		d, reason = time.Until(wc.exp), "token expired"
+	default:
+		return
+	}
+	ver := wc.ver
+	wc.timer = time.AfterFunc(d, func() {
+		cs.mu.Lock()
+		if cs.conns[cid] != wc || wc.ver != ver || !wc.startClose() {
+			cs.mu.Unlock()
+			return
+		}
+		c, nc := wc.conn, wc.nc
+		cs.mu.Unlock()
+		closeConn(c, nc, WsStatusAuthRequired, reason)
+	})
+}
+
+// stopTimer stops the timer of wc, if any. The mutex of its table must be
+// held.
+func (wc *wsConn) stopTimer() {
+	if wc.timer != nil {
+		wc.timer.Stop()
+		wc.timer = nil
+	}
+}
+
+// startClose marks the live connection of wc as closing: its messages are no
+// longer served and its timer is stopped. It reports false when wc has no
+// connection or it is already closing. The mutex of its table must be held.
+func (wc *wsConn) startClose() bool {
+	if wc.conn == nil || wc.closing {
+		return false
+	}
+	wc.closing = true
+	wc.stopTimer()
+	return true
+}
+
+// startClose marks the live connection cid as closing (see wsConn.startClose)
+// and returns it with its network connection. With c set, the connection
+// must be c. It reports false if there is no such connection, or it is
+// already closing.
+func (cs *wsConns) startClose(cid uint64, c *websocket.Conn) (*websocket.Conn, net.Conn, bool) {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	wc, ok := cs.conns[cid]
+	if !ok || (c != nil && wc.conn != c) || !wc.startClose() {
+		return nil, nil, false
+	}
+	return wc.conn, wc.nc, true
 }
 
 // serving reports whether the messages of c are served: c is registered and
-// not being closed by closeAll. It returns the token payload of c, if any.
+// not being closed by the server. It returns the token payload of c, if any.
 func (cs *wsConns) serving(c *websocket.Conn) (AuthPayload, bool) {
 	cs.mu.RLock()
 	defer cs.mu.RUnlock()
-	if wc, ok := cs.conns[c.ID()]; ok && wc.conn == c && !wc.goingAway {
+	if wc, ok := cs.conns[c.ID()]; ok && wc.conn == c && !wc.closing {
 		return wc.tp, true
 	}
 	return nil, false
 }
 
-// remove unregisters the connection c. It reports whether c was registered
-// and whether closeAll closed it.
+// wsConnInfo is a live connection as VisitConns passes it.
+type wsConnInfo struct {
+	cid uint64
+	tp  AuthPayload
+}
+
+// live returns the live connections that are not closing, by ID.
+func (cs *wsConns) live() []wsConnInfo {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	res := make([]wsConnInfo, 0, len(cs.conns))
+	for cid, wc := range cs.conns {
+		if wc.conn != nil && !wc.closing {
+			res = append(res, wsConnInfo{cid, wc.tp})
+		}
+	}
+	slices.SortFunc(res, func(a, b wsConnInfo) int { return cmp.Compare(a.cid, b.cid) })
+	return res
+}
+
+// remove unregisters the connection c and stops its timer. It reports
+// whether c was registered and whether closeAll closed it.
 func (cs *wsConns) remove(c *websocket.Conn) (registered, goingAway bool) {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
@@ -104,6 +225,7 @@ func (cs *wsConns) remove(c *websocket.Conn) (registered, goingAway bool) {
 	if !ok || wc.conn != c {
 		return false, false
 	}
+	wc.stopTimer()
 	delete(cs.conns, c.ID())
 	cs.checkDrained()
 	return true, wc.goingAway
@@ -129,10 +251,11 @@ func (cs *wsConns) checkDrained() {
 }
 
 // closeAll makes add reject new connections and closes the registered ones
-// with a "going away" status. It does not wait: each close runs in its own
-// goroutine, as queueing the close frame blocks while the outbound queue of
-// the connection is full; cs.drained is closed when all of them have closed.
-// Only the first call does anything.
+// with a "going away" status, stopping their timers; a connection already
+// being closed by the server keeps its status. It does not wait: each close
+// runs in its own goroutine, as queueing the close frame blocks while the
+// outbound queue of the connection is full; cs.drained is closed when all of
+// them have closed. Only the first call does anything.
 func (cs *wsConns) closeAll() {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
@@ -141,7 +264,7 @@ func (cs *wsConns) closeAll() {
 	}
 	cs.closed = true
 	for _, wc := range cs.conns {
-		if wc.conn == nil {
+		if !wc.startClose() {
 			continue
 		}
 		wc.goingAway = true
@@ -150,18 +273,127 @@ func (cs *wsConns) closeAll() {
 	cs.checkDrained()
 }
 
+// wsMaxCloseReason is the longest close reason in bytes: the payload of a
+// close frame (a control frame) is at most 125 bytes, two of them the status.
+const wsMaxCloseReason = 123
+
+// truncateCloseReason returns reason as valid UTF-8 cut to wsMaxCloseReason
+// bytes on a character boundary. A longer or invalid reason makes browsers
+// fail the connection (1002/1006) and lose the status.
+func truncateCloseReason(reason string) string {
+	reason = strings.ToValidUTF8(reason, "")
+	if len(reason) <= wsMaxCloseReason {
+		return reason
+	}
+	i := wsMaxCloseReason
+	for i > 0 && !utf8.RuneStart(reason[i]) {
+		i--
+	}
+	return reason[:i]
+}
+
 // closeConn closes the connection c, whose network connection is nc, with
-// status and reason: Conn.CloseDetail (safe from any goroutine) queues the
-// close frame, after which writes to c fail with websocket.ErrConnClosed, and
-// the library closes nc once the queued frames are written (at most about one
-// second later). CloseDetail blocks while the outbound queue of c is full, and
-// a client that does not read can stall the writer of c, so nc reads and
-// writes first get a deadline of wsCloseTimeout.
+// status and reason (cut by truncateCloseReason): Conn.CloseDetail (safe from
+// any goroutine) queues the close frame, after which writes to c fail with
+// websocket.ErrConnClosed, and the library closes nc once the queued frames
+// are written (at most about one second later). CloseDetail blocks while the
+// outbound queue of c is full, and a client that does not read can stall the
+// writer of c, so nc reads and writes first get a deadline of wsCloseTimeout.
 func closeConn(c *websocket.Conn, nc net.Conn, status websocket.StatusCode, reason string) {
 	if nc != nil {
 		nc.SetDeadline(time.Now().Add(wsCloseTimeout)) //nolint:errcheck
 	}
-	c.CloseDetail(status, reason)
+	c.CloseDetail(status, truncateCloseReason(reason))
+}
+
+// Close statuses of the WebSocket connections closed by the server for
+// authentication reasons; WsCloseError carries one. Applications may define
+// their own in the 4000–4999 range. A client reacts to them as follows.
+const (
+	// WsStatusAuthRequired (4001): the connection has no valid token (its
+	// token expired, or none came within WithWsAuthTimeout). The client gets
+	// a fresh token and reconnects.
+	WsStatusAuthRequired websocket.StatusCode = 4001
+	// WsStatusForbidden (4003): the connection may not continue (another
+	// user, access revoked). The client does not reconnect.
+	WsStatusForbidden websocket.StatusCode = 4003
+	// WsStatusContextChanged (4009): the token is of another security
+	// context (e.g. organization) than the connection. The client gets a
+	// token of the context it needs and opens a new connection with it.
+	WsStatusContextChanged websocket.StatusCode = 4009
+)
+
+// WsCloseError is an error that closes the WebSocket connection. When the
+// handler of a message (including the built-in updateAccessToken, through
+// OnTokenUpdate, and the WithWsAuthFunc function) returns an error with a
+// *WsCloseError in its chain, the client first gets the error reply to the
+// message, then the connection is closed with Code and Reason.
+//
+// The reply is built from Err when the chain has an *errors.Error with a
+// status; otherwise from Code: WsStatusAuthRequired gives ErrUnauthorized
+// (401), WsStatusForbidden ErrForbidden (403), WsStatusContextChanged
+// ErrWsContextChanged (409), any other code 400. It is never alarmed.
+//
+// Reason is sent to the client in the close frame, cut to 123 bytes: it must
+// not carry sensitive details; put them in Err.
+type WsCloseError struct {
+	Code   websocket.StatusCode
+	Reason string
+	Err    error // optional
+}
+
+// NewWsCloseError returns a WsCloseError closing the connection with code and
+// reason; err (may be nil) is the cause.
+func NewWsCloseError(code websocket.StatusCode, reason string, err error) *WsCloseError {
+	return &WsCloseError{Code: code, Reason: reason, Err: err}
+}
+
+func (e *WsCloseError) Error() string {
+	s := "websocket close " + strconv.Itoa(int(e.Code))
+	if e.Reason != "" {
+		s += " " + strconv.Quote(e.Reason)
+	}
+	if e.Err != nil {
+		s += ": " + e.Err.Error()
+	}
+	return s
+}
+
+func (e *WsCloseError) Unwrap() error { return e.Err }
+
+// errWsClosed is the reply to a message whose WsCloseError has a code
+// without its own error.
+var errWsClosed = errors.Template("bad request").StatusCode(400).Severity(errors.Tiny)
+
+// wsReplyError returns the error sent to the client for err and the
+// *WsCloseError in its chain, if any (see WsCloseError).
+func wsReplyError(err error) (error, *WsCloseError) {
+	var wce *WsCloseError
+	if !stderrors.As(err, &wce) {
+		return err, nil
+	}
+	if xe := vatelError(err); xe != nil && errors.Serialize(xe).StatusCode != 0 {
+		return err, wce
+	}
+	t := errWsClosed
+	switch wce.Code {
+	case WsStatusAuthRequired:
+		t = ErrUnauthorized
+	case WsStatusForbidden:
+		t = ErrForbidden
+	case WsStatusContextChanged:
+		t = ErrWsContextChanged
+	}
+	return t.Wrap(err), wce
+}
+
+// Expirer is implemented by a token payload (AuthPayload) that expires. The
+// WebSocket connection whose payload has a non-zero ExpiresAt is closed with
+// WsStatusAuthRequired at that time, unless the client sends a new token
+// (updateAccessToken) before; an already expired payload is rejected by
+// UpdateAccessToken with ErrUnauthorized.
+type Expirer interface {
+	ExpiresAt() time.Time
 }
 
 // WebsocketVatel manages WebSocket endpoint registration and message routing.
@@ -174,7 +406,7 @@ type WebsocketVatel struct {
 	conns                 wsConns
 	callbackOnOpen        func(*websocket.Conn)
 	callbackOnClose       func(*websocket.Conn, error)
-	callbackOnTokenUpdate func(cid uint64, tp AuthPayload) error
+	callbackOnTokenUpdate func(cid uint64, prev, next AuthPayload) error
 }
 
 // WsOption holds WebSocket-specific configuration.
@@ -184,6 +416,7 @@ type WsOption struct {
 	authFunc        func(ctx WebsocketContext, path string, requiredPerms []string) error
 	writeTimeout    time.Duration
 	writeTimeoutSet bool
+	authTimeout     time.Duration
 }
 
 // WithWsWriteTimeout sets how long writing one frame to a WebSocket client may
@@ -193,6 +426,15 @@ type WsOption struct {
 // connection ends, so the handler writing to it does not block forever.
 func WithWsWriteTimeout(d time.Duration) func(*WsOption) {
 	return func(o *WsOption) { o.writeTimeout, o.writeTimeoutSet = d, true }
+}
+
+// WithWsAuthTimeout closes a connection that has no token payload d after it
+// opened (no successful UpdateAccessToken, nor a payload stored for its ID
+// before it opened) with WsStatusAuthRequired. A rejected token does not
+// count. The default 0 means no limit. It has no effect without
+// WithTokenDecoder.
+func WithWsAuthTimeout(d time.Duration) func(*WsOption) {
+	return func(o *WsOption) { o.authTimeout = d }
 }
 
 // WithLogger sets the logger of WS endpoints; their lines get "layer":"ws".
@@ -231,6 +473,9 @@ func NewWebsocketVatel(optFunc ...func(*WsOption)) *WebsocketVatel {
 	}
 	if !wv.cfg.writeTimeoutSet {
 		wv.cfg.writeTimeout = DefaultWsWriteTimeout
+	}
+	if wv.cfg.td != nil {
+		wv.conns.authTimeout = max(wv.cfg.authTimeout, 0)
 	}
 	wv.ws.HandleData(wv.onMessage)
 	// Always register onOpen and onClose so the registry stays consistent.
@@ -313,12 +558,32 @@ func (wv *WebsocketVatel) OnOpen(f func(*websocket.Conn)) { wv.callbackOnOpen = 
 func (wv *WebsocketVatel) OnClose(f func(*websocket.Conn, error)) { wv.callbackOnClose = f }
 
 // OnTokenUpdate registers a callback invoked by UpdateAccessToken after the
-// token is decoded and before its payload is stored for the connection cid.
+// token is decoded and before its payload next is stored for the connection
+// cid; prev is the payload stored for it so far, nil for the first token.
 // Returning an error rejects the token: the payload is not stored (the
 // connection keeps its previous payload, if any) and the error is returned
 // from UpdateAccessToken, and so sent to the client of the updateAccessToken
-// endpoint.
-func (wv *WebsocketVatel) OnTokenUpdate(f func(cid uint64, tp AuthPayload) error) {
+// endpoint. A *WsCloseError then also closes the connection after the reply,
+// e.g. to keep one security context (user, organization) per connection:
+//
+//	wv.OnTokenUpdate(func(_ uint64, prev, next vatel.AuthPayload) error {
+//		if prev == nil {
+//			return nil // first token
+//		}
+//		p, n := prev.(*Claims), next.(*Claims)
+//		switch {
+//		case p.UserID != n.UserID:
+//			return vatel.NewWsCloseError(vatel.WsStatusForbidden, "user changed", nil)
+//		case p.OrgID != n.OrgID:
+//			return vatel.NewWsCloseError(vatel.WsStatusContextChanged, "organization changed", nil)
+//		}
+//		return nil
+//	})
+//
+// The callback runs without a lock held; if another payload is stored for cid
+// meanwhile (a concurrent UpdateAccessToken), or the connection closes,
+// UpdateAccessToken returns ErrWsTokenConflict and stores nothing.
+func (wv *WebsocketVatel) OnTokenUpdate(f func(cid uint64, prev, next AuthPayload) error) {
 	wv.callbackOnTokenUpdate = f
 }
 
@@ -331,7 +596,7 @@ const wsNetConnKey = "vatel.wsNetConn"
 // with the ID of a live connection (UpgradeWithID), is closed at once, without
 // the OnOpen and OnClose callbacks, and its messages are not served. A panic
 // in the OnOpen callback is recovered (see runCallback) and closes c with
-// status 1011; OnClose is still called for it.
+// status 1011; its messages are not served, OnClose is still called for it.
 func (wv *WebsocketVatel) onOpen(c *websocket.Conn) {
 	// No frame is written before onOpen returns, so setting the timeout here
 	// does not race with the writer of c.
@@ -352,7 +617,7 @@ func (wv *WebsocketVatel) onOpen(c *websocket.Conn) {
 	}
 	if wv.callbackOnOpen != nil {
 		if wv.runCallback("OnOpen", c, func() { wv.callbackOnOpen(c) }) {
-			closeConn(c, nc, websocket.StatusUnexpected, "internal error")
+			wv.closeLive(c, websocket.StatusUnexpected, "internal error")
 		}
 	}
 }
@@ -393,6 +658,44 @@ func (wv *WebsocketVatel) runCallback(name string, c *websocket.Conn, f func()) 
 	}()
 	f()
 	return false
+}
+
+// closeLive closes the registered connection c with status and reason, unless
+// it is already closing: its messages are no longer served.
+func (wv *WebsocketVatel) closeLive(c *websocket.Conn, status websocket.StatusCode, reason string) {
+	if c, nc, ok := wv.conns.startClose(c.ID(), c); ok {
+		closeConn(c, nc, status, reason)
+	}
+}
+
+// CloseConn closes the live connection cid with status and reason, e.g. when
+// its user was removed from the organization, logged out, or its token was
+// revoked; its further messages are not served (the message being handled is
+// finished), and OnClose is called once it has closed. Reason is sent to the
+// client: it is cut to 123 bytes and must not carry sensitive details. It
+// reports false if there is no such connection or it is already closing. It
+// does not wait for the close and is safe from any goroutine, including a
+// VisitConns callback.
+func (wv *WebsocketVatel) CloseConn(cid uint64, status websocket.StatusCode, reason string) bool {
+	c, nc, ok := wv.conns.startClose(cid, nil)
+	if ok {
+		// Queueing the close frame blocks while the outbound queue is full.
+		go closeConn(c, nc, status, reason)
+	}
+	return ok
+}
+
+// VisitConns calls f for each live connection (not being closed), in the
+// order of IDs, with its ID and its token payload (nil without one), until f
+// returns false. f is called on a snapshot without a lock held, so it may call
+// CloseConn; a connection may close meanwhile. Use it to find the connections
+// of a user or an organization from their payloads.
+func (wv *WebsocketVatel) VisitConns(f func(cid uint64, tp AuthPayload) bool) {
+	for _, ci := range wv.conns.live() {
+		if !f(ci.cid, ci.tp) {
+			return
+		}
+	}
 }
 
 // Shutdown closes all active WebSocket connections with a "going away" status,
@@ -505,7 +808,7 @@ func (wv *WebsocketVatel) serveMessage(c *websocket.Conn, e *Endpoint, msg Webso
 
 	zc, err := wv.authorize(ctx, e, zc)
 	if err != nil {
-		e.wsWriteErrorResponse(c, lo, verbose, zc, ctx.Created(), err)
+		wv.writeError(c, e, lo, verbose, zc, ctx.Created(), err)
 		return
 	}
 
@@ -519,23 +822,23 @@ func (wv *WebsocketVatel) serveMessage(c *websocket.Conn, e *Endpoint, msg Webso
 	if input, ok := h.(Inputer); ok {
 		in := input.Input()
 		if err := decodeWSInput(msg.Data, in, e.inputFields.HasRules()); err != nil {
-			e.wsWriteErrorResponse(c, lo, verbose, zc, ctx.Created(), err)
+			wv.writeError(c, e, lo, verbose, zc, ctx.Created(), err)
 			return
 		}
 		if err := validate(in); err != nil {
-			e.wsWriteErrorResponse(c, lo, verbose, zc, ctx.Created(), err)
+			wv.writeError(c, e, lo, verbose, zc, ctx.Created(), err)
 			return
 		}
 	}
 
 	if err := h.Handle(ctx); err != nil {
-		e.wsWriteErrorResponse(c, lo, verbose, zc, ctx.Created(), err)
+		wv.writeError(c, e, lo, verbose, zc, ctx.Created(), err)
 		return
 	}
 
 	zc, size, err := e.writeWSResult(c, h, lo, zc)
 	if err != nil {
-		e.wsWriteErrorResponse(c, lo, verbose, zc, ctx.Created(), err)
+		wv.writeError(c, e, lo, verbose, zc, ctx.Created(), err)
 		return
 	}
 
@@ -544,6 +847,18 @@ func (wv *WebsocketVatel) serveMessage(c *websocket.Conn, e *Endpoint, msg Webso
 		logExit(zc, lo, ctx.VisitValues, nil, dur)
 	}
 	e.reportMetric(fasthttp.StatusOK, dur, size)
+}
+
+// writeError sends the error err of a message of connection c served by the
+// endpoint e (see wsWriteErrorResponse); a *WsCloseError in its chain then
+// closes c: the close frame is queued after the reply, so the client gets
+// both.
+func (wv *WebsocketVatel) writeError(c *websocket.Conn, e *Endpoint, lo LogOption, verbose bool, zc zerolog.Context, created time.Time, err error) {
+	e.wsWriteErrorResponse(c, lo, verbose, zc, created, err)
+	var wce *WsCloseError
+	if stderrors.As(err, &wce) {
+		wv.closeLive(c, wce.Code, wce.Reason)
+	}
 }
 
 // authorize calls the WithWsAuthFunc function, if any, for the endpoint e and
@@ -607,12 +922,19 @@ func decodeWSInput(data []byte, dest any, masked bool) error {
 
 // wsWriteErrorResponse logs an error (at level lo) and sends it to the
 // WebSocket client w. The status and the client JSON are resolved as for
-// HTTP (see errorResponse).
+// HTTP (see errorResponse); for an error with a *WsCloseError, see
+// wsReplyError, and it is not alarmed.
 func (e *Endpoint) wsWriteErrorResponse(w io.Writer, lo LogOption, verbose bool, zc zerolog.Context, created time.Time, err error) {
 	if err == nil {
 		return
 	}
+	err, wce := wsReplyError(err)
+	e.wsWriteError(w, lo, verbose, zc, created, err, wce == nil)
+}
 
+// wsWriteError logs err (at level lo), sends it to the WebSocket client w,
+// reports the metric and, with alarm, passes a 5xx err to the Alarmer.
+func (e *Endpoint) wsWriteError(w io.Writer, lo LogOption, verbose bool, zc zerolog.Context, created time.Time, err error, alarm bool) {
 	statusCode, body, _ := e.errorResponse(err, verbose)
 
 	if isErrorLogged(lo, statusCode) {
@@ -623,7 +945,9 @@ func (e *Endpoint) wsWriteErrorResponse(w io.Writer, lo LogOption, verbose bool,
 	w.Write(body) //nolint:errcheck
 
 	e.reportMetric(statusCode, time.Since(created), len(body))
-	e.alarm(statusCode, err)
+	if alarm {
+		e.alarm(statusCode, err)
+	}
 }
 
 // wsRecoverPanic answers a WS message whose handling panicked with r: the
@@ -637,13 +961,25 @@ func (e *Endpoint) wsRecoverPanic(w io.Writer, lo LogOption, verbose bool, zc ze
 			zl.Error().Msg("panic while recovering from a panic")
 		}
 	}()
-	e.wsWriteErrorResponse(w, lo, verbose, withPanic(zc, r), created, panicError(r))
+	// A panic is a 500, even with a *WsCloseError value.
+	e.wsWriteError(w, lo, verbose, withPanic(zc, r), created, panicError(r), true)
 }
 
-// UpdateAccessToken decodes a new access token and calls the OnTokenUpdate
-// callback, if any; unless the callback returns an error, it stores the
-// payload for the connection cid. A token that cannot be decoded is rejected
-// with ErrUnauthorized. Without WithTokenDecoder it does nothing.
+// UpdateAccessToken decodes a new access token for the connection cid and
+// calls the OnTokenUpdate callback, if any, with the payload stored so far;
+// unless the callback returns an error, it stores the new payload for cid. A
+// token that cannot be decoded, or whose payload (Expirer) has expired, is
+// rejected with ErrUnauthorized; if another payload was stored for cid while
+// the callback ran, or the connection closed, it returns ErrWsTokenConflict.
+// A rejected token is not stored: the connection keeps its payload. Storing a
+// payload arms the expiry of the connection (Expirer) and ends its
+// WithWsAuthTimeout. A payload stored for a cid without a live connection
+// becomes the payload of the connection opened with that ID
+// (UpgradeWithID). Without WithTokenDecoder it does nothing.
+//
+// A *WsCloseError returned by the callback is returned as is: the
+// updateAccessToken endpoint then closes the connection after its reply; a
+// direct caller closes it with CloseConn.
 func (wv *WebsocketVatel) UpdateAccessToken(cid uint64, token string) error {
 	if wv.cfg.td == nil {
 		return nil
@@ -656,12 +992,22 @@ func (wv *WebsocketVatel) UpdateAccessToken(cid uint64, token string) error {
 		// A broken TokenDecoder: neither a token nor an error.
 		return ErrUnauthorized.New().Msg("token decoder returned no token")
 	}
-	tp := at.ApplicationPayload()
+	next := at.ApplicationPayload()
+	var exp time.Time
+	if ex, ok := next.(Expirer); ok {
+		exp = ex.ExpiresAt()
+		if !exp.IsZero() && !time.Now().Before(exp) {
+			return ErrUnauthorized.New().Msg("token expired")
+		}
+	}
+	wc, prev, ver := wv.conns.lookup(cid)
 	if wv.callbackOnTokenUpdate != nil {
-		if err := wv.callbackOnTokenUpdate(cid, tp); err != nil {
+		if err := wv.callbackOnTokenUpdate(cid, prev, next); err != nil {
 			return err
 		}
 	}
-	wv.conns.setPayload(cid, tp)
+	if !wv.conns.storePayload(cid, wc, ver, next, exp) {
+		return ErrWsTokenConflict.New()
+	}
 	return nil
 }

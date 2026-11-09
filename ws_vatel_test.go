@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	stderrors "errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/axkit/errors"
 	"github.com/fasthttp/router"
@@ -23,6 +25,13 @@ func (cs *wsConns) payload(cid uint64) (AuthPayload, bool) {
 		return wc.tp, true
 	}
 	return nil, false
+}
+
+// setPayload stores tp for the connection cid unconditionally. Tests only:
+// UpdateAccessToken stores a payload with storePayload.
+func (cs *wsConns) setPayload(cid uint64, tp AuthPayload) {
+	wc, _, ver := cs.lookup(cid)
+	cs.storePayload(cid, wc, ver, tp, time.Time{})
 }
 
 func TestDecodeWSInput_Invalid(t *testing.T) {
@@ -204,18 +213,18 @@ func TestOnTokenUpdate(t *testing.T) {
 	wv := NewWebsocketVatel(WithTokenDecoder(dec))
 
 	var gotCID uint64
-	var gotTP AuthPayload
+	var gotPrev, gotNext AuthPayload
 	var stored bool
-	wv.OnTokenUpdate(func(cid uint64, tp AuthPayload) error {
-		gotCID, gotTP = cid, tp
+	wv.OnTokenUpdate(func(cid uint64, prev, next AuthPayload) error {
+		gotCID, gotPrev, gotNext = cid, prev, next
 		_, stored = wv.conns.payload(cid)
 		return nil
 	})
 	if err := wv.UpdateAccessToken(42, "token"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if gotCID != 42 || gotTP != AuthPayload(first) {
-		t.Errorf("callback got cid=%d tp=%v", gotCID, gotTP)
+	if gotCID != 42 || gotPrev != nil || gotNext != AuthPayload(first) {
+		t.Errorf("first callback got cid=%d prev=%v next=%v; want 42, nil, the first payload", gotCID, gotPrev, gotNext)
 	}
 	if stored {
 		t.Error("the callback must run before the payload is stored")
@@ -224,15 +233,169 @@ func TestOnTokenUpdate(t *testing.T) {
 		t.Errorf("stored payload = %v, %v; want the accepted payload", tp, ok)
 	}
 
+	dec.token = &mockTokener{payload: second}
+	if err := wv.UpdateAccessToken(42, "token"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotPrev != AuthPayload(first) || gotNext != AuthPayload(second) {
+		t.Errorf("second callback got prev=%v next=%v; want the first and the second payload", gotPrev, gotNext)
+	}
+
 	// A rejected token is not stored: the connection keeps its payload.
 	errCb := stderrors.New("rejected")
-	wv.OnTokenUpdate(func(uint64, AuthPayload) error { return errCb })
-	dec.token = &mockTokener{payload: second}
+	wv.OnTokenUpdate(func(uint64, AuthPayload, AuthPayload) error { return errCb })
+	dec.token = &mockTokener{payload: first}
 	if err := wv.UpdateAccessToken(42, "token"); !stderrors.Is(err, errCb) {
 		t.Errorf("want callback error, got %v", err)
 	}
-	if tp, _ := wv.conns.payload(42); tp != AuthPayload(first) {
+	if tp, _ := wv.conns.payload(42); tp != AuthPayload(second) {
 		t.Errorf("stored payload = %v, want the previous payload after a rejection", tp)
+	}
+
+	// A WsCloseError from the callback is returned as is; nothing is stored.
+	wv.OnTokenUpdate(func(uint64, AuthPayload, AuthPayload) error {
+		return NewWsCloseError(WsStatusContextChanged, "organization changed", nil)
+	})
+	var wce *WsCloseError
+	if err := wv.UpdateAccessToken(42, "token"); !stderrors.As(err, &wce) || wce.Code != WsStatusContextChanged {
+		t.Errorf("want the WsCloseError 4009, got %v", err)
+	}
+	if tp, _ := wv.conns.payload(42); tp != AuthPayload(second) {
+		t.Errorf("stored payload = %v, want the previous payload after a WsCloseError", tp)
+	}
+}
+
+// A payload that has already expired is rejected with ErrUnauthorized before
+// the callback; the previous payload stays.
+func TestUpdateAccessToken_ExpiredPayload(t *testing.T) {
+	wv := NewWebsocketVatel(WithTokenDecoder(ctxDecoder{}))
+	calls := 0
+	wv.OnTokenUpdate(func(uint64, AuthPayload, AuthPayload) error { calls++; return nil })
+	if err := wv.UpdateAccessToken(1, "1/10"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	prev, _ := wv.conns.payload(1)
+
+	err := wv.UpdateAccessToken(1, "1/10/-1s")
+	if !errors.Is(err, ErrUnauthorized) {
+		t.Errorf("want ErrUnauthorized, got %v", err)
+	}
+	var wce *WsCloseError
+	if stderrors.As(err, &wce) {
+		t.Error("an expired token must not close the connection")
+	}
+	if calls != 1 {
+		t.Errorf("callback calls = %d, want 1 (not called for the expired token)", calls)
+	}
+	if tp, _ := wv.conns.payload(1); tp != prev {
+		t.Errorf("stored payload = %v, want the previous one", tp)
+	}
+}
+
+// Concurrent UpdateAccessToken calls for one connection: when the payload
+// changed while the callback ran, the later store fails with
+// ErrWsTokenConflict (409, VTL-0010) instead of overwriting it.
+func TestUpdateAccessToken_Concurrent(t *testing.T) {
+	wv := NewWebsocketVatel(WithTokenDecoder(ctxDecoder{}))
+	if err := wv.UpdateAccessToken(5, "1/1"); err != nil {
+		t.Fatal(err)
+	}
+	arrived := make(chan struct{}, 2)
+	release := make(chan struct{})
+	wv.OnTokenUpdate(func(uint64, AuthPayload, AuthPayload) error {
+		arrived <- struct{}{}
+		<-release
+		return nil
+	})
+	errs := make(chan error, 2)
+	for _, tok := range []string{"1/10", "1/11"} {
+		go func() { errs <- wv.UpdateAccessToken(5, tok) }()
+	}
+	<-arrived
+	<-arrived
+	close(release)
+	e1, e2 := <-errs, <-errs
+	if (e1 == nil) == (e2 == nil) {
+		t.Fatalf("errors = %v, %v; want exactly one nil", e1, e2)
+	}
+	conflict := e1
+	if conflict == nil {
+		conflict = e2
+	}
+	if !errors.Is(conflict, ErrWsTokenConflict) {
+		t.Errorf("want ErrWsTokenConflict, got %v", conflict)
+	}
+	se := errors.Serialize(conflict, errors.WithAttributes(errors.ServerOutputFormat))
+	if se.StatusCode != 409 || se.Code != "VTL-0010" {
+		t.Errorf("conflict = %d %s, want 409 VTL-0010", se.StatusCode, se.Code)
+	}
+	if tp, _ := wv.conns.payload(5); tp.(*ctxPayload).org == 1 {
+		t.Error("the accepted payload was not stored")
+	}
+}
+
+func TestWsCloseError(t *testing.T) {
+	inner := ErrValidationFailed.New()
+	err := fmt.Errorf("wrapped: %w", NewWsCloseError(WsStatusForbidden, "user changed", inner))
+	var wce *WsCloseError
+	if !stderrors.As(err, &wce) || wce.Code != WsStatusForbidden || wce.Reason != "user changed" {
+		t.Fatalf("errors.As = %v", wce)
+	}
+	if !errors.Is(err, ErrValidationFailed) {
+		t.Error("Unwrap must expose Err")
+	}
+	if got := NewWsCloseError(4009, "organization changed", nil).Error(); !strings.Contains(got, "4009") || !strings.Contains(got, "organization changed") {
+		t.Errorf("Error() = %q, want the code and the reason", got)
+	}
+}
+
+func TestTruncateCloseReason(t *testing.T) {
+	a := func(n int) string { return strings.Repeat("a", n) }
+	tests := []struct{ name, in, want string }{
+		{"short", "bye", "bye"},
+		{"123 bytes", a(123), a(123)},
+		{"124 bytes", a(124), a(123)},
+		{"2-byte rune across the limit", a(122) + "é" + "z", a(122)},
+		{"3-byte rune across the limit", a(121) + "€" + "z", a(121)},
+		{"rune ending at the limit", a(121) + "é" + "z", a(121) + "é"},
+		{"invalid UTF-8", "a\xffb", "ab"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := truncateCloseReason(tt.in)
+			if got != tt.want || len(got) > 123 || !utf8.ValidString(got) {
+				t.Errorf("truncateCloseReason = %q (%d bytes), want %q", got, len(got), tt.want)
+			}
+		})
+	}
+}
+
+// WithWsAuthTimeout has no effect without a TokenDecoder: no token could
+// authenticate a connection.
+func TestWithWsAuthTimeout_NoDecoder(t *testing.T) {
+	if d := NewWebsocketVatel(WithWsAuthTimeout(time.Second)).conns.authTimeout; d != 0 {
+		t.Errorf("auth timeout without a decoder = %v, want 0", d)
+	}
+	if d := NewWebsocketVatel(WithTokenDecoder(ctxDecoder{}), WithWsAuthTimeout(time.Second)).conns.authTimeout; d != time.Second {
+		t.Errorf("auth timeout = %v, want 1s", d)
+	}
+}
+
+// remove stops the timer of the connection.
+func TestWsConns_RemoveStopsTimer(t *testing.T) {
+	cs := newWsConns()
+	cs.authTimeout = time.Hour
+	c := &websocket.Conn{}
+	if err := cs.add(c, nil); err != nil {
+		t.Fatal(err)
+	}
+	wc := cs.conns[c.ID()]
+	if wc.timer == nil {
+		t.Fatal("no auth timer armed by add")
+	}
+	cs.remove(c)
+	if wc.timer != nil {
+		t.Error("timer not stopped by remove")
 	}
 }
 
@@ -262,7 +425,7 @@ func TestUpdateAccessToken_DecoderReturnsNilToken(t *testing.T) {
 func TestUpdateAccessToken_NoDecoder(t *testing.T) {
 	wv := NewWebsocketVatel()
 	called := false
-	wv.OnTokenUpdate(func(uint64, AuthPayload) error { called = true; return nil })
+	wv.OnTokenUpdate(func(uint64, AuthPayload, AuthPayload) error { called = true; return nil })
 	if err := wv.UpdateAccessToken(1, "token"); err != nil {
 		t.Errorf("want nil without a decoder, got %v", err)
 	}
@@ -374,3 +537,18 @@ func TestWsCompile_PermsWithAuthFunc_OK(t *testing.T) {
 type plainWsHandler struct{}
 
 func (h *plainWsHandler) Handle(ctx WebsocketContext) error { return nil }
+
+// A panic is a 500 and is alarmed, even when its value is a *WsCloseError.
+func TestWsRecoverPanic_CloseErrorValueAlarmed(t *testing.T) {
+	m := &syncMetrics{}
+	e := &Endpoint{EndpointMeta: EndpointMeta{Method: "WS", Path: "x"}}
+	compileCommon(NewVatel(WithAlarmer(m), WithMetricReporter(m)), e)
+	var out bytes.Buffer
+	e.wsRecoverPanic(&out, LogExit, false, zerolog.Nop().With(), time.Now(), NewWsCloseError(WsStatusForbidden, "x", nil))
+	if !strings.Contains(out.String(), "VTL-0005") {
+		t.Errorf("reply = %s, want VTL-0005", out.String())
+	}
+	if n := m.alarms(); n != 1 {
+		t.Errorf("alarms = %d, want 1", n)
+	}
+}

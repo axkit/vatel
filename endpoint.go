@@ -185,6 +185,13 @@ var (
 	// ErrUnknownPath is sent to a WebSocket client for a message whose path
 	// names no WS endpoint.
 	ErrUnknownPath = errors.Template("unknown path").Code("VTL-0008").StatusCode(404).Severity(errors.Tiny)
+	// ErrWsContextChanged is sent to a WebSocket client for a message whose
+	// WsCloseError with WsStatusContextChanged has no error of its own.
+	ErrWsContextChanged = errors.Template("security context changed").Code("VTL-0009").StatusCode(409).Severity(errors.Medium)
+	// ErrWsTokenConflict is returned by WebsocketVatel.UpdateAccessToken when
+	// another payload was stored for the connection, or it closed, while the
+	// OnTokenUpdate callback ran.
+	ErrWsTokenConflict = errors.Template("concurrent token update").Code("VTL-0010").StatusCode(409).Severity(errors.Medium)
 )
 
 // parseLogLevelHeader parses a comma-separated X-Set-Log-Level header value
