@@ -10,6 +10,8 @@ Version notes:
   or later.
 - `github.com/axkit/errors` v1.1.0 is required (see [section 3](#3-upgrading-from-v013v014-and-axkiterrors-v0x--v10x)).
 - `github.com/axkit/bitset` is a regular dependency, v1.0.4 (no `replace` directive).
+- v1.26.0 adds `ctx.SetBodyStream(r, size)` (streamed response, replaces
+  `ctx.RequestCtx().SetBodyStream`); custom implementations of `vatel.Context` must add it.
 - Go 1.26, `github.com/valyala/fasthttp` v1.77.0 and `github.com/fasthttp/router` v1.5.4
   are the new minimums (v0.14: Go 1.24, fasthttp v1.31.0, router v1.4.4); see
   [Module](#module).
@@ -96,11 +98,11 @@ Endpoints that need a valid token but no permission: `cfg.RequireAuth()`.
 |---|---|
 | `ctx.TokenPayload() TokenPayloader` | `ctx.TokenPayload() any`: type-assert, `ctx.TokenPayload().(*Claims)` |
 | `ctx.SetTokenPayload(TokenPayloader)` | `ctx.SetTokenPayload(any)` |
-| `ctx.RequestCtx() *fasthttp.RequestCtx` | removed. Use `Header`, `RequestBody`, `PathValue`, `QueryValue`, `FormFile`, `FormValue`, `RemoteAddr` (real IP), `RequestTime`, `SetHeader`; the request ID is `ctx.Get("reqId")` with `WithRequestID()`. Code that passed `ctx.RequestCtx()` as a `context.Context` passes `ctx.Context()`: its `Value(key)` returns the request values (`Set`, `SetValue`, path params, `reqId`), as `RequestCtx.Value` did, then the values of the parent context |
+| `ctx.RequestCtx() *fasthttp.RequestCtx` | removed. Use `Header`, `RequestBody`, `PathValue`, `QueryValue`, `FormFile`, `FormValue`, `RemoteAddr` (real IP), `RequestTime`, `SetHeader`, `SetBodyStream` (v1.26.0+, for `RequestCtx().SetBodyStream`); the request ID is `ctx.Get("reqId")` with `WithRequestID()`. Code that passed `ctx.RequestCtx()` as a `context.Context` passes `ctx.Context()`: its `Value(key)` returns the request values (`Set`, `SetValue`, path params, `reqId`), as `RequestCtx.Value` did, then the values of the parent context |
 | `ctx.RequestCtx().SetUserValue(key, v)` (typed key, read back with `goctx.Value(key)`) | `ctx.SetValue(key, v)`; `ctx.Context().Value(key)` returns it (see [Request context](#request-context)) |
 | `VatelContext.Log`, `LogValues` | removed; values stored with `ctx.Set` are written to the request log |
 | — | new: `ctx.Context()` (Go context), `ctx.SetValue(key, val any)` (any comparable key), `VerboseError`/`SetVerboseError` |
-| custom implementations of `vatel.Context` (test mocks) | must add the new methods: `Context`, `SetValue`, `PathValue`, `QueryValue`, `RemoteAddr`, `RequestTime`, `RequestBody`, `VerboseError`, `SetVerboseError` |
+| custom implementations of `vatel.Context` (test mocks) | must add the new methods: `Context`, `SetValue`, `PathValue`, `QueryValue`, `RemoteAddr`, `RequestTime`, `RequestBody`, `VerboseError`, `SetVerboseError`; since v1.26.0 also `SetBodyStream` |
 | `WebsocketContext.TokenPayload() TokenPayloader` | `TokenPayload() any`, `SetTokenPayload(any)` |
 
 ### Middleware
@@ -479,6 +481,9 @@ Per-endpoint middleware: `e.AddMiddleware(pos, f...)` inside an `EndpointOption`
 ### Metrics
 
 - The size reported for a HEAD response is 0: the server drops its body.
+- The size reported for a streamed body (`SetBodyStream`, v1.26.0+) is its declared size,
+  0 if unknown; the stream is not read. v0.14 read the whole stream into memory to measure
+  it when a `MetricReporter` was set.
 - The size reported for a successful WebSocket message is the size of the reply (before:
   0).
 

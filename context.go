@@ -17,6 +17,13 @@ import (
 type Context interface {
 	// Response writing
 	BodyWriter() io.Writer
+	// SetBodyStream sets the response body to r, read only while the response
+	// is sent, so a large file is never held in memory. size is the body
+	// length (Content-Length) or -1 if unknown (chunked encoding). r is closed
+	// after the response is sent if it is an io.Closer. An error returned by
+	// the handler, a panic or a non-nil Resulter result replaces the stream
+	// (and closes it).
+	SetBodyStream(r io.Reader, size int) Context
 	SetContentType([]byte) Context
 	SetStatusCode(code int) Context
 	SetHeader(name, val []byte) Context
@@ -130,6 +137,11 @@ func (c *VatelContext) end() {
 
 func (c *VatelContext) BodyWriter() io.Writer {
 	return c.fh.Response.BodyWriter()
+}
+
+func (c *VatelContext) SetBodyStream(r io.Reader, size int) Context {
+	c.fh.Response.SetBodyStream(r, size)
+	return c
 }
 
 func (c *VatelContext) SetContentType(ct []byte) Context {

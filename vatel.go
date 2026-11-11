@@ -44,7 +44,9 @@ type TokenDecoder interface {
 	Decode(encodedToken []byte) (Tokener, error)
 }
 
-// MetricReporter submits per-request metrics (e.g. to Prometheus).
+// MetricReporter submits per-request metrics (e.g. to Prometheus). size is the
+// response body length; for a streamed body (Context.SetBodyStream) it is the
+// declared size, 0 if unknown.
 type MetricReporter interface {
 	ReportMetric(method, path string, statusCode int, dur float64, size int)
 }

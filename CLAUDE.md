@@ -123,6 +123,9 @@ resolve log level (endpoint LogOptions, X-Set-Log-Level header, LogSilent preced
 → LogExit line → metrics → OnSuccessResponse (errors ignored, `runHooks`)
 ```
 
+Metrics size comes from `responseSize`: a body stream (`ctx.SetBodyStream`) is never read for it
+(`Response.Body()` would load the whole stream), its `Content-Length` is used, 0 if unknown.
+
 Any error goes to `writeErrorResponse`: log (unless `LogSilent` and < 500), JSON error body from
 `errorResponse`, metrics, `Alarmer` for >= 500, `OnErrorResponse` middleware with `e.EndpointMeta`.
 
