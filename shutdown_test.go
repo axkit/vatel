@@ -603,3 +603,48 @@ func TestServerConfig_ConnStateHook(t *testing.T) {
 		t.Errorf("user ConnState hook states = %v, want to start with StateNew", states)
 	}
 }
+
+// A streamed body reaches the client whole, plain and gzipped (WithCompress),
+// and the metric gets its size from Content-Length.
+func TestServe_BodyStream(t *testing.T) {
+	data := strings.Repeat("0123456789", 50_000)
+	m := &syncMetrics{}
+	v := NewVatel(WithMetricReporter(m))
+	stream := func(ctx Context) error {
+		ctx.SetContentType([]byte("application/octet-stream"))
+		ctx.SetBodyStream(strings.NewReader(data), len(data))
+		return nil
+	}
+	ts := startServer(t, v, Endpoints{
+		GET("/file", Func(stream)),
+		GET("/gz", Func(stream), WithCompress()),
+	})
+	conn := ts.connect(t)
+	br := bufio.NewReader(conn)
+
+	resp := roundTrip(t, conn, br, "/file")
+	if resp.StatusCode() != 200 || string(resp.Body()) != data {
+		t.Fatalf("/file: status %d, %d bytes, want 200 and %d bytes", resp.StatusCode(), len(resp.Body()), len(data))
+	}
+
+	if _, err := conn.Write([]byte("GET /gz HTTP/1.1\r\nHost: test\r\nAccept-Encoding: gzip\r\n\r\n")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	var gz fasthttp.Response
+	if err := gz.Read(br); err != nil {
+		t.Fatalf("read /gz: %v", err)
+	}
+	if ce := string(gz.Header.ContentEncoding()); ce != "gzip" {
+		t.Fatalf("/gz Content-Encoding = %q, want gzip", ce)
+	}
+	body, err := gz.BodyGunzip()
+	if err != nil || string(body) != data {
+		t.Fatalf("/gz: gunzip err %v, %d bytes, want %d bytes", err, len(body), len(data))
+	}
+
+	for _, p := range []string{"/file", "/gz"} {
+		if got := m.sizes(p); len(got) != 1 || got[0] != len(data) {
+			t.Errorf("%s metric sizes = %v, want [%d]", p, got, len(data))
+		}
+	}
+}

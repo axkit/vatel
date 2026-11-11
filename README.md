@@ -344,8 +344,30 @@ when the request is not a multipart form or has no such file field.
 `vatel.Context` gives the handler access to the request and the response without exposing
 fasthttp: `Header`, `RequestBody`, `PathValue`, `QueryValue`, `FormFile`, `FormValue`,
 `RemoteAddr` (real IP), `RequestTime`, `SetStatusCode`, `SetHeader`, `SetContentType`,
-`BodyWriter`, `TokenPayload`, `Context` (Go context), and a per-request key-value store
-`Set`/`Get`. Values stored with `Set` are written to the request log.
+`BodyWriter`, `SetBodyStream`, `TokenPayload`, `Context` (Go context), and a per-request
+key-value store `Set`/`Get`. Values stored with `Set` are written to the request log.
+
+`SetBodyStream(r, size)` sends a body that is read only while the response is written, so a
+large file is not loaded into memory. `size` is the length (`Content-Length`) or -1 if
+unknown (chunked encoding); `r` is closed after the response if it is an `io.Closer`. A
+handler error, a panic or a non-nil `Result()` replaces the stream and closes it.
+
+```go
+vatel.GET("/files/{id}", vatel.Func(func(ctx vatel.Context) error {
+	f, err := os.Open(pathOf(ctx.PathValue("id")))
+	if err != nil {
+		return err
+	}
+	st, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return err
+	}
+	ctx.SetContentType([]byte("application/octet-stream"))
+	ctx.SetBodyStream(f, int(st.Size())) // f is closed after the response
+	return nil
+}))
+```
 
 `SetValue(key, val any)` stores a value under any comparable key, typically an unexported
 typed key, for code that only gets the Go context: `ctx.Context().Value(key)` returns it.
@@ -992,7 +1014,7 @@ the close codes as in the table above. A complete server is in [example/ws.go](e
 | `WithStaticLoggingLevel()` | Ignore the `X-Set-Log-Level` header. |
 | `WithDefaultTimeout(d)` | Request context timeout of endpoints without their own. |
 | `WithJsonMasker(jm)` | Masker for logged JSON (default `jsonmask.New()`). |
-| `WithMetricReporter(mr)` | `ReportMetric(method, path, statusCode, durSeconds, size)` per request; `path` is the template; `size` is 0 for HEAD. |
+| `WithMetricReporter(mr)` | `ReportMetric(method, path, statusCode, durSeconds, size)` per request; `path` is the template; `size` is 0 for HEAD; for `SetBodyStream` it is the declared size (0 if unknown), the stream is not read. |
 | `WithAlarmer(a)` | `Alarm(err)` for errors with status >= 500. |
 | `WithWebsocketSupport(wv)` | Enables WS endpoints. |
 | `WithServerConfig(f)` | Configures the `fasthttp.Server` started by `ListenAndServe`. |

@@ -287,7 +287,7 @@ func (e *Endpoint) handler(l *zerolog.Logger) func(*fasthttp.RequestCtx) {
 		if lo&LogExit == LogExit {
 			logExit(zc, lo, ctx.VisitUserValues, e.isPathParamKey, dur)
 		}
-		e.reportMetric(fctx.Response.StatusCode(), dur, len(fctx.Response.Body()))
+		e.reportMetric(fctx.Response.StatusCode(), dur, responseSize(&fctx.Response))
 		ctx.reported = true
 
 		// The response is written: errors of OnSuccessResponse middleware
@@ -316,6 +316,16 @@ func (e *Endpoint) reportMetric(statusCode int, dur time.Duration, size int) {
 		size = 0
 	}
 	e.v.cfg.mr.ReportMetric(e.Method, e.Path, statusCode, dur.Seconds(), size)
+}
+
+// responseSize returns the body length of resp. A streamed body is not read
+// (Response.Body would read the whole stream into memory): its size is the
+// Content-Length, 0 if unknown.
+func responseSize(resp *fasthttp.Response) int {
+	if resp.IsBodyStream() {
+		return max(resp.Header.ContentLength(), 0)
+	}
+	return len(resp.Body())
 }
 
 // alarm passes a 5xx error to the Alarmer, if any.

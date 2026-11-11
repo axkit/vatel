@@ -332,6 +332,8 @@ func (c *uploadMockCtx) SaveMultipartFile(_ *multipart.FileHeader, path string) 
 	c.savedPath = path
 	return nil
 }
+func (c *uploadMockCtx) SetBodyStream(io.Reader, int) Context { return c }
+
 func (c *uploadMockCtx) BodyWriter() io.Writer             { return nil }
 func (c *uploadMockCtx) SetContentType([]byte) Context     { return c }
 func (c *uploadMockCtx) SetStatusCode(int) Context         { return c }

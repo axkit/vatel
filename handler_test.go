@@ -2457,3 +2457,105 @@ func TestFunc_PathParams(t *testing.T) {
 		t.Errorf("PathValue(id) = %q, want 42", id)
 	}
 }
+
+// ── streamed response body ────────────────────────────────────────────────────
+
+// countingStream is a response body stream that counts the bytes read from it
+// and records Close.
+type countingStream struct {
+	r      io.Reader
+	read   int
+	closed bool
+}
+
+func (s *countingStream) Read(p []byte) (int, error) {
+	n, err := s.r.Read(p)
+	s.read += n
+	return n, err
+}
+
+func (s *countingStream) Close() error { s.closed = true; return nil }
+
+func newCountingStream(data string) *countingStream {
+	return &countingStream{r: strings.NewReader(data)}
+}
+
+func TestHandler_BodyStream_NotReadByMetric(t *testing.T) {
+	data := strings.Repeat("x", 1<<16)
+	s := newCountingStream(data)
+	m := &mockMetrics{lastSize: -100}
+	fctx := newGETCtx("/file")
+
+	run(NewVatel(WithMetricReporter(m)), GET("/file", Func(func(ctx Context) error {
+		ctx.SetContentType([]byte("application/octet-stream"))
+		ctx.SetBodyStream(s, len(data))
+		return nil
+	})), fctx)
+
+	if s.read != 0 || s.closed {
+		t.Fatalf("stream touched before the response is sent: read %d bytes, closed %v", s.read, s.closed)
+	}
+	if m.callCount != 1 || m.lastStatus != 200 || m.lastSize != len(data) {
+		t.Errorf("metric = (calls %d, status %d, size %d), want (1, 200, %d)", m.callCount, m.lastStatus, m.lastSize, len(data))
+	}
+	if !fctx.Response.IsBodyStream() {
+		t.Fatal("response is not a body stream")
+	}
+	if got := string(fctx.Response.Body()); got != data {
+		t.Errorf("body: got %d bytes, want %d", len(got), len(data))
+	}
+}
+
+func TestHandler_BodyStream_UnknownSizeMetricZero(t *testing.T) {
+	s := newCountingStream("chunked body")
+	m := &mockMetrics{lastSize: -100}
+
+	run(NewVatel(WithMetricReporter(m)), GET("/file", Func(func(ctx Context) error {
+		ctx.SetBodyStream(s, -1)
+		return nil
+	})), newGETCtx("/file"))
+
+	if s.read != 0 {
+		t.Fatalf("stream read before the response is sent: %d bytes", s.read)
+	}
+	if m.lastSize != 0 {
+		t.Errorf("metric size = %d, want 0 for a stream of unknown size", m.lastSize)
+	}
+}
+
+func TestHandler_BodyStream_ClosedOnError(t *testing.T) {
+	s := newCountingStream("partial")
+	fctx := newGETCtx("/file")
+
+	run(NewVatel(), GET("/file", Func(func(ctx Context) error {
+		ctx.SetBodyStream(s, 7)
+		return ErrValidationFailed.New()
+	})), fctx)
+
+	if !s.closed || s.read != 0 {
+		t.Errorf("stream after an error: closed %v, read %d; want closed, unread", s.closed, s.read)
+	}
+	if fctx.Response.IsBodyStream() {
+		t.Error("error response is still a body stream")
+	}
+	if fctx.Response.StatusCode() != 400 || !strings.Contains(string(fctx.Response.Body()), "VTL-0006") {
+		t.Errorf("error response = %d %s", fctx.Response.StatusCode(), fctx.Response.Body())
+	}
+}
+
+func TestHandler_BodyStream_ClosedOnPanic(t *testing.T) {
+	s := newCountingStream("partial")
+	fctx := newGETCtx("/file")
+
+	run(NewVatel(), GET("/file", Func(func(ctx Context) error {
+		ctx.SetBodyStream(s, 7)
+		panic("boom")
+	})), fctx)
+
+	if !s.closed || s.read != 0 {
+		t.Errorf("stream after a panic: closed %v, read %d; want closed, unread", s.closed, s.read)
+	}
+	if fctx.Response.StatusCode() != 500 {
+		t.Errorf("status = %d, want 500", fctx.Response.StatusCode())
+	}
+}
