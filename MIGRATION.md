@@ -102,7 +102,7 @@ Endpoints that need a valid token but no permission: `cfg.RequireAuth()`.
 | `ctx.RequestCtx().SetUserValue(key, v)` (typed key, read back with `goctx.Value(key)`) | `ctx.SetValue(key, v)`; `ctx.Context().Value(key)` returns it (see [Request context](#request-context)) |
 | `VatelContext.Log`, `LogValues` | removed; values stored with `ctx.Set` are written to the request log |
 | — | new: `ctx.Context()` (Go context), `ctx.SetValue(key, val any)` (any comparable key), `VerboseError`/`SetVerboseError` |
-| custom implementations of `vatel.Context` (test mocks) | must add the new methods: `Context`, `SetValue`, `PathValue`, `QueryValue`, `RemoteAddr`, `RequestTime`, `RequestBody`, `VerboseError`, `SetVerboseError`; since v1.26.0 also `SetBodyStream` |
+| custom implementations of `vatel.Context` (test mocks) | must add the new methods: `Context`, `SetValue`, `PathValue`, `QueryValue`, `RemoteAddr`, `RequestTime`, `RequestBody`, `VerboseError`, `SetVerboseError`; since v1.26.0 also `SetBodyStream`. A mock that embeds the interface to stub only some methods cannot embed `vatel.Context` directly: the embedded field is named `Context` and hides the `Context()` method. Embed it under an alias: `type vatelCtx = vatel.Context; type mockCtx struct{ vatelCtx }` |
 | `WebsocketContext.TokenPayload() TokenPayloader` | `TokenPayload() any`, `SetTokenPayload(any)` |
 
 ### Middleware
